@@ -63,13 +63,17 @@ EULA_ARGS=()
 if $ACCEPT_EULA; then EULA_ARGS=(--accept-eula); fi
 .venv/bin/python scripts/configure.py --name "$NAME" --agents "$AGENTS" --wall-minutes "$WALL" \
   --max-calls "$CALLS" --max-cost "$COST" "${API_ARGS[@]}" "${EULA_ARGS[@]}" $FORCE
+MODE=strict
+if [[ "$AGENTS" == "4" ]]; then MODE=paper; fi
+COMPOSE=infra/compose.local.yaml
+.venv/bin/python scripts/render_compose.py --agents "$AGENTS" --mode "$MODE" --output "$COMPOSE"
 
 if $BUILD; then
-  docker compose -f infra/compose.paper.yaml --env-file infra/.env build
+  docker compose -f "$COMPOSE" --env-file infra/.env build
 fi
 if $UP; then
   $ACCEPT_EULA || { echo "--up requires --accept-eula" >&2; exit 2; }
-  docker compose -f infra/compose.paper.yaml --env-file infra/.env up -d
+  docker compose -f "$COMPOSE" --env-file infra/.env up -d
 fi
 if $RUN; then
   $ACCEPT_EULA || { echo "--run requires --accept-eula" >&2; exit 2; }
@@ -82,7 +86,7 @@ Configured: configs/local.yaml
 Environment: infra/.env (mode 600, gitignored)
 Next:
   export DEEPSEEK_API_KEY=...       # if not passed to setup
-  docker compose -f infra/compose.paper.yaml --env-file infra/.env up -d --build
+  docker compose -f "$COMPOSE" --env-file infra/.env up -d --build
   ./scripts/run.sh
   .venv/bin/mc-harness serve runs --port 8896
 Dashboard: http://127.0.0.1:8896/

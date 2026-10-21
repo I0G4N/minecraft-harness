@@ -37,7 +37,7 @@ def write_env(path: Path, *, api_key: str | None, accept_eula: bool) -> None:
         "JAVA_IMAGE": "eclipse-temurin:17-jre-jammy",
         "NODE_IMAGE": "node:22-bookworm-slim",
     }
-    for index in range(1, 5):
+    for index in range(1, 9):
         values[f"WORKER{index}_TOKEN"] = token()
         values[f"BOT{index}_ADMIN_TOKEN"] = token()
         values[f"BOT{index}_AGENT_TOKENS_JSON"] = json.dumps({f"player{index}": token()}, separators=(",", ":"))
@@ -54,7 +54,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", type=Path, default=ROOT / "configs" / "local.yaml")
     parser.add_argument("--name", default="minecraft-harness-local")
-    parser.add_argument("--agents", type=int, choices=(1, 2, 4), default=4)
+    parser.add_argument("--agents", type=int, choices=range(1, 9), default=4)
     parser.add_argument("--model", default="deepseek-flash")
     parser.add_argument("--base-url", default="https://api.deepseek.com")
     parser.add_argument("--api-key", default=os.environ.get("DEEPSEEK_API_KEY"))
@@ -67,8 +67,8 @@ def main() -> int:
     parser.add_argument("--force", action="store_true")
     args = parser.parse_args()
 
-    if args.agents not in (1, 2, 4):
-        raise SystemExit("agents must be 1, 2 or 4")
+    if not 1 <= args.agents <= 8:
+        raise SystemExit("agents must be 1..8")
     if args.config.exists() and not args.force:
         print(f"config exists: {args.config}; use --force to replace", file=sys.stderr)
         return 2

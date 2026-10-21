@@ -19,3 +19,4 @@ infra/.cache/*
 .DS_Store
 .uv-python/
 .uv-cache/
+infra/compose.local.yaml

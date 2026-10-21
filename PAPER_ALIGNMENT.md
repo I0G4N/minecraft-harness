@@ -91,7 +91,7 @@ Vanilla 的真实短任务、小时/日尺度运行和真实模型费用均等�
 | 论文测量参数 | paper 模板 `context_chars` 调至 160000 并注明依据（论文玩家平均每次调用约 56k 输入 token）；Observer 与玩家共享同一模型/上下文口径（论文同为 coding agent），可用 `observer.context_chars` 单独放大。 | `configs/minecraft-paper-aligned.yaml` |
 | 真实 Minecraft 单 Agent 验证 | EULA 接受后在本机 Mojang 1.20.4/Easy 服务端用真实 Mineflayer + DeepSeek 跑通 `obtain_logs`（stats 原木 delta=3）与 `craft_table`（stats 工作台 delta=6），报告 token/费用在修复收尾竞态后为已知值；4 Agent paper_aligned 与日尺度未验证。 | `validation/2026-10-21-real-minecraft/` |
 
-验证：仓库内 Python **347 项通过**、Node **51 项通过**；`--network none` 离线 smoke 独立运行通过；真实 DeepSeek 1 Agent + LLM Observer 8 分钟运行 106 次调用、11 条报告、成本约 $0.24，未知用量发生后继续到墙钟上限；加入强制补报与补报重试后的 4 分钟复核为 66 次调用、10 条报告、2 次补报失败、成本约 $0.13。真实 Minecraft 1 Agent（strict，真实服务器 stats 证据）已在上表通过；4 Agent paper_aligned、付费模型能力实验与日尺度运行仍未验收；原冻结一小时 failed 结论保持不变。
+验证：仓库内 Python **350 项通过**、Node **51 项通过**；`--network none` 离线 smoke 独立运行通过；真实 DeepSeek 1 Agent + LLM Observer 8 分钟运行 106 次调用、11 条报告、成本约 $0.24，未知用量发生后继续到墙钟上限；加入强制补报与补报重试后的 4 分钟复核为 66 次调用、10 条报告、2 次补报失败、成本约 $0.13。真实 Minecraft 1 Agent（strict，真实服务器 stats 证据）已在上表通过；4 Agent paper_aligned、付费模型能力实验与日尺度运行仍未验收；原冻结一小时 failed 结论保持不变。
 
 ## 2026-10-21 二次深入审计
 
@@ -123,7 +123,7 @@ Vanilla 的真实短任务、小时/日尺度运行和真实模型费用均等�
   "Ten crystals" 没有 advancement/统计对应，固定 unavailable；in-game days（论文 ~81 天）需要 level.dat
   DayTime；论文的完整 3D 世界渲染只做到 160×160 mesh/full-world LOD，不是全精度全景。
 - 数据来源与边界见 [DASHBOARD.md](DASHBOARD.md#论文图表的动态回放)；回归测试 `tests/test_figures.py`，
-  Python 347 项 / Node 51 项通过。
+  Python 350 项 / Node 51 项通过。
 
 ## 2026-10-21 二次复核：仍未对齐的论文设计
 
@@ -176,7 +176,7 @@ Observer schema/报告、成功时间日志佐证等，然后声明更接近复�
 
 ### 2026-10-21 深夜修复结果（覆盖上述历史缺口）
 
-已实现并通过 347 项 Python + 51 项 Node 测试：
+已实现并通过 350 项 Python + 51 项 Node 测试：
 
 - `runtime.leftover_policy: allow` + bot `LEFTOVER_POLICY=allow`：正常返回和超时都保留 globals/timers/listeners/异步动作；超时执行被 detach，下一程序可运行。循环型 CPU 死循环由 loop instrumentation 在下一迭代中断并保留 globals；非循环超长 CPU 仍有 fallback reset。
 - `agents.paper_single_program: true`：paper 模板只暴露同步 `mc_execute`，async submit/wait/jobs/status/cancel/pending/events_read 全部从 schema 隐藏。

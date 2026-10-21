@@ -5,7 +5,7 @@
 ## 2026-10-21 真实模型复核与修复（独立运行）
 
 - **独立运行**：`--network none` 下 `configs/offline-smoke.yaml` 通过（`diagnostic_pass`）；框架自带 `pyproject.toml`、`uv.lock`、`node_modules`，不导入 `ai_native_harness`、`ai_native_world`、`sim2real` 或 `skill_engine`，不需要 zkdx 产品运行时、模型密钥或网络。
-- **回归**：Python **347 项通过**（含 leftover 语义、单程序工具集、Observer 完整报告、in-game days、session-loss 恢复回归），Node **51 项通过**。
+- **回归**：Python **350 项通过**（含 leftover 语义、单程序工具集、Observer 完整报告、in-game days、session-loss 恢复回归），Node **51 项通过**。
 - **真实 DeepSeek（deepseek-flash）1 Agent + 1 LLM Observer、fake 游戏**：8 分钟 106 次模型调用（player 81 / observer 25）、**11 条 `observer_report`**、3 次补报失败、成本约 $0.24；期间一次停机取消产生的 unknown usage 按最坏预留计费后继续运行到墙钟上限。强制补报 + 补报重试后的 4 分钟复核：66 次调用（player 45 / observer 21）、**10 条 `observer_report`**、2 次补报失败、成本约 $0.13，报告正常生成。
 - **修复前**：单一玩家 380 秒内触发 **190 次 Observer 调用（占 72% 成本）、0 条报告**（Observer 追自身记账事件，评审间隔失效）。修复后 Observer 评审间隔为硬下限，8 分钟 25 次调用、11 条报告。
 - **收尾竞态修复**：paper_aligned 下 Observer 在停止/成功收尾时自然退出，此前会被判为 unexpected 并让整次运行以 `infra_failed` 结束；修复后 `paper_lifecycle_soak` 连续 25 次通过，全量套件连续 3 次通过。
