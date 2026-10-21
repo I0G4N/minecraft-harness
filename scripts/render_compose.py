@@ -41,7 +41,7 @@ def rewrite(value, index: int):
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--agents", type=int, choices=range(1, 9), required=True)
+    parser.add_argument("--agents", type=int, choices=range(1, 17), required=True)
     parser.add_argument("--mode", choices=("paper", "strict"), required=True)
     parser.add_argument("--output", type=Path, default=ROOT / "infra" / "compose.local.yaml")
     parser.add_argument("--project", default="minecraft-paper")

@@ -69,7 +69,7 @@ Useful flags:
 | `--run` | Start the supervisor after setup |
 | `--install-gvisor` | Install+register pinned `runsc` (requires root/sudo) |
 | `--force` | Replace an existing `configs/local.yaml` |
-| `--agents N` | Number of players, 1–8 (4 = paper-aligned; others use strict/longrun semantics) |
+| `--agents N` | Number of players, 1–16 (4 = paper-aligned; others use strict/longrun semantics) |
 | `--wall-minutes`, `--max-calls`, `--max-cost` | Budgets |
 | `--name` | Experiment name |
 | `--world`, `--log` | Override server world/log paths |
@@ -85,10 +85,10 @@ uv run mc-harness serve runs --port 8896
 
 ## More than four agents
 
-The paper protocol uses four players. The harness itself is N-agent capable: `--agents 1..8`
+The paper protocol uses four players. The harness itself is N-agent capable: `--agents 1..16`
 generates an exact-N compose file and config. Four agents use the paper-aligned profile;
 other counts use the strict/longrun profile (same DeepSeek model and worker). Each agent gets a
-separate identity proxy, launcher, worker network and loopback bot port (3101..3108).
+separate identity proxy, launcher, worker network and loopback bot port (3101..3116).
 
 ```bash
 ./setup.sh --accept-eula --agents 6 --wall-minutes 120 --max-calls 5000 --max-cost 10

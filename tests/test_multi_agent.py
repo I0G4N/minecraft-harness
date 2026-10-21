@@ -13,11 +13,11 @@ ROOT = Path(__file__).resolve().parents[1]
 
 class MultiAgentTests(unittest.TestCase):
     def test_config_accepts_one_to_eight_agents_longrun(self):
-        for count in (1, 3, 5, 6, 8):
+        for count in (1, 3, 5, 6, 8, 16):
             with self.subTest(count=count):
                 cfg = validate_config({"agents": {"count": count}})
                 self.assertEqual(cfg["agents"]["count"], count)
-        for count in (0, 9):
+        for count in (0, 17):
             with self.subTest(count=count):
                 with self.assertRaises(ValueError):
                     validate_config({"agents": {"count": count}})

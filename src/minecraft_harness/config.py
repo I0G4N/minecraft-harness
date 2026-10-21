@@ -102,8 +102,8 @@ def validate_config(raw: dict) -> dict:
     _integer(rt["max_background_jobs"], "runtime.max_background_jobs", maximum=128)
     _integer(rt["max_background_ttl_ms"], "runtime.max_background_ttl_ms", minimum=10)
     count = agents["count"]
-    if type(count) is not int or not 1 <= count <= 8:
-        raise ValueError("agents.count must be an integer from 1 to 8")
+    if type(count) is not int or not 1 <= count <= 16:
+        raise ValueError("agents.count must be an integer from 1 to 16")
     ids = agents.get("ids", [f"player{i + 1}" for i in range(count)])
     if not isinstance(ids, list) or len(ids) != count or any(not isinstance(x, str) or not re.fullmatch(r"[A-Za-z0-9_]{1,16}", x) for x in ids) or len(set(ids)) != count:
         raise ValueError("unique Minecraft agent IDs (1–16 alphanumeric/underscore characters) required")
