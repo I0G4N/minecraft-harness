@@ -1,0 +1,440 @@
+name: ${HARNESS_PROJECT:-minecraft-paper}
+services:
+  server:
+    read_only: true
+    cap_drop: &id001
+    - ALL
+    security_opt: &id002
+    - no-new-privileges:true
+    pids_limit: 128
+    mem_limit: 2g
+    cpus: 2
+    init: true
+    restart: 'no'
+    logging: &id003
+      driver: local
+      options:
+        max-size: 10m
+        max-file: '3'
+    container_name: ${MC_SERVER_CONTAINER:-minecraft-paper-server}
+    image: minecraft-harness-server:1.20.4-research
+    user: ${MC_UID:-1000}:${MC_GID:-1000}
+    environment:
+      ACCEPT_EULA: ${ACCEPT_EULA:-false}
+      MC_SEED: ${MC_SEED:-42}
+    volumes:
+    - ${SERVER_DATA_DIR:-./server-data}:/data
+    networks:
+    - world
+    tmpfs:
+    - /tmp:rw,nosuid,nodev,size=128m
+    stdin_open: true
+    stop_grace_period: 60s
+  identity1:
+    read_only: true
+    cap_drop: *id001
+    security_opt: *id002
+    pids_limit: 64
+    mem_limit: 256m
+    cpus: 1
+    init: true
+    restart: 'no'
+    logging: *id003
+    image: minecraft-harness-control:research
+    command:
+    - node
+    - src/identity-proxy.js
+    environment:
+      ALLOWED_USERNAME: player1
+      MC_HOST: server
+      MC_PORT: '25565'
+      GAME_CHAT: ${GAME_CHAT:-true}
+    networks:
+    - worker1
+    - world
+    depends_on:
+    - server
+  launcher1:
+    read_only: true
+    cap_drop: *id001
+    security_opt: *id002
+    pids_limit: 64
+    mem_limit: 256m
+    cpus: 1
+    init: true
+    restart: 'no'
+    logging: *id003
+    image: minecraft-harness-launcher:research
+    user: 0:0
+    volumes:
+    - /var/run/docker.sock:/var/run/docker.sock
+    tmpfs:
+    - /tmp:rw,nosuid,nodev,size=32m
+    environment:
+      WORKER_AGENT_ID: player1
+      WORKER_HOST_TOKEN: ${WORKER1_TOKEN:?Set unique WORKER1_TOKEN}
+      WORKER_HOST_ID: ${HARNESS_PROJECT:-minecraft-paper}-player1
+      WORKER_SANDBOX_IMAGE: minecraft-harness-worker:research
+      # Optional mature OCI sandbox runtime, e.g. runsc (gVisor). Empty = runc + native filter.
+      WORKER_SANDBOX_RUNTIME: ${WORKER_SANDBOX_RUNTIME:-runsc}
+      WORKER_NETWORK: ${HARNESS_PROJECT:-minecraft-paper}_worker1
+      WORKER_MC_HOST: identity1
+      WORKER_BIND: 0.0.0.0
+      WORKER_PORT: '3901'
+      WORKER_IDENTITY_PROXY: 'true'
+    networks:
+    - control
+    depends_on:
+    - identity1
+  bot1:
+    read_only: true
+    cap_drop: *id001
+    security_opt: *id002
+    pids_limit: 64
+    mem_limit: 256m
+    cpus: 1
+    init: true
+    restart: 'no'
+    logging: *id003
+    image: minecraft-harness-control:research
+    environment:
+      BIND: 0.0.0.0
+      PORT: '3001'
+      MODE: minecraft
+      LIFECYCLE: paper_aligned
+      MC_VERSION: 1.20.4
+      ALLOWED_AGENT_ID: player1
+      ALLOWED_USERNAME: player1
+      TOKEN: ${BOT1_ADMIN_TOKEN:?Set BOT1_ADMIN_TOKEN}
+      AGENT_TOKENS_JSON: ${BOT1_AGENT_TOKENS_JSON:-}
+      WORKER_ENDPOINTS_JSON: '{"player1":{"endpoint":"tcp://launcher1:3901","token":"${WORKER1_TOKEN}"}}'
+      SUPERVISOR_LEASE_MS: '30000'
+      MAX_BACKGROUND_JOBS: '8'
+      MAX_BACKGROUND_TTL_MS: '129600000'
+      # Keep in sync with configs/minecraft-paper-aligned.yaml runtime.program_timeout_max_s.
+      MAX_TIMEOUT_MS: '600000'
+      # Paper §4: timed-out/returned programs may leave code, timers and globals alive.
+      LEFTOVER_POLICY: allow
+      CHAT_DELIVERY: program_output
+      MAX_PROGRAM_LOGS: '16384'
+      MAX_PROGRAM_LOG_BYTES: '16777216'
+      MAX_RESULT_BYTES: '8388608'
+      MAX_RESPONSE_BYTES: '67108864'
+    ports:
+    - 127.0.0.1:3101:3001
+    networks:
+    - control
+    depends_on:
+    - launcher1
+  identity2:
+    read_only: true
+    cap_drop: *id001
+    security_opt: *id002
+    pids_limit: 64
+    mem_limit: 256m
+    cpus: 1
+    init: true
+    restart: 'no'
+    logging: *id003
+    image: minecraft-harness-control:research
+    command:
+    - node
+    - src/identity-proxy.js
+    environment:
+      ALLOWED_USERNAME: player2
+      MC_HOST: server
+      MC_PORT: '25565'
+      GAME_CHAT: ${GAME_CHAT:-true}
+    networks:
+    - worker2
+    - world
+    depends_on:
+    - server
+  launcher2:
+    read_only: true
+    cap_drop: *id001
+    security_opt: *id002
+    pids_limit: 64
+    mem_limit: 256m
+    cpus: 1
+    init: true
+    restart: 'no'
+    logging: *id003
+    image: minecraft-harness-launcher:research
+    user: 0:0
+    volumes:
+    - /var/run/docker.sock:/var/run/docker.sock
+    tmpfs:
+    - /tmp:rw,nosuid,nodev,size=32m
+    environment:
+      WORKER_AGENT_ID: player2
+      WORKER_HOST_TOKEN: ${WORKER2_TOKEN:?Set unique WORKER2_TOKEN}
+      WORKER_HOST_ID: ${HARNESS_PROJECT:-minecraft-paper}-player2
+      WORKER_SANDBOX_IMAGE: minecraft-harness-worker:research
+      # Optional mature OCI sandbox runtime, e.g. runsc (gVisor). Empty = runc + native filter.
+      WORKER_SANDBOX_RUNTIME: ${WORKER_SANDBOX_RUNTIME:-runsc}
+      WORKER_NETWORK: ${HARNESS_PROJECT:-minecraft-paper}_worker2
+      WORKER_MC_HOST: identity2
+      WORKER_BIND: 0.0.0.0
+      WORKER_PORT: '3901'
+      WORKER_IDENTITY_PROXY: 'true'
+    networks:
+    - control
+    depends_on:
+    - identity2
+  bot2:
+    read_only: true
+    cap_drop: *id001
+    security_opt: *id002
+    pids_limit: 64
+    mem_limit: 256m
+    cpus: 1
+    init: true
+    restart: 'no'
+    logging: *id003
+    image: minecraft-harness-control:research
+    environment:
+      BIND: 0.0.0.0
+      PORT: '3001'
+      MODE: minecraft
+      LIFECYCLE: paper_aligned
+      MC_VERSION: 1.20.4
+      ALLOWED_AGENT_ID: player2
+      ALLOWED_USERNAME: player2
+      TOKEN: ${BOT2_ADMIN_TOKEN:?Set BOT2_ADMIN_TOKEN}
+      AGENT_TOKENS_JSON: ${BOT2_AGENT_TOKENS_JSON:-}
+      WORKER_ENDPOINTS_JSON: '{"player2":{"endpoint":"tcp://launcher2:3901","token":"${WORKER2_TOKEN}"}}'
+      SUPERVISOR_LEASE_MS: '30000'
+      MAX_BACKGROUND_JOBS: '8'
+      MAX_BACKGROUND_TTL_MS: '129600000'
+      # Keep in sync with configs/minecraft-paper-aligned.yaml runtime.program_timeout_max_s.
+      MAX_TIMEOUT_MS: '600000'
+      # Paper §4: timed-out/returned programs may leave code, timers and globals alive.
+      LEFTOVER_POLICY: allow
+      CHAT_DELIVERY: program_output
+      MAX_PROGRAM_LOGS: '16384'
+      MAX_PROGRAM_LOG_BYTES: '16777216'
+      MAX_RESULT_BYTES: '8388608'
+      MAX_RESPONSE_BYTES: '67108864'
+    ports:
+    - 127.0.0.1:3102:3001
+    networks:
+    - control
+    depends_on:
+    - launcher2
+  identity3:
+    read_only: true
+    cap_drop: *id001
+    security_opt: *id002
+    pids_limit: 64
+    mem_limit: 256m
+    cpus: 1
+    init: true
+    restart: 'no'
+    logging: *id003
+    image: minecraft-harness-control:research
+    command:
+    - node
+    - src/identity-proxy.js
+    environment:
+      ALLOWED_USERNAME: player3
+      MC_HOST: server
+      MC_PORT: '25565'
+      GAME_CHAT: ${GAME_CHAT:-true}
+    networks:
+    - worker3
+    - world
+    depends_on:
+    - server
+  launcher3:
+    read_only: true
+    cap_drop: *id001
+    security_opt: *id002
+    pids_limit: 64
+    mem_limit: 256m
+    cpus: 1
+    init: true
+    restart: 'no'
+    logging: *id003
+    image: minecraft-harness-launcher:research
+    user: 0:0
+    volumes:
+    - /var/run/docker.sock:/var/run/docker.sock
+    tmpfs:
+    - /tmp:rw,nosuid,nodev,size=32m
+    environment:
+      WORKER_AGENT_ID: player3
+      WORKER_HOST_TOKEN: ${WORKER3_TOKEN:?Set unique WORKER3_TOKEN}
+      WORKER_HOST_ID: ${HARNESS_PROJECT:-minecraft-paper}-player3
+      WORKER_SANDBOX_IMAGE: minecraft-harness-worker:research
+      # Optional mature OCI sandbox runtime, e.g. runsc (gVisor). Empty = runc + native filter.
+      WORKER_SANDBOX_RUNTIME: ${WORKER_SANDBOX_RUNTIME:-runsc}
+      WORKER_NETWORK: ${HARNESS_PROJECT:-minecraft-paper}_worker3
+      WORKER_MC_HOST: identity3
+      WORKER_BIND: 0.0.0.0
+      WORKER_PORT: '3901'
+      WORKER_IDENTITY_PROXY: 'true'
+    networks:
+    - control
+    depends_on:
+    - identity3
+  bot3:
+    read_only: true
+    cap_drop: *id001
+    security_opt: *id002
+    pids_limit: 64
+    mem_limit: 256m
+    cpus: 1
+    init: true
+    restart: 'no'
+    logging: *id003
+    image: minecraft-harness-control:research
+    environment:
+      BIND: 0.0.0.0
+      PORT: '3001'
+      MODE: minecraft
+      LIFECYCLE: paper_aligned
+      MC_VERSION: 1.20.4
+      ALLOWED_AGENT_ID: player3
+      ALLOWED_USERNAME: player3
+      TOKEN: ${BOT3_ADMIN_TOKEN:?Set BOT3_ADMIN_TOKEN}
+      AGENT_TOKENS_JSON: ${BOT3_AGENT_TOKENS_JSON:-}
+      WORKER_ENDPOINTS_JSON: '{"player3":{"endpoint":"tcp://launcher3:3901","token":"${WORKER3_TOKEN}"}}'
+      SUPERVISOR_LEASE_MS: '30000'
+      MAX_BACKGROUND_JOBS: '8'
+      MAX_BACKGROUND_TTL_MS: '129600000'
+      # Keep in sync with configs/minecraft-paper-aligned.yaml runtime.program_timeout_max_s.
+      MAX_TIMEOUT_MS: '600000'
+      # Paper §4: timed-out/returned programs may leave code, timers and globals alive.
+      LEFTOVER_POLICY: allow
+      CHAT_DELIVERY: program_output
+      MAX_PROGRAM_LOGS: '16384'
+      MAX_PROGRAM_LOG_BYTES: '16777216'
+      MAX_RESULT_BYTES: '8388608'
+      MAX_RESPONSE_BYTES: '67108864'
+    ports:
+    - 127.0.0.1:3103:3001
+    networks:
+    - control
+    depends_on:
+    - launcher3
+  identity4:
+    read_only: true
+    cap_drop: *id001
+    security_opt: *id002
+    pids_limit: 64
+    mem_limit: 256m
+    cpus: 1
+    init: true
+    restart: 'no'
+    logging: *id003
+    image: minecraft-harness-control:research
+    command:
+    - node
+    - src/identity-proxy.js
+    environment:
+      ALLOWED_USERNAME: player4
+      MC_HOST: server
+      MC_PORT: '25565'
+      GAME_CHAT: ${GAME_CHAT:-true}
+    networks:
+    - worker4
+    - world
+    depends_on:
+    - server
+  launcher4:
+    read_only: true
+    cap_drop: *id001
+    security_opt: *id002
+    pids_limit: 64
+    mem_limit: 256m
+    cpus: 1
+    init: true
+    restart: 'no'
+    logging: *id003
+    image: minecraft-harness-launcher:research
+    user: 0:0
+    volumes:
+    - /var/run/docker.sock:/var/run/docker.sock
+    tmpfs:
+    - /tmp:rw,nosuid,nodev,size=32m
+    environment:
+      WORKER_AGENT_ID: player4
+      WORKER_HOST_TOKEN: ${WORKER4_TOKEN:?Set unique WORKER4_TOKEN}
+      WORKER_HOST_ID: ${HARNESS_PROJECT:-minecraft-paper}-player4
+      WORKER_SANDBOX_IMAGE: minecraft-harness-worker:research
+      # Optional mature OCI sandbox runtime, e.g. runsc (gVisor). Empty = runc + native filter.
+      WORKER_SANDBOX_RUNTIME: ${WORKER_SANDBOX_RUNTIME:-runsc}
+      WORKER_NETWORK: ${HARNESS_PROJECT:-minecraft-paper}_worker4
+      WORKER_MC_HOST: identity4
+      WORKER_BIND: 0.0.0.0
+      WORKER_PORT: '3901'
+      WORKER_IDENTITY_PROXY: 'true'
+    networks:
+    - control
+    depends_on:
+    - identity4
+  bot4:
+    read_only: true
+    cap_drop: *id001
+    security_opt: *id002
+    pids_limit: 64
+    mem_limit: 256m
+    cpus: 1
+    init: true
+    restart: 'no'
+    logging: *id003
+    image: minecraft-harness-control:research
+    environment:
+      BIND: 0.0.0.0
+      PORT: '3001'
+      MODE: minecraft
+      LIFECYCLE: paper_aligned
+      MC_VERSION: 1.20.4
+      ALLOWED_AGENT_ID: player4
+      ALLOWED_USERNAME: player4
+      TOKEN: ${BOT4_ADMIN_TOKEN:?Set BOT4_ADMIN_TOKEN}
+      AGENT_TOKENS_JSON: ${BOT4_AGENT_TOKENS_JSON:-}
+      WORKER_ENDPOINTS_JSON: '{"player4":{"endpoint":"tcp://launcher4:3901","token":"${WORKER4_TOKEN}"}}'
+      SUPERVISOR_LEASE_MS: '30000'
+      MAX_BACKGROUND_JOBS: '8'
+      MAX_BACKGROUND_TTL_MS: '129600000'
+      # Keep in sync with configs/minecraft-paper-aligned.yaml runtime.program_timeout_max_s.
+      MAX_TIMEOUT_MS: '600000'
+      # Paper §4: timed-out/returned programs may leave code, timers and globals alive.
+      LEFTOVER_POLICY: allow
+      CHAT_DELIVERY: program_output
+      MAX_PROGRAM_LOGS: '16384'
+      MAX_PROGRAM_LOG_BYTES: '16777216'
+      MAX_RESULT_BYTES: '8388608'
+      MAX_RESPONSE_BYTES: '67108864'
+    ports:
+    - 127.0.0.1:3104:3001
+    networks:
+    - control
+    depends_on:
+    - launcher4
+networks:
+  world:
+    internal: true
+  control: {}
+  worker1:
+    internal: true
+    driver_opts:
+      com.docker.network.bridge.gateway_mode_ipv4: isolated
+    name: ${HARNESS_PROJECT:-minecraft-paper}_worker1
+  worker2:
+    internal: true
+    driver_opts:
+      com.docker.network.bridge.gateway_mode_ipv4: isolated
+    name: ${HARNESS_PROJECT:-minecraft-paper}_worker2
+  worker3:
+    internal: true
+    driver_opts:
+      com.docker.network.bridge.gateway_mode_ipv4: isolated
+    name: ${HARNESS_PROJECT:-minecraft-paper}_worker3
+  worker4:
+    internal: true
+    driver_opts:
+      com.docker.network.bridge.gateway_mode_ipv4: isolated
+    name: ${HARNESS_PROJECT:-minecraft-paper}_worker4

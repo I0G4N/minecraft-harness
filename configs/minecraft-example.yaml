@@ -1,0 +1,37 @@
+# Provision isolated runtimes using infra/compose.yaml; secrets only via env.
+experiment:
+  name: four-agent-logs
+  task: obtain_logs
+  goal: As a team, obtain at least one wood log in this shared survival world. Verify the result.
+agents:
+  count: 4
+  max_turns: 100
+model:
+  kind: chat_completions
+  base_url: https://YOUR-MODEL-GATEWAY/v1
+  model: YOUR-TOOL-CALLING-MODEL
+  api_key_env: MC_MODEL_API_KEY
+  max_output_tokens: 4096
+  max_retries: 0
+runtime:
+  mode: minecraft
+  urls:
+    player1: http://127.0.0.1:3101
+    player2: http://127.0.0.1:3102
+    player3: http://127.0.0.1:3103
+    player4: http://127.0.0.1:3104
+  token_envs:
+    player1: BOT1_ADMIN_TOKEN
+    player2: BOT2_ADMIN_TOKEN
+    player3: BOT3_ADMIN_TOKEN
+    player4: BOT4_ADMIN_TOKEN
+server:
+  world_dir: ../infra/server-data/world
+  log_path: ../infra/server-data/logs/latest.log
+  managed_container: minecraft-harness-server
+  save_interval_s: 300
+budgets:
+  wall_time_minutes: 30
+  total_model_calls: 200
+observer:
+  mode: rules

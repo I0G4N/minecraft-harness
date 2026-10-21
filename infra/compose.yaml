@@ -1,0 +1,175 @@
+name: minecraft-harness
+
+x-bot: &bot
+  build:
+    context: ..
+    dockerfile: infra/bot.Dockerfile
+    args:
+      NODE_IMAGE: ${NODE_IMAGE:-node:22-bookworm-slim}
+  image: minecraft-harness-bot:local
+  read_only: true
+  cap_drop: [ALL]
+  security_opt: [no-new-privileges:true]
+  tmpfs:
+    - /tmp:rw,nosuid,nodev,size=64m
+  mem_limit: 512m
+  pids_limit: 64
+  cpus: 1
+  init: true
+  restart: "no"
+  logging:
+    driver: local
+    options: {max-size: "10m", max-file: "3"}
+  healthcheck:
+    test: [CMD, node, -e, "fetch('http://127.0.0.1:3001/health').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))"]
+    interval: 15s
+    timeout: 4s
+    retries: 3
+    start_period: 60s
+  depends_on: [server]
+
+x-bot-environment: &bot-environment
+  BIND: 0.0.0.0
+  PORT: "3001"
+  MODE: minecraft
+  MC_HOST: server
+  MC_PORT: "25565"
+  MC_VERSION: "1.20.4"
+  # Keep in sync with configs/minecraft-longrun.yaml runtime.program_timeout_max_s.
+  MAX_TIMEOUT_MS: "600000"
+  STARTUP_TIMEOUT_MS: "45000"
+  SUPERVISOR_LEASE_MS: "30000"
+  PARENT_WATCHDOG_MS: "10000"
+  MAX_WORKER_RSS_BYTES: "268435456"
+  MAX_BUFFERED_EVENTS: "4096"
+  MAX_EVENT_BYTES: "8388608"
+  MAX_RETAINED_EXECUTIONS: "128"
+  MAX_RESPONSE_BYTES: "4194304"
+
+services:
+  server:
+    container_name: ${MC_SERVER_CONTAINER:-minecraft-harness-server}
+    user: "${MC_UID:-1000}:${MC_GID:-1000}"
+    build:
+      context: .
+      dockerfile: server.Dockerfile
+      args:
+        JAVA_IMAGE: ${JAVA_IMAGE:-eclipse-temurin:17-jre-jammy}
+    image: minecraft-harness-server:1.20.4-local
+    environment:
+      ACCEPT_EULA: ${ACCEPT_EULA:-false}
+      MC_SEED: ${MC_SEED:-42}
+    volumes: ["${SERVER_DATA_DIR:-./server-data}:/data"]
+    # Bots reach server:25565 on their internal game network. Host gameplay
+    # would require a separate, explicitly provisioned fixed game relay.
+    networks: [game1, game2, game3, game4]
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    tmpfs:
+    - /tmp:rw,nosuid,nodev,size=128m
+    mem_limit: 2g
+    pids_limit: 128
+    cpus: 2
+    stdin_open: true
+    init: true
+    stop_grace_period: 60s
+    restart: "no"
+    logging:
+      driver: local
+      options: {max-size: "10m", max-file: "3"}
+    healthcheck:
+      test: [CMD, timeout, "3", harness-control, ready]
+      interval: 15s
+      timeout: 4s
+      retries: 3
+      start_period: 90s
+  bot1:
+    <<: *bot
+    environment:
+      <<: *bot-environment
+      TOKEN: ${BOT1_ADMIN_TOKEN:?Set BOT1_ADMIN_TOKEN}
+      AGENT_TOKENS_JSON: ${BOT1_AGENT_TOKENS_JSON:?Set BOT1_AGENT_TOKENS_JSON}
+      ALLOWED_AGENT_ID: player1
+      ALLOWED_USERNAME: player1
+    networks: [game1]
+  bot2:
+    <<: *bot
+    profiles: [two, four]
+    environment:
+      <<: *bot-environment
+      TOKEN: ${BOT2_ADMIN_TOKEN:-unused-profile-token-2}
+      AGENT_TOKENS_JSON: ${BOT2_AGENT_TOKENS_JSON:-}
+      ALLOWED_AGENT_ID: player2
+      ALLOWED_USERNAME: player2
+    networks: [game2]
+  bot3:
+    <<: *bot
+    profiles: [four]
+    environment:
+      <<: *bot-environment
+      TOKEN: ${BOT3_ADMIN_TOKEN:-unused-profile-token-3}
+      AGENT_TOKENS_JSON: ${BOT3_AGENT_TOKENS_JSON:-}
+      ALLOWED_AGENT_ID: player3
+      ALLOWED_USERNAME: player3
+    networks: [game3]
+  bot4:
+    <<: *bot
+    profiles: [four]
+    environment:
+      <<: *bot-environment
+      TOKEN: ${BOT4_ADMIN_TOKEN:-unused-profile-token-4}
+      AGENT_TOKENS_JSON: ${BOT4_AGENT_TOKENS_JSON:-}
+      ALLOWED_AGENT_ID: player4
+      ALLOWED_USERNAME: player4
+    networks: [game4]
+  rpc-relay:
+    build:
+      context: ..
+      dockerfile: infra/rpc-relay.Dockerfile
+      args:
+        NODE_IMAGE: ${NODE_IMAGE:-node:22-bookworm-slim}
+    image: minecraft-harness-rpc-relay:local
+    environment:
+      RELAY_ENABLED_AGENTS: bot1,bot2,bot3,bot4
+      RELAY_MAX_CONNECTIONS: "128"
+      # Session creation may wait 45s for Mineflayer; Python allows 60s.
+      RELAY_IDLE_TIMEOUT_MS: "90000"
+      RELAY_CONNECT_TIMEOUT_MS: "5000"
+    # Host endpoints stay fixed; only this fixed-upstream relay joins the
+    # ordinary network needed for Docker localhost publication/NAT.
+    ports:
+      - "127.0.0.1:3101:3001"
+      - "127.0.0.1:3102:3002"
+      - "127.0.0.1:3103:3003"
+      - "127.0.0.1:3104:3004"
+    networks: [rpc, game1, game2, game3, game4]
+    depends_on: [bot1]
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    tmpfs:
+    - /tmp:rw,nosuid,nodev,size=32m
+    mem_limit: 128m
+    pids_limit: 64
+    cpus: 0.5
+    init: true
+    restart: "no"
+    logging:
+      driver: local
+      options: {max-size: "10m", max-file: "3"}
+    healthcheck:
+      test: [CMD, node, -e, "fetch('http://127.0.0.1:3001/health').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))"]
+      interval: 15s
+      timeout: 4s
+      retries: 3
+      start_period: 60s
+
+# Each bot joins one internal game bridge with the server and fixed RPC relay.
+# The relay has no generic destination forwarding or world/model-key mount.
+networks:
+  rpc: {}
+  game1: {internal: true}
+  game2: {internal: true}
+  game3: {internal: true}
+  game4: {internal: true}

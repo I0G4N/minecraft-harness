@@ -1,0 +1,26 @@
+{
+  "name": "minecraft-harness-bot-runtime",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Independent Mineflayer program runtime; process isolation is not a security sandbox",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "postinstall": "node scripts/canvas-shim.mjs",
+    "start": "node src/server.js",
+    "test": "node --test test/*.test.js tests/*.test.js",
+    "test:protocol": "node --test tests/protocol-integration.test.js",
+    "test:soak": "node scripts/soak.js"
+  },
+  "dependencies": {
+    "@napi-rs/canvas": "^0.1.80",
+    "acorn": "^8.19.0",
+    "minecraft-data": "3.117.0",
+    "mineflayer": "4.35.0",
+    "mineflayer-pathfinder": "2.4.5",
+    "prismarine-viewer": "1.33.0",
+    "vec3": "0.1.10"
+  }
+}

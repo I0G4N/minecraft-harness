@@ -1,0 +1,9 @@
+{
+  "minecraft_version": "1.20.4",
+  "manifest_url": "https://piston-meta.mojang.com/mc/game/version_manifest_v2.json",
+  "metadata_url": "https://piston-meta.mojang.com/v1/packages/ee2bc046cef978a91a7494e760a32d4f7f3e835c/1.20.4.json",
+  "metadata_sha1": "ee2bc046cef978a91a7494e760a32d4f7f3e835c",
+  "server_url": "https://piston-data.mojang.com/v1/objects/8dd1a28015f51b1803213892b50b7b4fc76e594d/server.jar",
+  "server_sha1": "8dd1a28015f51b1803213892b50b7b4fc76e594d",
+  "server_sha256": "c03fa6f39daa69ddf413c965a3a83084db746a7a138ce535a693293b5472d363"
+}

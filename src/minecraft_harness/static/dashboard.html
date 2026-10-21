@@ -1,0 +1,178 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="operator-token" content="__TOKEN__">
+  <meta name="color-scheme" content="dark">
+  <title>实验观测台 · Minecraft Harness</title>
+  <link rel="icon" href="/ui-assets/grass_block_side.png" type="image/png">
+  <link rel="stylesheet" href="/dashboard.css">
+  <script src="/dashboard.js" defer></script>
+</head>
+<body>
+  <a class="skip-link" href="#main">跳转到实验数据</a>
+  <button id="nav-backdrop" class="nav-backdrop" aria-label="收起导航" hidden></button>
+  <aside id="sidebar" class="sidebar" aria-label="主导航">
+    <a class="brand" href="#overview" aria-label="实验观测台首页">
+      <img class="brand-mark" src="/ui-assets/crafting_table_top.png" alt="" width="36" height="36" aria-hidden="true">
+      <span><strong>实验观测台</strong><small>MINECRAFT HARNESS</small></span>
+    </a>
+    <div class="nav-groups">
+      <div class="nav-group">
+        <div class="nav-section-label">运行</div>
+        <nav class="nav-list" aria-label="运行">
+          <a href="#overview" data-view="overview" class="nav-item active" aria-current="page"><img class="nav-icon" src="/ui-assets/map.png" alt="" width="20" height="20" aria-hidden="true"><span>实验总览</span><span class="nav-key">⌘ 1</span></a>
+          <a href="#events" data-view="events" class="nav-item"><img class="nav-icon" src="/ui-assets/clock.png" alt="" width="20" height="20" aria-hidden="true"><span>事件时间线</span><span id="nav-event-count" class="nav-count">—</span></a>
+          <a href="#programs" data-view="programs" class="nav-item"><img class="nav-icon" src="/ui-assets/redstone.png" alt="" width="20" height="20" aria-hidden="true"><span>程序与任务</span></a>
+          <a href="#chat" data-view="chat" class="nav-item"><img class="nav-icon" src="/ui-assets/writable_book.png" alt="" width="20" height="20" aria-hidden="true"><span>协作聊天</span></a>
+        </nav>
+      </div>
+      <div class="nav-group">
+        <div class="nav-section-label">证据与审计</div>
+        <nav class="nav-list" aria-label="证据与审计">
+          <a href="#evidence" data-view="evidence" class="nav-item"><img class="nav-icon" src="/ui-assets/spyglass.png" alt="" width="20" height="20" aria-hidden="true"><span>证据与评估</span></a>
+          <a href="#observer" data-view="observer" class="nav-item"><img class="nav-icon" src="/ui-assets/ender_eye.png" alt="" width="20" height="20" aria-hidden="true"><span>Observer 审阅</span></a>
+          <a href="#resources" data-view="resources" class="nav-item"><img class="nav-icon" src="/ui-assets/gold_ingot.png" alt="" width="20" height="20" aria-hidden="true"><span>资源与费用</span></a>
+        </nav>
+      </div>
+      <div class="nav-group">
+        <div class="nav-section-label">观察工具</div>
+        <nav class="nav-list" aria-label="观察工具">
+          <a href="#figures" data-view="figures" class="nav-item"><img class="nav-icon" src="/ui-assets/painting.png" alt="" width="20" height="20" aria-hidden="true"><span>论文图表</span></a>
+          <a href="#live" data-view="live" class="nav-item"><img class="nav-icon" src="/ui-assets/ender_pearl.png" alt="" width="20" height="20" aria-hidden="true"><span>实时第一视角</span></a>
+        </nav>
+      </div>
+    </div>
+    <div class="sidebar-footer">
+      <div class="operator-note"><span class="operator-dot"></span><div><strong>操作者视角</strong><small>只读观测 · 操作需要确认</small></div></div>
+      <button id="control-open" class="sidebar-control"><img class="nav-icon" src="/ui-assets/lever.png" alt="" width="18" height="18" aria-hidden="true">实验控制<span>↗</span></button>
+      <div class="sidebar-version">HARNESS / LOCAL OBSERVATORY</div>
+    </div>
+  </aside>
+
+  <div class="workspace">
+    <header class="topbar">
+      <div class="topbar-left"><button id="nav-toggle" class="icon-button" aria-label="收起或展开导航" aria-expanded="true" title="收起/展开导航"><svg viewBox="0 0 20 20"><path d="M3 5h14M3 10h14M3 15h14"/></svg></button><span class="breadcrumb">实验工作空间</span><span class="breadcrumb-slash">/</span><label class="run-select-wrap"><span class="sr-only">选择实验运行</span><select id="run-select" aria-label="选择实验运行"><option value="">当前实验</option></select></label></div>
+      <div class="topbar-actions"><span id="connection" class="connection"><span class="status-dot"></span><span>连接中</span></span><button id="poll-toggle" class="button button-quiet" aria-pressed="false" title="仅暂停页面刷新，不影响实验"><svg viewBox="0 0 20 20"><path d="M7 4v12M13 4v12"/></svg><span>暂停刷新</span></button><button id="refresh" class="icon-button" aria-label="立即刷新"><svg viewBox="0 0 20 20"><path d="M16 7a6 6 0 1 0 0 6M16 3v4h-4"/></svg></button></div>
+    </header>
+
+    <section id="run-hud" class="run-hud" aria-label="运行摘要">
+      <div class="hud-items">
+        <div class="hud-item"><span>状态</span><strong id="hud-status">—</strong></div>
+        <div class="hud-item"><span>运行时长</span><strong id="hud-time">—</strong></div>
+        <div class="hud-item"><span>程序</span><strong id="hud-programs">—</strong></div>
+        <div class="hud-item"><span>模型 / 费用</span><strong id="hud-model">—</strong></div>
+        <div class="hud-item"><span>Observer</span><strong id="hud-observer">—</strong></div>
+      </div>
+      <div class="hud-actions">
+        <button id="hud-control" type="button" class="button button-secondary"><img class="nav-icon" src="/ui-assets/lever.png" alt="" width="16" height="16" aria-hidden="true">实验控制</button>
+        <a class="button button-secondary" href="#live"><img class="nav-icon" src="/ui-assets/ender_pearl.png" alt="" width="16" height="16" aria-hidden="true">实时视角</a>
+      </div>
+    </section>
+
+    <main id="main" tabindex="-1">
+      <div id="error-banner" class="notice notice-error" role="alert" hidden><span id="error-message"></span><button id="error-dismiss" class="text-button">关闭</button></div>
+      <div class="page-heading"><div class="page-heading-main"><span id="page-icon" class="mc-page-icon" aria-hidden="true"></span><div><div class="eyebrow">EXPERIMENT OBSERVATORY</div><h1 id="page-title">实验总览</h1><p id="page-description">在同一处查看运行状态、协作过程与可核验证据。</p></div></div><div class="heading-meta"><span id="run-status" class="badge neutral">等待数据</span><span id="profile-badge" class="badge outline" hidden></span><span id="diagnostic-badge" class="badge warning" hidden>诊断运行</span><span id="last-updated">尚未同步</span></div></div>
+      <div id="scope-banner" class="scope-banner"><span class="scope-icon">i</span><span id="scope-text">未知值显示为「未知」；页面刷新不会触发实验操作。</span></div>
+
+      <section data-panel="overview" id="panel-overview" class="view-panel">
+        <div id="overview-metrics" class="metric-grid" aria-label="实验关键指标"></div>
+        <nav class="quick-nav" aria-label="快速入口">
+          <a class="quick-link" href="#events"><img src="/ui-assets/clock.png" alt="" width="18" height="18"><span>事件时间线</span></a>
+          <a class="quick-link" href="#programs"><img src="/ui-assets/redstone.png" alt="" width="18" height="18"><span>程序与任务</span></a>
+          <a class="quick-link" href="#evidence"><img src="/ui-assets/spyglass.png" alt="" width="18" height="18"><span>证据与评估</span></a>
+          <a class="quick-link" href="#chat"><img src="/ui-assets/writable_book.png" alt="" width="18" height="18"><span>协作聊天</span></a>
+          <a class="quick-link" href="#figures"><img src="/ui-assets/painting.png" alt="" width="18" height="18"><span>论文图表</span></a>
+          <a class="quick-link" href="#live"><img src="/ui-assets/ender_pearl.png" alt="" width="18" height="18"><span>实时第一视角</span></a>
+        </nav>
+        <div class="overview-primary">
+          <section class="card activity-card"><div class="card-heading"><div><h2>运行活动</h2><p>Supervisor 内存与采样状态</p></div><span id="activity-label" class="subtle">等待采样</span></div><div class="chart-legend"><span><i class="legend-dot green"></i>Python RSS</span><span id="activity-current" class="chart-current">— <small>MiB</small></span></div><div class="chart-wrap"><canvas id="overview-chart" aria-label="Supervisor Python 内存趋势，单位MiB" role="img"></canvas><div id="overview-chart-empty" class="chart-empty">尚无资源采样</div></div><div class="chart-footer"><span id="chart-range">资源采样来自持久事件</span><span>点间连线仅作阅读辅助</span></div></section>
+          <section class="card health-card"><div class="card-heading"><div><h2>运行健康</h2><p>基础设施与证据的独立状态</p></div><span id="health-indicator" class="mini-indicator"></span></div><div id="health-items" class="health-list"></div><div id="health-footnote" class="card-footnote">框架运行状态与游戏任务成败分别记录。</div></section>
+        </div>
+        <div class="overview-secondary"><section class="card"><div class="card-heading"><div><h2>参与者</h2><p>已记录的执行活动与模型调用</p></div><button class="text-button" data-go="programs">查看执行 <span>↗</span></button></div><div class="table-scroll"><table><thead><tr><th>参与者</th><th>程序</th><th>模型调用</th><th>当前状态</th></tr></thead><tbody id="actors-table"></tbody></table></div></section><section class="card"><div class="card-heading"><div><h2>最近动态</h2><p>来自可信持久事件账本</p></div><button class="text-button" data-go="events">全部事件 <span>↗</span></button></div><div id="recent-activity" class="activity-feed"></div></section></div>
+        <section class="card metadata-card"><div class="card-heading"><div><h2>实验信息</h2><p>本次运行的条件与数据边界</p></div><span class="badge outline">OPERATOR ONLY</span></div><dl id="run-metadata" class="metadata-grid"></dl></section>
+      </section>
+
+      <section data-panel="events" id="panel-events" class="view-panel" hidden>
+        <form id="events-filter" class="filter-bar"><label>参与者<select name="actor" class="actor-select"><option value="">全部参与者</option></select></label><label>类别<select name="category"><option value="all">全部类别</option><option value="program">程序</option><option value="job">后台任务</option><option value="chat">聊天</option><option value="model">模型调用</option><option value="observer">Observer</option><option value="evidence">证据与世界</option><option value="control">操作者控制</option><option value="system">系统</option></select></label><label>级别<select name="severity"><option value="">全部级别</option><option value="error">错误</option><option value="warning">警告</option><option value="info">信息</option></select></label><label class="filter-search">搜索<input name="q" placeholder="事件类型、内容或执行 ID" autocomplete="off" maxlength="256"></label><button class="button button-primary" type="submit">应用筛选</button><button class="button button-quiet" type="reset">重置</button><label class="follow-toggle"><input id="events-follow" type="checkbox" checked>实时跟随</label></form>
+        <section class="card table-card"><div class="table-caption"><span id="events-count">正在读取事件</span><span class="subtle">点击行查看详情与关联产物</span></div><div class="table-scroll"><table class="interactive-table"><thead><tr><th class="seq-column">序号 / 时间</th><th>参与者</th><th>事件</th><th>内容摘要</th><th>来源</th><th></th></tr></thead><tbody id="events-table"></tbody></table></div><div class="pagination"><span id="events-scope" class="subtle"></span><button id="events-more" class="button button-secondary">加载更早事件</button></div></section>
+      </section>
+
+      <section data-panel="programs" id="panel-programs" class="view-panel" hidden>
+        <div class="section-toolbar"><div class="segmented" role="tablist" aria-label="执行类型"><button id="program-tab" role="tab" aria-selected="true" data-program-tab="programs">前台程序<span id="program-count"></span></button><button id="job-tab" role="tab" aria-selected="false" data-program-tab="jobs">后台任务<span id="job-count"></span></button></div><p class="toolbar-note">等待结束不等于取消 · 恢复后不会自动重放动作</p></div>
+        <form id="programs-filter" class="filter-bar"><label>参与者<select name="actor" class="actor-select"><option value="">全部参与者</option></select></label><label>状态<select name="status"><option value="">全部状态</option><option value="running">运行中</option><option value="succeeded">已完成</option><option value="failed">失败</option><option value="timed_out">超时</option><option value="cancelled">已取消</option><option value="interrupted">基础设施中断</option></select></label><button class="button button-primary" type="submit">应用筛选</button><button class="button button-quiet" type="reset">重置</button></form>
+        <section class="card table-card"><div class="table-caption"><span id="programs-caption">程序执行记录</span><span class="subtle">源码与回执保存在原始产物中</span></div><div class="table-scroll"><table class="interactive-table"><thead id="programs-head"></thead><tbody id="programs-table"></tbody></table></div><div class="pagination"><span id="programs-scope" class="subtle"></span><button id="programs-more" class="button button-secondary">加载更多记录</button></div></section>
+      </section>
+
+      <section data-panel="chat" id="panel-chat" class="view-panel" hidden>
+        <form id="chat-filter" class="filter-bar"><label>发言者<select name="actor" class="actor-select"><option value="">全部参与者</option></select></label><label class="filter-search">搜索<input name="q" placeholder="检索聊天内容" autocomplete="off" maxlength="256"></label><button class="button button-primary" type="submit">应用筛选</button><button class="button button-quiet" type="reset">重置</button></form>
+        <div class="chat-layout"><section class="card chat-card"><div class="card-heading"><div><h2>协作对话</h2><p id="chat-caption">服务器聊天与客户端投递会标明各自来源</p></div><span class="badge outline">消息记录</span></div><div id="chat-feed" class="chat-feed"></div><div class="pagination"><span id="chat-scope" class="subtle"></span><button id="chat-more" class="button button-secondary">加载更早消息</button></div></section><aside class="card context-card"><h3>如何阅读聊天数据</h3><p>服务器记录可核验消息发生；客户端回调可能包含面向不同接收者的重复投递。</p><div class="source-key"><span class="badge good">服务端核验</span><p>来源为已登记的服务器证据。</p><span class="badge neutral">客户端观察</span><p>用于辅助核对，不独立证明任务成功。</p></div><div class="context-divider"></div><p>协调、救援、坐标等标签来自固定词法规则，多标签可并存，不表示因果判断。</p><div id="chat-labels" class="tag-list"></div></aside></div>
+      </section>
+
+      <section data-panel="evidence" id="panel-evidence" class="view-panel" hidden>
+        <section id="evaluation-summary" class="evaluation-summary card"></section>
+        <section class="card"><div class="card-heading"><div><h2>任务判定标准</h2><p>已持久化的确定性规则与证据引用</p></div></div><div id="evaluation-criteria" class="criteria-list"></div></section>
+        <div class="section-toolbar"><div id="window-switch" class="segmented" aria-label="统计窗口"><button data-window="full_session" aria-pressed="true">完整会话</button><button data-window="pre_first_success" aria-pressed="false">首次成功前</button></div><span id="window-note" class="toolbar-note">没有已核验成功时，不推断成功前窗口。</span></div>
+        <div id="evidence-metrics" class="metric-grid three"></div>
+        <div class="evidence-grid"><section class="card"><div class="card-heading"><div><h2>阶段时间线</h2><p>只显示有直接证据的阶段，缺失阶段保持未知</p></div></div><div id="stage-timeline" class="stage-timeline"></div></section><section class="card"><div class="card-heading"><div><h2>证据完整性</h2><p>采集缺口、截断和未知统计</p></div></div><div id="evidence-integrity" class="integrity-list"></div><div class="card-footnote">Observer 的解释不会替代确定性 Evaluator 的成功判定。</div></section></div>
+        <section class="card"><div class="card-heading"><div><h2>参与者统计</h2><p>程序耗时、前台与后台活动，以及服务端死亡记录</p></div><div class="card-actions"><button id="report-open" class="text-button">阅读报告 ↗</button><a id="report-download-json" class="button button-secondary" href="/download/report.json" download>JSON ↓</a><a id="report-download-md" class="button button-secondary" href="/download/report.md" download>Markdown ↓</a></div></div><div class="table-scroll"><table><thead><tr><th>参与者</th><th>程序 p50 / p95</th><th>活动占比 · 前台 / 含后台</th><th>错误 / 超时</th><th>死亡</th></tr></thead><tbody id="evidence-players"></tbody></table></div></section>
+      </section>
+
+      <section data-panel="observer" id="panel-observer" class="view-panel" hidden>
+        <div id="observer-summary" class="observer-summary card"></div>
+        <div class="section-toolbar"><h2 class="section-title">审阅记录</h2><span class="toolbar-note">每条结论保留证据引用 · 最终成功由 Evaluator 判定</span></div>
+        <div id="observer-feed" class="observer-feed"></div><div class="pagination"><span id="observer-scope" class="subtle"></span><button id="observer-more" class="button button-secondary">加载更早审阅</button></div>
+      </section>
+
+      <section data-panel="resources" id="panel-resources" class="view-panel" hidden>
+        <div id="resource-metrics" class="metric-grid"></div>
+        <div class="resource-grid"><section class="card"><div class="card-heading"><div><h2>内存趋势</h2><p>Supervisor Python RSS · MiB</p></div><span id="resource-range" class="subtle"></span></div><div class="chart-wrap tall"><canvas id="resource-chart" aria-label="Supervisor Python 内存历史趋势，单位MiB" role="img"></canvas><div id="resource-chart-empty" class="chart-empty">暂无资源采样</div></div><div id="resource-chart-note" class="chart-footer">有界读取最近的持久采样，不将未采样区间推断为连续观测。</div><div class="resource-pagination"><span id="resource-paging-scope" class="subtle"></span><div><button id="resources-latest" class="button button-quiet">返回最新</button><button id="resources-more" class="button button-secondary">加载更早采样</button></div></div></section><section class="card"><div class="card-heading"><div><h2>预算使用</h2><p>已结算与并发预留分别展示</p></div></div><div id="budget-bars" class="budget-list"></div><div class="card-footnote">价格表在运行开始时冻结；未知 usage 或费用保持未知。</div></section></div>
+        <section class="card"><div class="card-heading"><div><h2>模型费用分账</h2><p>按参与者、角色与调用用途分组</p></div><span class="badge outline">USD</span></div><div class="table-scroll"><table><thead><tr><th>参与者 / 用途</th><th>调用</th><th>输入 / 缓存</th><th>输出 / 推理</th><th>费用</th></tr></thead><tbody id="cost-table"></tbody></table></div><div class="card-footnote">缓存输入是输入 token 的子集；推理 token 是否包含在输出中由供应商适配器声明，不重复加总。</div></section>
+        <section class="card storage-card"><div class="card-heading"><div><h2>存储与输出</h2><p>记录、工作区与原始产物</p></div></div><dl id="storage-metadata" class="metadata-grid"></dl></section>
+      </section>
+      <section data-panel="figures" id="panel-figures" class="view-panel" hidden>
+        <section class="card figures-card">
+          <div class="card-heading"><div><h2>论文图表</h2><p>按论文图 1/3/4/5/6/8/12/13/14 的视觉与口径，从本 run 的服务端证据与账本重建；横轴为相对首个程序的秒数。</p></div><span id="fig-status" class="badge outline">等待数据</span></div>
+          <div id="fig-meta" class="card-footnote">正在读取图表数据…</div>
+          <div class="fig-tabs" role="tablist" aria-label="论文图表选择">
+            <button type="button" data-fig-tab="timeline" class="fig-tab active" role="tab">图 3 · 整个运行</button>
+            <button type="button" data-fig-tab="progress" class="fig-tab" role="tab">图 1/4 · 十三步</button>
+            <button type="button" data-fig-tab="chat" class="fig-tab" role="tab">图 5/6/8/14 · 聊天</button>
+            <button type="button" data-fig-tab="dragon" class="fig-tab" role="tab">图 12 · 末地</button>
+            <button type="button" data-fig-tab="behavior" class="fig-tab" role="tab">图 13 · 行为与死因</button>
+            <button type="button" data-fig-tab="world" class="fig-tab" role="tab">存档世界 · 地图</button>
+          </div>
+          <div class="fig-controls">
+            <button id="fig-play" type="button" class="button button-secondary" title="播放/暂停" aria-label="播放或暂停图表回放">▶</button>
+            <label class="fig-seek-label"><span>时间</span><input id="fig-seek" type="range" min="0" max="1" step="0.01" value="0"></label>
+            <span id="fig-clock" class="subtle">0s / 0s</span>
+            <label class="fig-follow"><input id="fig-follow" type="checkbox" checked> 跟随最新</label>
+            <button id="fig-focus" type="button" class="button button-secondary" title="专注模式：只保留图表，Esc 退出">⛶ 专注</button>
+          </div>
+          <div id="fig-body" class="fig-body"><div class="fig-empty">正在读取图表数据…</div></div>
+          <div id="fig-detail" class="fig-detail" hidden></div>
+          <div id="fig-legend" class="fig-legend"></div>
+          <div class="card-footnote" id="fig-notes"></div>
+        </section>
+      </section>
+      <section data-panel="live" id="panel-live" class="view-panel" hidden>
+        <section class="card">
+          <div class="card-heading"><div><h2>实时第一视角</h2><p>每个玩家 bot 的真实游戏画面，在浏览器中实时三维渲染。</p></div><span class="badge outline">LIVE</span></div>
+          <div id="live-note" class="card-footnote"></div>
+          <div id="live-grid" class="live-grid"></div>
+          <div class="card-footnote">可用性取决于 bot 是否在线以及 SSH 隧道是否就绪；画面是渲染视图，不能替代服务器证据或确定性评分。</div>
+        </section>
+      </section>
+      <footer class="page-footer"><span>观测可复核的过程，而非推断的结果。</span><span>数据来自本机实验账本 <span aria-hidden="true">↗</span></span></footer>
+    </main>
+  </div>
+
+  <div id="drawer-backdrop" class="drawer-backdrop" hidden></div>
+  <aside id="detail-drawer" class="detail-drawer" role="dialog" aria-modal="true" aria-labelledby="drawer-title" hidden><div class="drawer-heading"><div><div id="drawer-eyebrow" class="eyebrow">EVIDENCE DETAIL</div><h2 id="drawer-title">事件详情</h2></div><button id="drawer-close" class="icon-button" aria-label="关闭详情">×</button></div><div id="drawer-body" class="drawer-body"></div></aside>
+
+  <dialog id="control-dialog" aria-labelledby="control-title"><form method="dialog"><div class="dialog-header"><div><div class="eyebrow">OPERATOR CONTROL</div><h2 id="control-title">实验控制</h2></div><button class="icon-button" aria-label="关闭">×</button></div></form><p class="dialog-description">操作进入现有持久控制队列，由 Supervisor 执行。页面不会直接操纵游戏。</p><div id="control-target" class="control-target"></div><div id="control-options" class="control-options"><button data-command="pause"><strong>暂停推理</strong><span>暂停新的 Agent 决策，具体执行语义由运行时记录。</span></button><button data-command="freeze"><strong>冻结世界</strong><span>请求暂停实验，并通过服务器流程冻结世界。</span></button><button data-command="resume"><strong>恢复运行</strong><span>恢复 Supervisor 与实验运行。</span></button><button data-command="checkpoint"><strong>保存检查点</strong><span>请求持久化当前检查点与世界存档。</span></button><button data-command="stop" class="control-danger"><strong>停止实验</strong><span>请求有序停止。重新开始需遵循恢复流程。</span></button></div><div id="control-confirmation" hidden><div id="control-warning" class="notice notice-warning"></div><div class="dialog-actions"><button id="control-cancel" class="button button-secondary">返回</button><button id="control-confirm" class="button button-primary">确认提交</button></div></div><div id="control-feedback" class="control-feedback" aria-live="polite"></div></dialog>
+  <div id="toast" class="toast" role="status" aria-live="polite" hidden></div>
+  <noscript><div class="noscript">实验观测台需要 JavaScript。可通过 CLI 查看状态和导出报告。</div></noscript>
+</body>
+</html>

@@ -1,0 +1,58 @@
+#!/bin/sh
+# Operator-only console access. This file lives only in the server image.
+set -eu
+control=${HARNESS_CONTROL_DIR:-/tmp/harness-control}
+data=${HARNESS_DATA_DIR:-/data}
+log="$data/logs/latest.log"
+
+ready() {
+    [ -p "$control/console" ] && [ -s "$control/java.pid" ] || return 1
+    java_pid=$(cat "$control/java.pid")
+    case "$java_pid" in ''|*[!0-9]*) return 1 ;; esac
+    kill -0 "$java_pid" 2>/dev/null || return 1
+    [ -f "$control/ready" ] && [ "$control/ready" -nt "$control/started" ] && return 0
+    # Ignore the previous boot's latest.log until the new logger has written it.
+    [ -f "$log" ] && [ "$log" -nt "$control/started" ] || return 1
+    grep -Eq '^\[[0-9]{2}:[0-9]{2}:[0-9]{2}\] \[Server thread/INFO\]: Done \([0-9.]+s\)! For help, type "help"' "$log" || return 1
+    touch "$control/ready"
+}
+
+case "${1:-}" in
+    ready)
+        ready
+        ;;
+    save)
+        ready || { echo 'Minecraft server is not ready' >&2; exit 69; }
+        # The kernel releases flock even after SIGKILL. A directory lock alone
+        # can survive a killed helper and block every subsequent world save.
+        exec 9> "$control/save.guard"
+        flock -n 9 || { echo 'A save request is already running' >&2; exit 75; }
+        rmdir "$control/save.lock" 2>/dev/null || true
+        mkdir "$control/save.lock"
+        trap 'rmdir "$control/save.lock" 2>/dev/null || true' EXIT
+        trap 'exit 143' TERM HUP
+        trap 'exit 130' INT
+        before=$(stat -c %s "$log")
+        # timeout also bounds the FIFO write if Java exits between checks.
+        timeout 5 /bin/sh -c 'printf "%s\n" "save-all flush" > "$1"' sh "$control/console" 9>&-
+        count=0
+        while [ "$count" -lt 60 ]; do
+            # A player chat message always has a <username> prefix and cannot
+            # impersonate this exact server-console acknowledgement.
+            if tail -c "+$((before + 1))" "$log" | grep -Eq '^\[[0-9]{2}:[0-9]{2}:[0-9]{2}\] \[Server thread/INFO\]: Saved the game$'; then
+                printf 'Saved the game\n'
+                exit 0
+            fi
+            java_pid=$(cat "$control/java.pid")
+            kill -0 "$java_pid" 2>/dev/null || { echo 'Minecraft exited before save acknowledgement' >&2; exit 70; }
+            count=$((count + 1))
+            sleep 1 9>&-
+        done
+        echo 'Timed out waiting for save-all flush acknowledgement' >&2
+        exit 70
+        ;;
+    *)
+        echo 'Usage: harness-control ready|save' >&2
+        exit 64
+        ;;
+esac

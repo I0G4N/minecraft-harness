@@ -1,0 +1,30 @@
+# Scripted protocol fixture: tests mechanisms, never Minecraft capability.
+experiment:
+  name: offline-four-agent-smoke
+  task: observe_only
+  goal: Observe your test bot and send one greeting to teammates.
+agents:
+  count: 4
+  max_turns: 3
+  max_no_progress_turns: 2
+model:
+  kind: fake
+  script:
+    - tool_calls:
+        - id: observe
+          type: function
+          function:
+            name: mc_execute
+            arguments:
+              source: 'globals.observations = (globals.observations || 0) + 1; console.log(bot.username, bot.entity.position); bot.chat("hello teammates"); return { username: bot.username, observations: globals.observations };'
+    - tool_calls:
+        - id: events
+          type: function
+          function:
+            name: events_read
+            arguments: {}
+runtime:
+  mode: fake
+budgets:
+  wall_time_minutes: 2
+  total_model_calls: 16

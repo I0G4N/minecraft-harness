@@ -1,0 +1,6 @@
+*
+!.cache/
+!.cache/server-1.20.4.jar
+!server.properties
+!server-entrypoint.sh
+!harness-control

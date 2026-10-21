@@ -1,0 +1,60 @@
+# Real, billable DeepSeek; synthetic game. No Minecraft EULA is accepted here.
+# Rates verified 2026-10-21 at https://api-docs.deepseek.com/quick_start/pricing/
+# Peak USD / million tokens, a conservative estimate rather than an account bill.
+experiment:
+  name: deepseek-flash-framework-smoke
+  profile: paper_aligned
+  seed: null
+  task: observe_only
+  stop_on_success: false
+  goal: >-
+    Test the experiment harness against a SYNTHETIC Minecraft bot, not real Minecraft.
+    In your first decision, use mc_execute to run your own short JavaScript program
+    that observes bot identity, position and health and increments a globals counter;
+    also write that source to diagnostic.js and send one short bot.chat greeting.
+    In later decisions, verify the counter in a second program, read team events,
+    and write a brief evidence-based shared note using memory_write. You have only
+    three model decisions, so combine independent tool calls. Preserve unknowns.
+    Do not attempt a game objective or claim real Minecraft success.
+agents:
+  count: 4
+  max_turns: 3
+  max_no_progress_turns: 2
+  max_model_failures: 1
+  context_chars: 32000
+model:
+  kind: chat_completions
+  base_url: https://api.deepseek.com
+  model: deepseek-flash
+  api_key_env: DEEPSEEK_API_KEY
+  max_output_tokens: 1536
+  timeout_s: 45
+  max_retries: 0
+  max_request_bytes: 64000
+  extra_body:
+    thinking:
+      type: disabled
+runtime:
+  mode: fake
+  lifecycle: paper_aligned
+  program_timeout_default_s: 5
+  program_timeout_max_s: 10
+  max_background_ttl_ms: 30000
+observer:
+  mode: llm
+  interval_s: 10
+  allow_infra_requests: false
+workspace:
+  provision: false
+budgets:
+  wall_time_minutes: 3
+  total_model_calls: 16
+  max_cost_usd: 0.15
+  max_input_tokens: 64000
+  prices_per_million:
+    input: 0.30
+    cached_input: 0.006
+    output: 1.20
+supervision:
+  resource_check_interval_s: 1
+  resource_sample_interval_s: 2
