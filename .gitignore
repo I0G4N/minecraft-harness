@@ -3,20 +3,32 @@ __pycache__/
 *.pyc
 *.egg-info/
 runs/
-validation/
 .env
 .env.local
-configs/local.yaml
 bot_runtime/node_modules/
 bot_runtime/.build-npm-cache/
 infra/data/
 infra/.env
-infra/server-data/
-infra/bin/
-infra/.cache/*
-!infra/.cache/sandbox.so
-*.log
-.DS_Store
-.uv-python/
-.uv-cache/
-infra/compose.local.yaml
+# Exact-N generated token files; keep the example tracked for documentation.
+infra/.env.*
+!infra/.env.example
+validation/finalization-benchmark/*/events.jsonl
+validation/finalization-benchmark/*.pstats
+# Local session aids; never part of an experiment or deliverable.
+.test-venv/
+.baseline-*/
+.tmp-paper/
+.tmp-pi/
+.npm-cache/
+pi_runtime/node_modules/
+# DEST-specific ignored runtime/deployment files
+.test-venv/
+.pytest_cache/
+runs/
+validation/
+mc-runs/
+mc-logs/
+.browser/
+Caddyfile
+pi_runtime/node_modules/
+.venv

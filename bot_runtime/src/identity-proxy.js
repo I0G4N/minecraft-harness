@@ -149,5 +149,28 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
   const proxy = await startIdentityProxy({ host: process.env.BIND ?? '0.0.0.0', port: Number(process.env.PORT ?? 25565),
     targetHost: process.env.MC_HOST ?? 'server', targetPort: Number(process.env.MC_PORT ?? 25565),
     username: process.env.ALLOWED_USERNAME, gameChat: process.env.GAME_CHAT !== 'false' });
-  for (const signal of ['SIGTERM', 'SIGINT']) process.on(signal, () => proxy.close().then(() => process.exit(0)));
+  // Trusted loopback-facing bridge for the gVisor worker's prismarine-viewer.
+  // The worker network is Docker-internal, so a published port on the worker
+  // itself cannot be reached from the operator host. The identity container is
+  // already an allowed member of that network; it forwards only this fixed
+  // viewer port to the fixed worker IP. No generated code can reach this port.
+  let viewerServer = null;
+  const viewerPort = Number(process.env.VIEWER_PROXY_PORT ?? 0);
+  const viewerTarget = process.env.VIEWER_TARGET;
+  if (Number.isInteger(viewerPort) && viewerPort > 0 && viewerPort < 65536 && viewerTarget) {
+    viewerServer = net.createServer(client => {
+      const upstream = net.connect({ host: viewerTarget, port: viewerPort });
+      let closed = false;
+      const close = () => { if (closed) return; closed = true; client.destroy(); upstream.destroy(); };
+      client.setNoDelay(true); upstream.setNoDelay(true);
+      client.on('error', close); upstream.on('error', close);
+      client.on('close', close); upstream.on('close', close);
+      client.pipe(upstream).pipe(client);
+    });
+    viewerServer.listen(viewerPort, '0.0.0.0');
+  }
+  for (const signal of ['SIGTERM', 'SIGINT']) process.on(signal, () => {
+    viewerServer?.close();
+    proxy.close().then(() => process.exit(0));
+  });
 }

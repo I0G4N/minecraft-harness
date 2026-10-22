@@ -8,7 +8,9 @@ import json
 import importlib.metadata
 import os
 import platform
+import secrets
 import subprocess
+import sys
 import time
 import uuid
 from datetime import datetime, timezone
@@ -39,6 +41,15 @@ def _git_sha():
         return "unknown"
 
 
+def _effective_runner_egress(config):
+    """Best-effort effective egress mode for manifest/evidence (never raises)."""
+    from .runners import resolve_runner_egress
+    try:
+        return resolve_runner_egress(config)
+    except Exception:
+        return "bridge"
+
+
 def is_active(run_dir):
     path = Path(run_dir) / ".supervisor.lock"
     if not path.exists():
@@ -60,6 +71,32 @@ def request_control(run_dir, command, **arguments):
     return enqueue_control(path, command, arguments)
 
 
+# Per-agent end states that under ``supervision.agent_failure_policy=isolate``
+# end only that agent; the rest of the team keeps running. ``turns_exhausted``
+# and ``stalled`` are bounded normal endings but still mean the player left the
+# experiment early, so they are surfaced as degraded rather than silently lost.
+DEGRADED_AGENT_STATUSES = frozenset({
+    "model_failed", "infra_failed", "reliability_failed", "resource_exhausted",
+    "turns_exhausted", "stalled",
+})
+# Only these historically terminated the whole run immediately under the old
+# policy; ``fail_run`` preserves exactly that behavior.
+FATAL_AGENT_STATUSES = frozenset({"model_failed", "infra_failed"})
+
+
+class _BudgetedWebConfig(dict):
+    """Web configuration that also carries the team Budget into WebTools.
+
+    A plain dict subclass keeps every serialisation path (manifest, runner spec,
+    YAML) unchanged; in-process agents read the attributes directly.
+    """
+
+    def __init__(self, mapping, budget, agent_id):
+        super().__init__(mapping or {})
+        self._web_budget = budget
+        self._web_agent_id = agent_id
+
+
 class Supervisor:
     def __init__(self, config, run_dir, resume=False):
         self.config = validate_config(config)
@@ -68,8 +105,19 @@ class Supervisor:
         self.gateway = self.recorder = self.budget = None
         self.status = "starting"
         self.frozen = False
+        self.runners = None
         self.sessions_fenced = False
         self._observer_outcome_recorded = False
+        # Host-side model forwarder for restricted-egress Pi runner containers.
+        self._model_forwarder = None
+        supervision = self.config.get("supervision", {})
+        self.agent_failure_policy = supervision.get("agent_failure_policy", "isolate")
+        self.observer_failure_policy = supervision.get("observer_failure_policy", "degrade")
+        self._agent_outcomes = {}
+        self._reaped_agent_tasks = set()
+        self._fail_run_triggered = False
+        self._paused_started = None
+        self._paused_total = 0.0
 
     def _manifest(self):
         encoded = json.dumps(self.config, sort_keys=True).encode()
@@ -77,10 +125,13 @@ class Supervisor:
         refs = {}
         files = list((root / "src").rglob("*.py")) + list((root / "bot_runtime" / "src").glob("*.js"))
         files += [root / "uv.lock", root / "bot_runtime" / "package-lock.json"]
+        # Pin the Pi runtime version in the manifest even though the bundle is
+        # mounted as a read-only dependency tree rather than source-snapshotted.
+        files += [root / "pi_runtime" / "package.json", root / "pi_runtime" / "package-lock.json"]
         for path in sorted(files):
             if path.is_file():
                 refs[str(path.relative_to(root))] = hashlib.sha256(path.read_bytes()).hexdigest()
-        return {"schema_version": 1, "run_id": uuid.uuid4().hex, "harness_version": __version__, "git_sha": _git_sha(), "python": platform.python_version(), "created_at": datetime.now(timezone.utc).isoformat(), "config": self.config, "config_sha256": hashlib.sha256(encoded).hexdigest(), "source_hashes": refs, "python_dependencies": {name: importlib.metadata.version(name) for name in ("httpx", "PyYAML")}, "runtime_mode": self.config["runtime"]["mode"], "model_kind": self.config["model"]["kind"], "diagnostic_only": self.config["runtime"]["mode"] == "fake" or self.config["model"]["kind"] == "fake", "background_jobs": self.config['runtime']['lifecycle'] == 'paper_aligned', "world_seed_operator_only": self.config["experiment"].get("seed")}
+        return {"schema_version": 1, "run_id": uuid.uuid4().hex, "harness_version": __version__, "git_sha": _git_sha(), "python": platform.python_version(), "created_at": datetime.now(timezone.utc).isoformat(), "config": self.config, "config_sha256": hashlib.sha256(encoded).hexdigest(), "source_hashes": refs, "python_dependencies": {name: importlib.metadata.version(name) for name in ("httpx", "PyYAML")}, "runtime_mode": self.config["runtime"]["mode"], "model_kind": self.config["model"]["kind"], "runner_mode": self.config["runtime"].get("runner_mode", "inprocess"), "runner_runtime": self.config["runtime"].get("runner_runtime", "python"), "runner_egress": _effective_runner_egress(self.config), "diagnostic_only": self.config["runtime"]["mode"] == "fake" or self.config["model"]["kind"] == "fake", "background_jobs": self.config['runtime']['lifecycle'] == 'paper_aligned' and not self.config['agents'].get('paper_single_program', False), "world_seed_operator_only": self.config["experiment"].get("seed")}
 
     async def _log_guard(self, collector):
         path = self.config['server'].get('log_path')
@@ -125,7 +176,13 @@ class Supervisor:
         return result
 
     def _consume_observer_outcome(self, outcome, *, expected_shutdown=False):
-        """Persist reviewer health separately from game capability evaluation."""
+        """Persist reviewer health separately from game capability evaluation.
+
+        ``supervision.observer_failure_policy`` decides whether a failed or
+        unexpectedly ended Observer ends the run (fail_run, old behavior) or is
+        only recorded as degraded evidence (degrade, the default). A reviewer
+        failure is always recorded as ``observer_degraded=true``.
+        """
         if self._observer_outcome_recorded:
             return False
         self._observer_outcome_recorded = True
@@ -134,11 +191,16 @@ class Supervisor:
         required = self.config['experiment']['profile'] == 'paper_aligned'
         failure = status in {'model_failed', 'infra_failed', 'reliability_failed', 'resource_exhausted'}
         unexpected = not expected_shutdown and status not in {'budget_exhausted'} and not failure
+        degraded = failure or unexpected
         payload = {**outcome, 'required': required, 'expected_shutdown': expected_shutdown}
         try:
             self.recorder.state_event('observer_outcome', payload, 'observer_outcome', payload, actor_id='observer')
-            if not required and (failure or unexpected):
-                self.recorder.state_event('observer_degraded', True, 'observer_degraded', payload, actor_id='observer')
+            if degraded:
+                degraded_payload = payload
+                if failure and expected_shutdown:
+                    degraded_payload = {**payload, 'reason': 'observer failed during expected shutdown'}
+                self.recorder.state_event('observer_degraded', True, 'observer_degraded',
+                                          degraded_payload, actor_id='observer')
         except Exception as exc:
             self.status = 'infra_failed'
             self._record_error('observer_outcome_record_failed', exc)
@@ -146,10 +208,180 @@ class Supervisor:
         if status == 'budget_exhausted':
             self.status = 'budget_exhausted'
             return True
-        if required and (failure or unexpected):
-            self.status = 'model_failed' if status == 'model_failed' else 'infra_failed'
-            return True
+        if failure and expected_shutdown:
+            # A deliberate ending already ran the Observer down; keep the run's
+            # deliberate final status, only the degradation evidence is added.
+            return False
+        if degraded:
+            if self.observer_failure_policy == 'fail_run' and required:
+                self.status = 'model_failed' if status == 'model_failed' else 'infra_failed'
+                return True
+            return False
         return False
+
+    # ---- long-run stability helpers -------------------------------------
+
+    def _web_config(self, agent):
+        """Web config with the team Budget attached for in-process agents."""
+        return _BudgetedWebConfig(self.config.get("web", {}), self.budget, agent)
+
+    def _active_wall_seconds(self, already_elapsed, start, now):
+        """Wall seconds excluding every operator pause window."""
+        current_pause = 0.0
+        if self._paused_started is not None:
+            current_pause = max(0.0, now - self._paused_started)
+        return already_elapsed + (now - start) - self._paused_total - current_pause
+
+    def _pause_clock(self):
+        if self._paused_started is not None:
+            return
+        self._paused_started = time.monotonic()
+        if self.budget is not None:
+            try:
+                self.budget.pause()
+            except Exception as exc:
+                self._record_error('budget_pause_failed', exc)
+
+    def _resume_clock(self):
+        if self._paused_started is None:
+            return
+        now = time.monotonic()
+        self._paused_total += max(0.0, now - self._paused_started)
+        self._paused_started = None
+        if self.budget is not None:
+            try:
+                self.budget.resume()
+            except Exception as exc:
+                self._record_error('budget_resume_failed', exc)
+
+    @staticmethod
+    def _task_agent(task):
+        name = task.get_name()
+        return name if isinstance(name, str) and name else "unknown"
+
+    def _normalise_agent_outcome(self, task):
+        """Return (agent, outcome, event_kind); never re-raise task failures."""
+        agent = self._task_agent(task)
+        if task.cancelled():
+            return agent, {"agent_id": agent, "status": "infra_failed",
+                           "error": "CancelledError", "cancelled": True}, "agent_task_cancelled"
+        exception = task.exception()
+        if exception is not None:
+            return agent, {"agent_id": agent, "status": "infra_failed",
+                           "error": type(exception).__name__, "crashed": True}, "agent_task_crashed"
+        result = task.result()
+        if not isinstance(result, dict):
+            return agent, {"agent_id": agent, "status": "infra_failed",
+                           "error": "invalid agent task result", "crashed": True}, "agent_task_crashed"
+        result = dict(result)
+        result.setdefault("agent_id", agent)
+        return agent, result, None
+
+    def _record_agent_degraded(self, agent, outcome):
+        payload = {"agent_id": agent, "status": outcome.get("status"),
+                   "error": outcome.get("error"), "turns": outcome.get("turns"),
+                   "policy": self.agent_failure_policy}
+        try:
+            self.recorder.state_event("agent_degraded:" + agent, payload, "agent_degraded",
+                                      payload, actor_id=agent)
+        except Exception:
+            pass
+
+    def _reap_agent_tasks(self, tasks, observer=None):
+        """Reap every completed player task exactly once.
+
+        Under ``isolate`` a failed agent is recorded as degraded and the run
+        continues; under ``fail_run`` the first model/infra failure (or crashed/
+        cancelled task) asks the main loop to break, preserving old behavior.
+        """
+        for task in tasks:
+            if not task.done():
+                continue
+            agent = self._task_agent(task)
+            if agent in self._reaped_agent_tasks:
+                continue
+            self._reaped_agent_tasks.add(agent)
+            try:
+                agent, outcome, error_kind = self._normalise_agent_outcome(task)
+            except Exception as exc:  # defensive: never raise out of the main loop
+                agent = self._task_agent(task)
+                outcome = {"agent_id": agent, "status": "infra_failed",
+                           "error": type(exc).__name__, "crashed": True}
+                error_kind = "agent_task_crashed"
+            if error_kind:
+                try:
+                    self.recorder.append(error_kind, outcome, actor_id=agent)
+                except Exception:
+                    pass
+            self._agent_outcomes[agent] = outcome
+            status = str(outcome.get("status") or "unknown")
+            if self.agent_failure_policy == "isolate":
+                if error_kind or status in DEGRADED_AGENT_STATUSES:
+                    self._record_agent_degraded(agent, outcome)
+                    if observer is not None and hasattr(observer, "wakeup"):
+                        try:
+                            observer.wakeup({'kind': 'agent_degraded', 'agent_id': agent,
+                                             'status': status})
+                        except Exception:
+                            pass
+            elif error_kind or status in FATAL_AGENT_STATUSES:
+                self._fail_run_triggered = True
+                return True
+        return False
+
+    def _legacy_final_status(self, outcomes, result):
+        """The pre-isolation status mapping, kept for fail_run compatibility."""
+        statuses = {x.get("status") for x in outcomes if isinstance(x, dict)}
+        if any(isinstance(x, BaseException) and not isinstance(x, asyncio.CancelledError)
+               for x in outcomes) or "infra_failed" in statuses:
+            return "infra_failed"
+        if "model_failed" in statuses:
+            return "model_failed"
+        if result["status"] in {"succeeded", "diagnostic_pass"}:
+            return result["status"]
+        if "budget_exhausted" in statuses or time.monotonic() >= self.budget.deadline:
+            return "budget_exhausted"
+        if statuses == {"stalled"}:
+            return "stalled"
+        if statuses == {"turns_exhausted"}:
+            return "not_succeeded"
+        return "not_succeeded"
+
+    def _isolated_final_status(self, outcomes, result):
+        """Status mapping for ``agent_failure_policy=isolate``.
+
+        When every player ends in a degraded state the run reports the aggregate
+        failure kind: all-model failures => model_failed, any infra/reliability
+        failure => infra_failed, only bounded endings => completed.
+        """
+        statuses = {str(x.get("status") or "unknown")
+                    for x in outcomes if isinstance(x, dict)}
+        if not statuses:
+            return None
+        # The team budget is shared: one agent hitting it means the run ended
+        # for budget reasons, not that the remaining team failed on its own.
+        if "budget_exhausted" in statuses:
+            return "budget_exhausted"
+        failures = statuses - {"turns_exhausted", "stalled"}
+        if all(status in DEGRADED_AGENT_STATUSES for status in statuses):
+            # A bounded end is not a failed experiment. Preserve a deterministic
+            # success/diagnostic evaluation before collapsing to "completed".
+            if result["status"] in {"succeeded", "diagnostic_pass"}:
+                return result["status"]
+            if not failures:
+                return "completed"
+            if failures <= {"model_failed"}:
+                return "model_failed"
+            return "infra_failed"
+        if result["status"] in {"succeeded", "diagnostic_pass"}:
+            return result["status"]
+        if time.monotonic() >= self.budget.deadline:
+            return "budget_exhausted"
+        if not failures:
+            return "completed"
+        if failures <= {"model_failed"}:
+            return "model_failed"
+        return "infra_failed"
 
     async def _collect(self, collector, server, baseline=False, flush=True):
         if flush:
@@ -321,8 +553,6 @@ class Supervisor:
             ownership.acquire()
             owned = True
             memory = MemoryStore(self.run_dir / "memory", self.recorder, shared_enabled=self.config["collaboration"]["shared_memory"])
-            if self.config["runtime"].get("url") or self.config["runtime"].get("urls"):
-                await self.gateway.fence()
             if self.budget.stop_requested():
                 raise BudgetExhausted("saved wall-time deadline has expired; no new sessions started")
             world = self.config["server"].get("world_dir")
@@ -330,12 +560,18 @@ class Supervisor:
                 await self._reconcile_world(server)
             if self.resume and server.container:
                 await server.start()
+            # World/config admission must happen BEFORE fencing live bot
+            # sessions. A stale marker or an occupied world should fail without
+            # deleting another run's sessions; only a validated new run may
+            # fence the runtime URLs.
             environment = await self._copy_safely(inspect_environment, self.config, run_id=self.recorder.run_id, resume=self.resume)
             self.recorder.set_state('effective_environment', environment)
             self.recorder.append('effective_environment_verified', environment)
             manifest = json.loads(manifest_path.read_text())
             manifest['effective_environment'] = environment
             atomic_json(manifest_path, manifest)
+            if self.config["runtime"].get("url") or self.config["runtime"].get("urls"):
+                await self.gateway.fence()
             self.gateway.config['remaining_run_ms'] = max(1, int((self.budget.deadline - time.monotonic()) * 1000))
             workspaces = WorkspaceProvisioner(self.config['workspace'], self.run_dir, run_id=self.recorder.run_id)
             coding_containers = await workspaces.provision(agents + (['observer'] if self.config['observer']['mode'] == 'llm' else []))
@@ -356,6 +592,9 @@ class Supervisor:
             for agent in agents:
                 runtime_health[agent] = await self.gateway._request('GET', '/health', agent_id=agent)
             environment['runtime_health'] = runtime_health
+            environment['runner_mode'] = self.config['runtime'].get('runner_mode', 'inprocess')
+            environment['runner_runtime'] = self.config['runtime'].get('runner_runtime', 'python')
+            environment['runner_egress'] = _effective_runner_egress(self.config)
             environment['deployment'] = await capture_deployment(self.config, dict(self.gateway.sessions), coding_containers, run_id=self.recorder.run_id)
             self.recorder.append('deployment_provenance_verified', environment['deployment'])
             if not self.config['web']['enabled'] or not self.config['web'].get('search_url'):
@@ -371,33 +610,41 @@ class Supervisor:
             self.recorder.set_state("world_frozen", False)
             self.recorder.append("run_resumed" if self.resume else "run_started", {"agents": agents, "mode": self.config["runtime"]["mode"]}, world_epoch=self.gateway.world_epoch)
             log_guard = asyncio.create_task(self._log_guard(collector), name='server-log-collector')
-            for agent in agents:
-                model = build_model(self.config["model"])
-                models.append(model)
-                agent_config = {**self.config["agents"], "agent_id": agent, "peers": [x for x in agents if x != agent], "goal": self.config["experiment"]["goal"],
-                    'profile': self.config['experiment']['profile'], 'lifecycle': self.config['runtime']['lifecycle'], 'web': self.config['web'],
-                    "game_chat": self.config["collaboration"]["game_chat"], "chat_delivery": self.config["collaboration"].get("chat_delivery", "events"), "model_request_timeout_s": self.config["agents"].get("model_request_timeout_s", self.config["model"]["timeout_s"] + 5),
-                    "program_timeout_ms": int(self.config["runtime"]["program_timeout_default_s"] * 1000),
-                    "leftover_policy": self.config["runtime"].get("leftover_policy", "reset"), "paper_tight_interface": self.config["agents"].get("paper_tight_interface", False)}
-                if agent in coding_containers:
-                    agent_config.update(shell_enabled=True, shell_container=coding_containers[agent], shell_env=self.gateway.cli_environment(agent))
-                loop = AgentLoop(agent_config, self.run_dir, self.recorder, self.gateway, model, self.budget, memory)
-                manifest['agent_interfaces'][agent] = {'prompt_sha256': hashlib.sha256(loop.messages[0]['content'].encode()).hexdigest(),
-                    'tools_sha256': hashlib.sha256(json.dumps(loop.schemas, sort_keys=True).encode()).hexdigest()}
-                tasks.append(asyncio.create_task(loop.run(), name=agent))
-            if self.config['observer']['mode'] == 'llm':
-                from .observer.agent import ObserverAgent
-                observer_model = build_model(self.config['model'])
-                models.append(observer_model)
-                observer_config = {**self.config['agents'], **self.config['observer'], 'web': self.config['web'], 'lifecycle': self.config['runtime']['lifecycle']}
-                if 'observer' in coding_containers:
-                    observer_config.update(shell_enabled=True, shell_container=coding_containers['observer'])
-                observer = ObserverAgent(observer_config, self.run_dir, self.recorder, observer_model, self.budget, infra_callback=self._observer_infra_issue)
-                manifest['agent_interfaces']['observer'] = {'prompt_sha256': hashlib.sha256(observer.messages[0]['content'].encode()).hexdigest(),
-                    'tools_sha256': hashlib.sha256(json.dumps(observer.schemas, sort_keys=True).encode()).hexdigest()}
-                observer_task = asyncio.create_task(observer.run(), name='observer')
-                self.recorder.set_state('observer_outcome', None)
-                self.recorder.state_event('observer_degraded', False, 'observer_started', {'mode': 'llm', 'required': self.config['experiment']['profile'] == 'paper_aligned'})
+            runner_mode = self.config["runtime"].get("runner_mode", "inprocess")
+            if runner_mode in {"process", "container"}:
+                tasks, observer_task, observer = await self._start_runner_agents(
+                    agents, manifest, manifest_path, coding_containers, memory)
+            else:
+                for agent in agents:
+                    model = build_model(self.config["model"])
+                    models.append(model)
+                    agent_config = {**self.config["agents"], "agent_id": agent, "peers": [x for x in agents if x != agent], "goal": self.config["experiment"]["goal"],
+                        'profile': self.config['experiment']['profile'], 'lifecycle': self.config['runtime']['lifecycle'], 'web': self._web_config(agent),
+                        "game_chat": self.config["collaboration"]["game_chat"], "chat_delivery": self.config["collaboration"].get("chat_delivery", "events"), "model_request_timeout_s": self.config["agents"].get("model_request_timeout_s", self.config["model"]["timeout_s"] + 5),
+                        "program_timeout_ms": int(self.config["runtime"]["program_timeout_default_s"] * 1000),
+                        "leftover_policy": self.config["runtime"].get("leftover_policy", "reset"), "paper_tight_interface": self.config["agents"].get("paper_tight_interface", False)}
+                    if agent in coding_containers:
+                        agent_config.update(shell_enabled=True, shell_container=coding_containers[agent], shell_env=self.gateway.cli_environment(agent))
+                    loop = AgentLoop(agent_config, self.run_dir, self.recorder, self.gateway, model, self.budget, memory)
+                    manifest['agent_interfaces'][agent] = {'prompt_sha256': hashlib.sha256(loop.messages[0]['content'].encode()).hexdigest(),
+                        'tools_sha256': hashlib.sha256(json.dumps(loop.schemas, sort_keys=True).encode()).hexdigest()}
+                    tasks.append(asyncio.create_task(loop.run(), name=agent))
+                if self.config['observer']['mode'] == 'llm':
+                    from .observer.agent import ObserverAgent
+                    observer_model = build_model(self.config['model'])
+                    models.append(observer_model)
+                    observer_config = {**self.config['agents'], **self.config['observer'],
+                                       'profile': self.config['experiment']['profile'],
+                                       'web': self._web_config('observer'),
+                                       'lifecycle': self.config['runtime']['lifecycle']}
+                    if 'observer' in coding_containers:
+                        observer_config.update(shell_enabled=True, shell_container=coding_containers['observer'])
+                    observer = ObserverAgent(observer_config, self.run_dir, self.recorder, observer_model, self.budget, infra_callback=self._observer_infra_issue)
+                    manifest['agent_interfaces']['observer'] = {'prompt_sha256': hashlib.sha256(observer.messages[0]['content'].encode()).hexdigest(),
+                        'tools_sha256': hashlib.sha256(json.dumps(observer.schemas, sort_keys=True).encode()).hexdigest()}
+                    observer_task = asyncio.create_task(observer.run(), name='observer')
+                    self.recorder.set_state('observer_outcome', None)
+                    self.recorder.state_event('observer_degraded', False, 'observer_started', {'mode': 'llm', 'required': self.config['experiment']['profile'] == 'paper_aligned'})
             atomic_json(manifest_path, manifest)
             self.status = "running"
             self.recorder.set_state("status", self.status)
@@ -420,6 +667,8 @@ class Supervisor:
                         observer_outcome = observer_task.result()
                     if self._consume_observer_outcome(observer_outcome):
                         break
+                if self._reap_agent_tasks(tasks, observer):
+                    break
                 if operation and operation.done():
                     try:
                         operation.result()
@@ -427,7 +676,8 @@ class Supervisor:
                         self.gateway.fault = exc
                     operation = None
                 if now >= next_heartbeat:
-                    await asyncio.to_thread(self.recorder.set_state, "active_wall_seconds", already_elapsed + now - start)
+                    await asyncio.to_thread(self.recorder.set_state, "active_wall_seconds",
+                                            self._active_wall_seconds(already_elapsed, start, now))
                     next_heartbeat = now + 1
                 control = await asyncio.to_thread(self.recorder.claim_control)
                 if control:
@@ -469,9 +719,10 @@ class Supervisor:
                         if self.config['experiment']['stop_on_success']:
                             self.status = "succeeded"
                             break
-                if any(task.done() and (task.cancelled() or task.exception() or (isinstance(task.result(), dict) and task.result().get("status") in {"infra_failed", "model_failed"})) for task in tasks):
-                    break
                 await asyncio.sleep(settings.get("poll_interval_s", .2))
+            # Reap the final completions that arrived during the last sleep. This
+            # also applies the isolate policy to the last finished agent.
+            self._reap_agent_tasks(tasks, observer)
             if self.status == "running":
                 self.status = "completed"
         except asyncio.CancelledError:
@@ -495,6 +746,18 @@ class Supervisor:
                 # usage and made the final token/cost totals null even after a win.
                 shutdown_grace = float(self.config.get("supervision", {}).get("shutdown_timeout_s", 30))
                 deliberate = self.status in {"succeeded", "stopped", "budget_exhausted", "completed"}
+                if self.runners is not None:
+                    try:
+                        await self.runners.stop(grace=shutdown_grace if deliberate else min(shutdown_grace, 15))
+                    except Exception as exc:
+                        self.status = "infra_failed"
+                        self._record_error("runner_shutdown_failed", exc)
+                if self._model_forwarder is not None:
+                    try:
+                        await asyncio.to_thread(self._model_forwarder.stop)
+                    except Exception as exc:
+                        self._record_error("model_forwarder_cleanup_failed", exc)
+                    self._model_forwarder = None
                 if deliberate and observer_task and not observer_task.done():
                     await asyncio.wait({observer_task}, timeout=shutdown_grace)
                 if observer_task:
@@ -513,7 +776,8 @@ class Supervisor:
                             or self.budget.stop_requested()
                             or self.status in {'succeeded', 'stopped', 'budget_exhausted', 'completed'})
                         if observer_task.cancelled():
-                            observer_outcome = {'status': 'stopped', 'reason': 'Supervisor shutdown', 'turns': observer.turns}
+                            observer_outcome = {'status': 'stopped', 'reason': 'Supervisor shutdown',
+                                                'turns': observer.turns if observer is not None else None}
                         elif observer_task.exception():
                             observer_outcome = {'status': 'infra_failed', 'error': type(observer_task.exception()).__name__}
                             expected_observer_shutdown = False
@@ -598,22 +862,15 @@ class Supervisor:
                     try:
                         result = await asyncio.to_thread(self._evaluation, True) if hasattr(self, "evaluator") else result
                         if self.status not in {"infra_failed", "model_failed", "reliability_failed", "resource_exhausted", "stopped", "budget_exhausted"}:
-                            statuses = {x.get("status") for x in outcomes if isinstance(x, dict)}
-                            if any(isinstance(x, BaseException) and not isinstance(x, asyncio.CancelledError) for x in outcomes) or "infra_failed" in statuses:
-                                self.status = "infra_failed"
-                            elif "model_failed" in statuses:
-                                self.status = "model_failed"
-                            elif result["status"] in {"succeeded", "diagnostic_pass"}:
-                                self.status = result["status"]
-                            elif "budget_exhausted" in statuses or time.monotonic() >= self.budget.deadline:
-                                self.status = "budget_exhausted"
-                            elif statuses == {"stalled"}:
-                                self.status = "stalled"
-                            elif statuses == {"turns_exhausted"}:
-                                self.status = "not_succeeded"
+                            if self.agent_failure_policy == "isolate":
+                                computed = self._isolated_final_status(outcomes, result)
+                                if computed is None:
+                                    computed = self._legacy_final_status(outcomes, result)
                             else:
-                                self.status = "not_succeeded"
-                        self.recorder.set_state("active_wall_seconds", already_elapsed + time.monotonic() - start)
+                                computed = self._legacy_final_status(outcomes, result)
+                            self.status = computed
+                        self.recorder.set_state("active_wall_seconds",
+                                                self._active_wall_seconds(already_elapsed, start, time.monotonic()))
                         self.recorder.set_state("status", self.status)
                         self.recorder.append("agent_outcomes", {"agents": [
                             x if isinstance(x, dict) else {'status': type(x).__name__} if isinstance(x, BaseException) else x
@@ -640,6 +897,225 @@ class Supervisor:
                         ownership.close()
                         lock.close()
         return {"run_dir": str(self.run_dir), "status": self.status, "evaluation": result, "reports": paths}
+
+    async def _start_runner_agents(self, agents, manifest, manifest_path, coding_containers, memory):
+        """Start one independent process per agent; control plane keeps all state."""
+        from .agents.tools import WorkspaceTools
+        from .runners import ArtifactVault, RunnerManager, ServiceHub
+
+        observer_enabled = self.config['observer']['mode'] == 'llm'
+        identifiers = list(agents) + (['observer'] if observer_enabled else [])
+        workspace_tools = {}
+        for agent in identifiers:
+            shell_container = coding_containers.get(agent)
+            shell_env = (self.gateway.cli_environment(agent)
+                         if shell_container and agent != 'observer' else None)
+            workspace_tools[agent] = WorkspaceTools(
+                self.run_dir / 'workspaces' / agent,
+                shell_enabled=bool(shell_container), shell_container=shell_container,
+                max_workspace_bytes=self.config['agents']['max_workspace_bytes'],
+                max_workspace_files=self.config['agents']['max_workspace_files'],
+                shell_env=shell_env,
+                max_shell_output_bytes=self.config['agents']['max_shell_output_bytes'],
+                max_shell_timeout_s=self.config['agents']['max_shell_timeout_s'],
+                default_shell_timeout_s=self.config['agents']['default_shell_timeout_s'])
+        artifacts = ArtifactVault(self.recorder, self.run_dir)
+        hub = ServiceHub(recorder=self.recorder, budget=self.budget, memory=memory,
+                         gateway=self.gateway, workspaces=workspace_tools,
+                         artifacts=artifacts, config=self.config,
+                         observer_callback=self._observer_infra_issue)
+        token_map, specs = {}, {}
+        for agent in identifiers:
+            role = 'observer' if agent == 'observer' else 'player'
+            token_map[secrets.token_urlsafe(32)] = {'agent_id': agent, 'role': role}
+
+        def player_config(agent):
+            config = {**self.config["agents"], "agent_id": agent,
+                      "peers": [x for x in agents if x != agent],
+                      "goal": self.config["experiment"]["goal"],
+                      'profile': self.config['experiment']['profile'],
+                      'lifecycle': self.config['runtime']['lifecycle'],
+                      'web': self._web_config(agent),
+                      "game_chat": self.config["collaboration"]["game_chat"],
+                      "chat_delivery": self.config["collaboration"].get("chat_delivery", "events"),
+                      "model_request_timeout_s": self.config["agents"].get(
+                          "model_request_timeout_s", self.config["model"]["timeout_s"] + 5),
+                      "program_timeout_ms": int(self.config["runtime"]["program_timeout_default_s"] * 1000),
+                      "leftover_policy": self.config["runtime"].get("leftover_policy", "reset"),
+                      "paper_tight_interface": self.config["agents"].get("paper_tight_interface", False)}
+            config["shell_enabled"] = agent in coding_containers
+            return config
+
+        for agent in agents:
+            specs[agent] = {
+                "schema_version": 1, "run_id": self.recorder.run_id, "agent_id": agent,
+                "role": "player", "state_root": str(self.run_dir / 'agents' / agent),
+                "shell_enabled": agent in coding_containers, "heartbeat_s": 10,
+                "agent_config": player_config(agent),
+                "model": json.loads(json.dumps(self.config["model"])),
+                # Pi-runtime integration: the per-agent submission-broker CLI
+                # environment and the model copy the Pi model proxy meters.
+                "cli_environment": self._runner_cli_environment(agent),
+                "pi_model": json.loads(json.dumps(self.config["model"])),
+            }
+        if observer_enabled:
+            observer_config = {**self.config['agents'], **self.config['observer'],
+                               'profile': self.config['experiment']['profile'],
+                               'web': self._web_config('observer'),
+                               'lifecycle': self.config['runtime']['lifecycle'],
+                               'agent_id': 'observer'}
+            observer_config["shell_enabled"] = 'observer' in coding_containers
+            specs['observer'] = {
+                "schema_version": 1, "run_id": self.recorder.run_id, "agent_id": "observer",
+                "role": "observer", "state_root": str(self.run_dir / 'agents' / 'observer'),
+                "shell_enabled": 'observer' in coding_containers, "heartbeat_s": 10,
+                "agent_config": observer_config,
+                "model": json.loads(json.dumps(self.config["model"])),
+                "cli_environment": {},
+                "pi_model": json.loads(json.dumps(self.config["model"])),
+                # Pi observer tuning (interval_s/max_reviews/max_turns) is read
+                # from here by RunnerManager when runtime.runner_runtime=pi; the
+                # Python ObserverAgent ignores this extra spec key.
+                "observer": dict(self.config["observer"]),
+            }
+
+        # Restricted-egress Pi runner containers have no network; the host-side
+        # forwarder over a bind-mounted UDS is their only path to the model
+        # provider. It lives in the Supervisor process and keeps the provider
+        # credential out of the runner environment.
+        from .runners import resolve_runner_egress
+        egress = resolve_runner_egress(self.config)
+        forwarder_socket = None
+        forwarder_token = None
+        if egress == "model_only":
+            from .pi_model_proxy import (MODEL_FORWARDER_SOCKET_NAME,
+                                         PiModelForwarder)
+            forwarder_token = secrets.token_urlsafe(32)
+            forwarder_socket = self.run_dir / "model-forwarder" / MODEL_FORWARDER_SOCKET_NAME
+            try:
+                run_stat = self.run_dir.stat()
+                owner_uid, owner_gid = run_stat.st_uid, run_stat.st_gid
+            except OSError:
+                owner_uid, owner_gid = None, None
+            forwarder = PiModelForwarder(self.config["model"],
+                                         socket_path=forwarder_socket,
+                                         token=forwarder_token,
+                                         owner_uid=owner_uid, owner_gid=owner_gid)
+            await asyncio.to_thread(forwarder.start)
+            self._model_forwarder = forwarder
+        try:
+            manager = RunnerManager(
+                run_dir=self.run_dir, config=self.config, specs=specs,
+                token_map=token_map, service_handler=hub.handle,
+                runner_env=self._runner_environment(), recorder=self.recorder,
+                budget=self.budget, on_runner_lost=self._runner_lost,
+                model_forwarder_socket=(str(forwarder_socket)
+                                        if forwarder_socket is not None else None),
+                model_forwarder_token=forwarder_token)
+            hub.manager = manager
+            self.runners = manager
+            ready = await manager.start()
+        except BaseException:
+            if self._model_forwarder is not None:
+                try:
+                    await asyncio.to_thread(self._model_forwarder.stop)
+                except Exception:
+                    pass
+                self._model_forwarder = None
+            raise
+        for agent, info in ready.items():
+            manifest['agent_interfaces'][agent] = {
+                'prompt_sha256': info['prompt_sha256'],
+                'tools_sha256': info['tools_sha256'],
+                'runner_pid': info.get('pid'),
+            }
+        manifest['runner_mode'] = self.config["runtime"].get("runner_mode", "process")
+        manifest['runner_runtime'] = self.config["runtime"].get("runner_runtime", "python")
+        manifest['runner_processes'] = manager.snapshot()
+        manifest['runner_egress'] = getattr(manager, "runner_egress", egress)
+        if getattr(manager, "runner_egress", egress) == "model_only":
+            from .pi_model_proxy import (MODEL_FORWARDER_ALLOWED_PATH,
+                                         MODEL_FORWARDER_CONTAINER_DIRECTORY,
+                                         MODEL_FORWARDER_CONTAINER_SOCKET)
+            manifest['model_forwarder'] = {
+                'mode': 'model_only',
+                'socket': str(forwarder_socket),
+                'container_socket': MODEL_FORWARDER_CONTAINER_SOCKET,
+                'container_directory': MODEL_FORWARDER_CONTAINER_DIRECTORY,
+                'allowed_path': MODEL_FORWARDER_ALLOWED_PATH,
+                'provider_credential_in_runner': False,
+            }
+        else:
+            manifest['model_forwarder'] = None
+        # Durable evidence of which source tree every runner will load, even
+        # after a restart. The snapshot itself lives under the run directory.
+        manifest['runner_source_snapshot'] = {
+            'source_sha256': getattr(manager, "source_sha256", None),
+            'source_files': getattr(manager, "source_snapshot_files", None),
+            'snapshot': str(getattr(manager, "source_snapshot_src", "")),
+            'created_this_start': bool(getattr(manager, "source_snapshot_created", False)),
+            'live_source_drift': bool(getattr(manager, "source_snapshot_live_drift", False)),
+            'pi_runtime_sha256': getattr(manager, "pi_runtime_sha256", None),
+        }
+        atomic_json(manifest_path, manifest)
+        tasks = [asyncio.create_task(manager.wait(agent), name=agent) for agent in agents]
+        observer_task = None
+        if observer_enabled:
+            observer_task = asyncio.create_task(manager.wait('observer'), name='observer')
+            self.recorder.set_state('observer_outcome', None)
+            self.recorder.state_event(
+                'observer_degraded', False, 'observer_started',
+                {'mode': 'llm',
+                 'required': self.config['experiment']['profile'] == 'paper_aligned',
+                 'transport': ('pi_observer'
+                               if self.config['runtime'].get('runner_runtime') == 'pi'
+                               else 'runner_process')})
+        return tasks, observer_task, None
+
+    def _runner_environment(self):
+        """Give runners only model/web credentials and a usable Python path."""
+        keep = {"PATH", "HOME", "LANG", "LC_ALL", "TZ", "TMPDIR", "PYTHONPATH",
+                "SSL_CERT_FILE", "SSL_CERT_DIR", "HTTP_PROXY", "HTTPS_PROXY",
+                "NO_PROXY", "http_proxy", "https_proxy", "no_proxy"}
+        environment = {key: value for key, value in os.environ.items() if key in keep}
+        root = Path(__file__).resolve().parents[2]
+        existing = environment.get("PYTHONPATH")
+        environment["PYTHONPATH"] = str(root / "src") + (
+            os.pathsep + existing if existing else "")
+        for group in (self.config["model"], self.config["web"]):
+            for key in ("api_key_env", "search_key_env", "fetch_key_env"):
+                name = group.get(key)
+                if isinstance(name, str) and name in os.environ:
+                    environment[name] = os.environ[name]
+        home = self.run_dir / "runners" / "home"
+        try:
+            home.mkdir(parents=True, exist_ok=True, mode=0o700)
+            environment["HOME"] = str(home)
+        except OSError:
+            pass
+        # Process runners inherit this and bound their RPC client from the frozen
+        # config; the container spawner currently uses the 120 s default because
+        # its environment whitelist lives in runners.py.
+        environment["HARNESS_RUNNER_RPC_TIMEOUT_S"] = str(
+            self.config.get("runtime", {}).get("runner_rpc_timeout_s", 120))
+        return environment
+
+    def _runner_cli_environment(self, agent):
+        """Submission-broker CLI environment for a runner spec, when available.
+
+        The broker only exists when coding workspaces (and their submission
+        proxy) are provisioned; a runner without one gets an empty environment
+        and the Pi runtime simply runs without the game CLI.
+        """
+        try:
+            return dict(self.gateway.cli_environment(agent))
+        except Exception:
+            return {}
+
+    async def _runner_lost(self, agent):
+        recovered = await self.budget.recover_abandoned(agent)
+        self.recorder.append('runner_budget_recovered',
+                             {'agent_id': agent, 'reservations': recovered})
 
     async def _reconcile_world(self, server):
         world = self.config["server"].get("world_dir")
@@ -700,6 +1176,7 @@ class Supervisor:
                 raise ValueError("restore requires a checkpoint ID inside this run")
             self.budget.admission.clear()
             self.gateway.admission.clear()
+            self._pause_clock()
             await self.gateway.fence()
             self.sessions_fenced = True
             if not self.frozen:
@@ -736,12 +1213,14 @@ class Supervisor:
             await self.gateway.resume_sessions()
             self.budget.admission.set()
             self.gateway.admission.set()
+            self._resume_clock()
             self.status = "running"
         elif command in {"pause", "freeze"}:
             if command == "freeze" and not server.container:
                 raise RuntimeError("world freeze requires server.managed_container")
             self.budget.admission.clear()
             self.gateway.admission.clear()
+            self._pause_clock()
             await self.gateway.pause_sessions()
             if command == "freeze":
                 await self.gateway.fence()
@@ -762,6 +1241,7 @@ class Supervisor:
             await self.gateway.resume_sessions()
             self.budget.admission.set()
             self.gateway.admission.set()
+            self._resume_clock()
             self.status = "running"
         elif command == "stop":
             self.budget.stopped = True

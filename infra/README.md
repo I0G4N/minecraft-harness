@@ -30,11 +30,50 @@ runtime source changes rebuild the three thin images without reinstalling the
 Docker client. Record inspected immutable image IDs in addition to tags.
 
 Fill `configs/minecraft-paper-aligned.yaml` with the intended model, frozen
-prices and explicit budgets. Export unique `BOT1_ADMIN_TOKEN` through
-`BOT4_ADMIN_TOKEN` and `WORKER1_TOKEN` through `WORKER4_TOKEN` in the trusted
-operator environment. `.env.example` contains placeholders only. Python invokes
-Compose directly for managed trials, so values must be exported; copying a
-file to `infra/.env` alone is insufficient for this path.
+prices and explicit budgets. `.env.example` contains placeholders only and
+documents tokens for up to 16 players. For managed trials, export unique
+`BOT1_ADMIN_TOKEN` through `BOT<agents>_ADMIN_TOKEN` and `WORKER1_TOKEN`
+through `WORKER<agents>_TOKEN` in the trusted operator environment. Python
+invokes Compose directly for managed trials, so values must be exported; copying
+a file to `infra/.env` alone is insufficient for this path.
+
+## Exact-N-agent generated deployment
+
+The checked-in `compose.paper.yaml` is a four-player reference template. For any
+other player count (and for reproducible generated files rather than hand
+editing), render the full deployment instead of deleting static service blocks:
+
+```bash
+# Does not start Docker, a server or a Supervisor.
+python3 scripts/prepare_deployment.py --agents 6 --project mc-paper-6
+# writes infra/compose.mc-paper-6.yaml, configs/mc-paper-6.yaml and
+# infra/.env.mc-paper-6 (mode 0600, fresh per-agent tokens)
+
+# Only after EULA acceptance and after the previous stack is stopped:
+docker compose -p mc-paper-6 -f infra/compose.mc-paper-6.yaml \
+  --env-file infra/.env.mc-paper-6 up -d
+PAPER_ENV_FILE=$PWD/infra/.env.mc-paper-6 PAPER_CONFIG=$PWD/configs/mc-paper-6.yaml \
+  PAPER_RUN_DIR=<fresh-run-dir> <deployment>/run-paper.sh   # reads server.managed_container
+```
+
+The renderer clones exactly N `identity`/`launcher`/`bot` triples, N worker
+networks, N loopback bot ports and N viewer ports. Four players keep the
+paper-aligned lifecycle; other counts use the strict lifecycle because the
+paper profile is defined for exactly four players. The independent Observer has
+no bot triple; with `observer.mode: llm` the Supervisor adds its runner container
+dynamically, for `N + 1` runner containers per run. The first four worker
+subnets preserve the static paper values; counts above four use non-overlapping
+`172.31.*/24` subnets. Run only one Minecraft stack at a time on this host.
+`run-paper.sh` derives the project from `server.managed_container` and loads the
+matching generated `infra/.env.<project>` (or `PAPER_ENV_FILE`), so an existing
+Supervisor container does not keep using another project's bot tokens.
+The generated server service carries `MAX_PLAYERS=N`; for a fresh data directory
+the server entrypoint rewrites `server.properties` accordingly (rebuild the
+server image after changing the entrypoint). Existing data directories are left
+untouched and must be provisioned/checked by the operator. Workspace provisioning
+supports up to 16 players plus the Observer; counts above four also need a fresh
+world and a stack with non-overlapping networks/ports (stop the old project, not
+just its containers).
 
 ```bash
 # Prepares inspectable world/config directories only, without Java or EULA acceptance.
@@ -45,11 +84,12 @@ uv run mc-harness batch --config configs/minecraft-paper-aligned.yaml --seeds ra
 ```
 
 Each trial gets a unique Compose project, server container, world, run ledger,
-workspace and memory. The trusted operator manages ports 3101–3104 exclusively;
-concurrent real batches on those ports are unsupported. The server uses the
-trial's prepared `server.properties`, and the supervisor validates the generated
-`level.dat` and actual rules before model admission. Preparation does not create
-an already generated world; the managed batch waits for Vanilla readiness first.
+workspace and memory. The trusted operator manages ports 3101 through 3100+N
+exclusively; concurrent real deployments on those ports are unsupported. The
+server uses the trial's prepared `server.properties`, and the supervisor validates
+the generated `level.dat` and actual rules before model admission. Preparation
+does not create an already generated world; the managed batch waits for Vanilla
+readiness first.
 
 Each player has a fixed identity proxy on its private game network. The worker
 can reach that proxy; the control service and launcher are on a separate network.

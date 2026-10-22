@@ -6,6 +6,8 @@ import { AsyncLocalStorage } from 'node:async_hooks';
 import { instrumentLoopDeadlines } from './loop-guard.mjs';
 import { boundedValue } from './limits.js';
 import { modulePolicy } from './capabilities.js';
+import { Worker } from 'node:worker_threads';
+import { fileURLToPath } from 'node:url';
 
 const nativeRequire = createRequire(import.meta.url);
 const config = JSON.parse(process.env.BOT_WORKER_CONFIG);
@@ -287,7 +289,7 @@ async function execute(message) {
     const syncBudget = Math.max(10, Math.min(Number(message.timeout_ms) || 60000,
       (Number(message.timeout_ms) || 60000) - 100));
     context.__paperInvoke = () => fn(bot, requireAllowed, logger, context,
-      () => Boolean(scopes.getStore()?.cancelled || scopes.getStore()?.closed), jobAPI);
+      () => Boolean(scopes.getStore()?.cancelled || scopes.getStore()?.closed), config.paperSingleProgram === true ? undefined : jobAPI);
     try {
       result = await scopes.run(scope, () => {
         if (config.chatDelivery === 'program_output' && pendingChat.length) {
@@ -397,38 +399,159 @@ if (config.mode === 'fake') {
     bot.once('kicked', reason => reject(new Error(`Kicked: ${String(reason)}`)));
     bot.once('end', reason => reject(new Error(`Connection ended before spawn: ${reason}`)));
   });
-  // Optional live first-person viewer for human observation. The Viewer is a
-  // browser-rendered 3D view of the bot's real game state (not a video codec);
-  // it is opt-in per bot via VIEWER_PORT and never receives model credentials.
+  // Optional live first-person viewer for human observation. The HTTP/socket
+  // renderer runs in an isolated worker thread inside the same read-only
+  // sandbox. A viewer exception is caught by this parent thread, which restarts
+  // the viewer; the agent bot, execution channel and experiment are untouched.
   const viewerPort = Number(process.env.VIEWER_PORT ?? '');
   if (Number.isInteger(viewerPort) && viewerPort > 0 && viewerPort < 65536) {
-    try {
-      const { mineflayer: mineflayerViewer } = nativeRequire('prismarine-viewer');
-      const http = nativeRequire('node:http');
-      const bind = process.env.VIEWER_BIND || '127.0.0.1';
-      const listen = http.Server.prototype.listen;
-      // prismarine-viewer always listens on every interface; bind loopback by
-      // default so the view is reachable only through the operator's SSH tunnel.
-      http.Server.prototype.listen = function (port, host, callback) {
-        if (typeof host === 'function') { callback = host; host = bind; }
-        else if (host === undefined) host = bind;
-        return listen.call(this, port, host, callback);
-      };
-      try {
-        const viewDistance = Math.max(1, Math.min(8, Number(process.env.VIEWER_VIEW_DISTANCE ?? '2') || 2));
-        mineflayerViewer(bot, {
-          port: viewerPort,
-          firstPerson: (process.env.VIEWER_FIRST_PERSON ?? 'true') !== 'false',
-          viewDistance
-        });
-      } finally {
-        http.Server.prototype.listen = listen;
-      }
-      send({ type: 'viewer_started', port: viewerPort, bind, first_person: (process.env.VIEWER_FIRST_PERSON ?? 'true') !== 'false' });
-    } catch (error) {
-      send({ type: 'viewer_error', error: String(error?.message ?? error).slice(0, 500) });
+    const bind = process.env.VIEWER_BIND || '127.0.0.1';
+    const viewDistance = Math.max(1, Math.min(8, Number(process.env.VIEWER_VIEW_DISTANCE ?? '2') || 2));
+    const firstPerson = (process.env.VIEWER_FIRST_PERSON ?? 'true') !== 'false';
+    const viewerScript = fileURLToPath(new URL('./viewer-child.cjs', import.meta.url));
+    const viewerChunks = new Map();
+    let viewerThread = null;
+    let viewerStopping = false;
+    let viewerRestarts = 0;
+    let viewerLastHeartbeat = Date.now();
+    let viewerRestartTimer = null;
+    let viewerPositionAt = 0;
+
+    function viewerSend(message) {
+      if (!viewerThread) return;
+      try { viewerThread.postMessage(message); } catch { /* restart owns recovery */ }
     }
+    function viewerSnapshot() {
+      const chunks = [];
+      for (const [key, json] of viewerChunks) {
+        const [x, z] = key.split(',').map(Number);
+        chunks.push({ x, z, json });
+      }
+      viewerSend({ type: 'chunks', chunks });
+      viewerPosition(true);
+    }
+    function viewerChunk(pos) {
+      try {
+        const column = bot.world?.getColumnAt(pos);
+        if (!column || typeof column.toJson !== 'function') return;
+        const x = Math.floor(pos.x / 16), z = Math.floor(pos.z / 16);
+        const json = column.toJson();
+        viewerChunks.set(`${x},${z}`, json);
+        if (viewerChunks.size > 1024) viewerChunks.delete(viewerChunks.keys().next().value);
+        viewerSend({ type: 'chunk', x, z, json });
+      } catch (error) { process.stderr.write(`viewer chunk capture failed: ${String(error?.message ?? error).slice(0, 300)}\n`); }
+    }
+    function viewerAllChunks() {
+      try {
+        const columns = bot.world?.columns || {};
+        for (const [key, column] of Object.entries(columns)) {
+          if (!column || typeof column.toJson !== 'function') continue;
+          const [x, z] = String(key).split(',').map(Number);
+          if (!Number.isInteger(x) || !Number.isInteger(z)) continue;
+          viewerChunks.set(`${x},${z}`, column.toJson());
+        }
+      } catch (error) { process.stderr.write(`viewer snapshot failed: ${String(error?.message ?? error).slice(0, 300)}\n`); }
+    }
+    function viewerPosition(force = false) {
+      const now = Date.now();
+      if (!force && now - viewerPositionAt < 100) return;
+      const position = bot.entity?.position;
+      if (!position) return;
+      viewerPositionAt = now;
+      viewerSend({ type: 'position', pos: { x: position.x, y: position.y, z: position.z }, yaw: bot.entity.yaw, pitch: bot.entity.pitch });
+    }
+    const viewerEntityAt = new Map();
+    function viewerEntity(entity, force = false) {
+      if (!entity || entity === bot.entity) return;
+      const now = Date.now();
+      if (!force && now - (viewerEntityAt.get(entity.id) || 0) < 150) return;
+      viewerEntityAt.set(entity.id, now);
+      if (viewerEntityAt.size > 256) viewerEntityAt.delete(viewerEntityAt.keys().next().value);
+      viewerSend({ type: 'entity', entity: { id: entity.id, name: entity.name, pos: { x: entity.position.x, y: entity.position.y, z: entity.position.z }, width: entity.width, height: entity.height, username: entity.username } });
+    }
+    function viewerBlockUpdate(oldBlock, newBlock) {
+      if (!newBlock || !newBlock.position) return;
+      const stateId = Number.isInteger(newBlock.stateId) ? newBlock.stateId : ((newBlock.type << 4) | (newBlock.metadata || 0));
+      viewerSend({ type: 'blockUpdate', block: { pos: { x: newBlock.position.x, y: newBlock.position.y, z: newBlock.position.z }, stateId } });
+    }
+    function viewerStart() {
+      if (viewerStopping) return;
+      if (viewerRestartTimer) { clearTimeout(viewerRestartTimer); viewerRestartTimer = null; }
+      const config = { port: viewerPort, bind, viewDistance, firstPerson, version: bot.version };
+      let thread;
+      try {
+        thread = new Worker(viewerScript, {
+          workerData: config,
+          resourceLimits: { maxOldGenerationSizeMb: 384, maxYoungGenerationSizeMb: 64 },
+        });
+      } catch (error) {
+        process.stderr.write(`viewer thread spawn failed: ${String(error?.message ?? error).slice(0, 500)}\n`);
+        viewerScheduleRestart();
+        return;
+      }
+      viewerThread = thread;
+      viewerLastHeartbeat = Date.now();
+      thread.on('message', (message) => {
+        if (!message || typeof message !== 'object') return;
+        if (message.type === 'viewer_heartbeat') { viewerLastHeartbeat = Date.now(); return; }
+        if (message.type === 'viewer_ready') {
+          viewerAllChunks();
+          viewerSnapshot();
+          send({ type: 'viewer_started', port: viewerPort, bind, first_person: firstPerson, isolated: true, restarts: viewerRestarts });
+          return;
+        }
+        if (message.type === 'viewer_fatal' || message.type === 'viewer_warning') {
+          process.stderr.write(`viewer ${message.type}: ${String(message.error).slice(0, 800)}\n`);
+        }
+      });
+      thread.on('error', (error) => {
+        process.stderr.write(`viewer thread error: ${String(error?.stack ?? error).slice(0, 1000)}\n`);
+      });
+      thread.on('exit', (code) => {
+        if (viewerThread === thread) viewerThread = null;
+        if (viewerStopping) return;
+        process.stderr.write(`viewer thread exited code=${code}; restarting\n`);
+        viewerScheduleRestart();
+      });
+    }
+    function viewerScheduleRestart() {
+      if (viewerStopping || viewerRestartTimer) return;
+      viewerRestarts++;
+      const delay = Math.min(5000, 500 + viewerRestarts * 250);
+      viewerRestartTimer = setTimeout(() => { viewerRestartTimer = null; viewerStart(); }, delay);
+    }
+    function viewerStop() {
+      viewerStopping = true;
+      if (viewerRestartTimer) { clearTimeout(viewerRestartTimer); viewerRestartTimer = null; }
+      const thread = viewerThread; viewerThread = null;
+      if (thread) {
+        try { thread.postMessage({ type: 'shutdown' }); } catch {}
+        const killTimer = setTimeout(() => { thread.terminate().catch(() => {}); }, 500);
+        killTimer.unref?.();
+        thread.once('exit', () => clearTimeout(killTimer));
+      }
+    }
+    process.on('exit', viewerStop);
+    process.on('SIGTERM', () => { viewerStop(); process.exit(0); });
+    bot.on('chunkColumnLoad', viewerChunk);
+    bot.on('move', () => viewerPosition());
+    bot.on('entitySpawn', (entity) => viewerEntity(entity, true));
+    bot.on('entityMoved', viewerEntity);
+    bot.on('entityGone', (entity) => viewerSend({ type: 'entity', entity: { id: entity.id, delete: true } }));
+    bot.on('blockUpdate', viewerBlockUpdate);
+    const viewerPositionTimer = setInterval(() => viewerPosition(), 250);
+    viewerPositionTimer.unref?.();
+    const viewerHealthTimer = setInterval(() => {
+      if (!viewerThread || viewerStopping) return;
+      if (Date.now() - viewerLastHeartbeat > 15000) {
+        process.stderr.write('viewer heartbeat timeout; restarting thread\n');
+        viewerThread.terminate().catch(() => {});
+      }
+    }, 5000);
+    viewerHealthTimer.unref?.();
+    viewerStart();
   }
+
 }
 const emitterMethods = new Set(['on', 'once', 'addListener', 'prependListener', 'prependOnceListener', 'off', 'removeListener', 'removeAllListeners', 'emit']);
 for (const name of Object.keys(bot)) if (!emitterMethods.has(name)) instrumentMethod(bot, name);

@@ -13,32 +13,75 @@ import yaml
 DEFAULTS = {
     "experiment": {"name": "minecraft", "task": "observe_only", "goal": "Observe the shared world and verify your observations.", "seed": 42,
                    "profile": "strict", "stop_on_success": True},
-    "agents": {"count": 4, "max_turns": 30, "context_chars": 48000, "max_no_progress_turns": 5, "paper_single_program": False, "paper_tight_interface": False, "paper_single_program": False,
+    "agents": {"count": 4, "max_turns": 30, "context_chars": 48000, "max_no_progress_turns": 5, "paper_single_program": False, "paper_tight_interface": False, "paper_cli_output": False, "paper_shell_cli": False, "max_shell_output_bytes": 65536, "max_shell_timeout_s": 120, "default_shell_timeout_s": 120,
                "max_model_failures": 5, "max_event_failures": 5, "retry_base_s": 1, "retry_max_s": 30,
                "max_workspace_bytes": 64_000_000, "max_workspace_files": 4096, "max_tool_result_chars": 16000},
     "model": {"kind": "fake", "max_output_tokens": 4096, "timeout_s": 90, "max_retries": 0,
-              "max_request_bytes": 1_000_000, "max_response_bytes": 2_000_000},
+              # Paper-mode context is 224k characters. A UTF-8 worst case plus
+              # tool schemas/protocol overhead exceeds the old 1 MB ceiling, so
+              # keep a request bound that can actually carry the configured
+              # context instead of failing on the first long compaction.
+              "max_request_bytes": 4_000_000, "max_response_bytes": 2_000_000},
     "collaboration": {"game_chat": True, "shared_memory": True, "chat_delivery": "events"},
     "runtime": {"mode": "fake", "url": None, "urls": {}, "viewer_ports": {}, "token_env": "MC_RUNTIME_TOKEN",
                 "program_timeout_default_s": 60, "program_timeout_max_s": 180,
                 "minecraft_version": "1.20.4", "host": "127.0.0.1", "port": 25565,
                 "request_timeout_s": 10, "startup_timeout_s": 60, "heartbeat_interval_s": 5, "lease_timeout_s": 30,
                 "response_max_bytes": 4 * 1024 ** 2, "lifecycle": "strict", "max_background_jobs": 8,
-                "max_background_ttl_ms": 86400000, "leftover_policy": "reset", "recover_session_loss": False},
-    "budgets": {"wall_time_minutes": 60, "total_model_calls": 400, "max_cost_usd": None},
+                "max_background_ttl_ms": 86400000, "leftover_policy": "reset", "recover_session_loss": False,
+                "runner_mode": "inprocess", "runner_restart_limit": 5,
+                "runner_startup_timeout_s": 90, "runner_heartbeat_timeout_s": 180,
+                "runner_container_image": "minecraft-harness-workspace:local",
+                "runner_container_python": "/usr/bin/python3.11",
+                "runner_container_network": "bridge", "runner_container_memory_mb": 1024,
+                "runner_container_cpus": 1.0, "runner_container_read_only": True,
+                "runner_container_shared_dir": None,
+                # uid:gid for runner containers; null derives the run directory
+                # owner. Container mode must match host file ownership because
+                # --cap-drop=ALL removes CAP_DAC_OVERRIDE.
+                "runner_container_user": None,
+                # Agent runner implementation. "python" keeps the custom
+                # AgentCore runner; "pi" launches minecraft_harness.pi_runner
+                # (Pi coding-agent RPC) while Supervisor/ledger/budget/observer
+                # remain Python. The pinned Pi CLI bundle path is resolved
+                # against the repository root and bind-mounted read-only at the
+                # same absolute path for container runners.
+                "runner_runtime": "python",
+                "pi_cli": "pi_runtime/node_modules/@earendil-works/pi-coding-agent/dist/bundle/cli.js",
+                "pi_context_window": 64000,
+                # Durable RPC calls must not wait forever when a runner process
+                # dies mid-request; the Supervisor retries/reconciles instead.
+                "runner_rpc_timeout_s": 120},
+    "budgets": {"wall_time_minutes": 60, "total_model_calls": 400, "max_cost_usd": None,
+                # External reference access is outside the model token budget;
+                # cap it separately so a long run cannot issue unbounded calls.
+                "max_web_calls": None},
     "server": {"world_dir": None, "log_path": None, "save_interval_s": 300, "managed_container": None,
                "control_timeout_s": 90, "startup_timeout_s": 120, "log_interval_s": 1,
                "properties_path": None, "require_fresh_world": False, "log_timezone": "UTC"},
     "storage": {"min_free_disk_bytes": 256 * 1024 ** 2, "max_artifact_bytes": 16 * 1024 ** 3,
-                "max_run_bytes": 24 * 1024 ** 3, "max_event_bytes": 4 * 1024 ** 2},
+                "max_run_bytes": 24 * 1024 ** 3, "max_event_bytes": 4 * 1024 ** 2,
+                # Pi session JSONL and model/tool artifact retention. Sessions
+                # older than the prune point are removed on runner start; new
+                # artifacts above the cap become metadata-only summaries.
+                "pi_session_max_bytes": 1_000_000_000,
+                "pi_artifact_max_bytes": 4_000_000_000},
     "supervision": {"poll_interval_s": .2, "evaluation_interval_s": 2, "resource_check_interval_s": 5, "resource_sample_interval_s": 10,
-                    "recovery_attempts": 3, "max_recoveries": 20, "recovery_base_s": 1, "recovery_max_s": 30, "shutdown_timeout_s": 30},
+                    "recovery_attempts": 3, "max_recoveries": 20, "recovery_base_s": 1, "recovery_max_s": 30, "shutdown_timeout_s": 30,
+                    # A single agent's model/infrastructure fault is an
+                    # experimental event, not a reason to discard the run. The
+                    # Observer is likewise allowed to degrade in place.
+                    "agent_failure_policy": "isolate", "observer_failure_policy": "degrade"},
     "observer": {"mode": "rules", "interval_s": 60, "allow_infra_requests": True},
     "workspace": {"provision": False, "image": "minecraft-harness-workspace:local", "network": "none",
                   "docs_dir": None},
-    "web": {"enabled": False, "search_url": None, "search_key_env": None, "allowed_hosts": [],
-            "timeout_s": 15, "max_response_bytes": 262144},
+    "web": {"enabled": False, "provider": "custom", "search_url": None, "fetch_url": None,
+            "search_key_env": None, "api_key_env": None, "fetch_key_env": None, "count": 10,
+            "need_content": False, "allowed_hosts": [], "timeout_s": 15, "max_response_bytes": 262144},
 }
+
+
+_REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
 def _merge(base: dict, override: dict) -> dict:
@@ -99,11 +142,52 @@ def validate_config(raw: dict) -> dict:
         raise ValueError("experiment.seed must be null (random) or a signed 64-bit integer")
     if rt["lifecycle"] not in {"strict", "paper_aligned"}:
         raise ValueError("runtime.lifecycle must be strict or paper_aligned")
+    if rt["runner_mode"] not in {"inprocess", "process", "container"}:
+        raise ValueError("runtime.runner_mode must be inprocess, process or container")
+    if rt["runner_runtime"] not in {"python", "pi"}:
+        raise ValueError("runtime.runner_runtime must be python or pi")
+    pi_cli = rt.get("pi_cli")
+    if (not isinstance(pi_cli, str) or not pi_cli.strip() or "\x00" in pi_cli
+            or not pi_cli.strip().endswith(".js")):
+        raise ValueError("runtime.pi_cli must be a path to the Pi CLI bundle (.js)")
+    pi_cli_path = Path(pi_cli.strip()).expanduser()
+    if not pi_cli_path.is_absolute():
+        pi_cli_path = _REPO_ROOT / pi_cli_path
+    rt["pi_cli"] = str(pi_cli_path.resolve())
+    _integer(rt["pi_context_window"], "runtime.pi_context_window",
+             minimum=1024, maximum=4_000_000)
+    _integer(rt["runner_restart_limit"], "runtime.runner_restart_limit", maximum=100)
+    _number(rt["runner_startup_timeout_s"], "runtime.runner_startup_timeout_s", maximum=3600)
+    _number(rt["runner_heartbeat_timeout_s"], "runtime.runner_heartbeat_timeout_s", minimum=5, maximum=86400)
+    _number(rt["runner_rpc_timeout_s"], "runtime.runner_rpc_timeout_s", minimum=1, maximum=3600)
+    if (not isinstance(rt["runner_container_image"], str) or
+            not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.:/@-]{0,199}", rt["runner_container_image"])):
+        raise ValueError("runtime.runner_container_image must be a Docker image reference")
+    if rt["runner_container_network"] not in {"bridge", "none"}:
+        raise ValueError("runtime.runner_container_network must be 'bridge' or 'none'")
+    _integer(rt["runner_container_memory_mb"], "runtime.runner_container_memory_mb",
+             minimum=128, maximum=1024 * 1024)
+    _number(rt["runner_container_cpus"], "runtime.runner_container_cpus",
+            maximum=1024)
+    if type(rt["runner_container_read_only"]) is not bool:
+        raise ValueError("runtime.runner_container_read_only must be boolean")
+    container_user = rt.get("runner_container_user")
+    if container_user is not None and (not isinstance(container_user, str) or
+                                        not re.fullmatch(r"[0-9]{1,10}:[0-9]{1,10}", container_user)):
+        raise ValueError("runtime.runner_container_user must be null or uid:gid")
+    container_python = rt.get("runner_container_python")
+    if (not isinstance(container_python, str) or not container_python.startswith("/") or
+            not re.fullmatch(r"/[A-Za-z0-9_./-]{1,255}", container_python)):
+        raise ValueError("runtime.runner_container_python must be an absolute container path")
+    shared_dir = rt.get("runner_container_shared_dir")
+    if shared_dir is not None and (not isinstance(shared_dir, str) or
+                                   not shared_dir.strip() or not Path(shared_dir).is_absolute()):
+        raise ValueError("runtime.runner_container_shared_dir must be an absolute path")
     _integer(rt["max_background_jobs"], "runtime.max_background_jobs", maximum=128)
     _integer(rt["max_background_ttl_ms"], "runtime.max_background_ttl_ms", minimum=10)
     count = agents["count"]
     if type(count) is not int or not 1 <= count <= 16:
-        raise ValueError("agents.count must be an integer from 1 to 16")
+        raise ValueError("agents.count must be an integer from 1 to 16; the paper profile requires exactly 4")
     ids = agents.get("ids", [f"player{i + 1}" for i in range(count)])
     if not isinstance(ids, list) or len(ids) != count or any(not isinstance(x, str) or not re.fullmatch(r"[A-Za-z0-9_]{1,16}", x) for x in ids) or len(set(ids)) != count:
         raise ValueError("unique Minecraft agent IDs (1–16 alphanumeric/underscore characters) required")
@@ -115,6 +199,13 @@ def validate_config(raw: dict) -> dict:
         raise ValueError("agents.paper_single_program must be a boolean")
     if type(agents.get("paper_tight_interface")) is not bool:
         raise ValueError("agents.paper_tight_interface must be a boolean")
+    if type(agents.get("paper_cli_output")) is not bool:
+        raise ValueError("agents.paper_cli_output must be a boolean")
+    if type(agents.get("paper_shell_cli")) is not bool:
+        raise ValueError("agents.paper_shell_cli must be a boolean")
+    _integer(agents["max_shell_output_bytes"], "agents.max_shell_output_bytes", minimum=1024, maximum=512 * 1024 ** 2)
+    _integer(agents["max_shell_timeout_s"], "agents.max_shell_timeout_s", minimum=1, maximum=7 * 24 * 3600)
+    _integer(agents["default_shell_timeout_s"], "agents.default_shell_timeout_s", minimum=1, maximum=agents["max_shell_timeout_s"])
     if result["runtime"].get("leftover_policy") not in {"reset", "allow"}:
         raise ValueError("runtime.leftover_policy must be 'reset' or 'allow'")
     if type(result["runtime"].get("recover_session_loss")) is not bool:
@@ -136,6 +227,8 @@ def validate_config(raw: dict) -> dict:
     for key in ("max_request_bytes", "max_response_bytes"):
         _integer(model[key], "model." + key, minimum=1024, maximum=16 * 1024 ** 2)
     _number(result["budgets"]["wall_time_minutes"], "budgets.wall_time_minutes")
+    if result["budgets"].get("max_web_calls") is not None:
+        _integer(result["budgets"]["max_web_calls"], "budgets.max_web_calls", minimum=0)
     if rt["mode"] not in ("fake", "minecraft"):
         raise ValueError("runtime.mode must be fake or minecraft")
     if model["kind"] not in ("fake", "chat_completions"):
@@ -166,13 +259,15 @@ def validate_config(raw: dict) -> dict:
     _environment_name(rt["token_env"], "runtime.token_env")
     for agent, env in rt.get("token_envs", {}).items():
         _environment_name(env, f"runtime.token_envs.{agent}")
-    for key in ("program_timeout_default_s", "program_timeout_max_s", "request_timeout_s", "startup_timeout_s", "heartbeat_interval_s", "lease_timeout_s"):
+    for key in ("program_timeout_default_s", "program_timeout_max_s"):
+        _number(rt[key], "runtime." + key, maximum=7 * 24 * 3600)
+    for key in ("request_timeout_s", "startup_timeout_s", "heartbeat_interval_s", "lease_timeout_s"):
         _number(rt[key], "runtime." + key, maximum=3600)
     if rt["program_timeout_default_s"] > rt["program_timeout_max_s"]:
         raise ValueError("invalid program timeout range")
     if rt["heartbeat_interval_s"] * 2 >= rt["lease_timeout_s"]:
         raise ValueError("runtime.lease_timeout_s must exceed twice runtime.heartbeat_interval_s")
-    _integer(rt["response_max_bytes"], "runtime.response_max_bytes", minimum=1024, maximum=64 * 1024 ** 2)
+    _integer(rt["response_max_bytes"], "runtime.response_max_bytes", minimum=1024, maximum=512 * 1024 ** 2)
     _integer(rt["port"], "runtime.port", maximum=65535)
     if rt["mode"] == "minecraft" and any(not rt.get("url") and not rt["urls"].get(agent) for agent in ids):
         raise ValueError("Minecraft mode requires an external bot runtime URL for every configured agent (see infra)")
@@ -195,6 +290,8 @@ def validate_config(raw: dict) -> dict:
             _integer(value, "storage." + key, minimum=0 if key == "min_free_disk_bytes" else 1024)
     if result["storage"]["max_artifact_bytes"] > result["storage"]["max_run_bytes"]:
         raise ValueError("storage.max_artifact_bytes cannot exceed storage.max_run_bytes")
+    if result["storage"]["pi_artifact_max_bytes"] > result["storage"]["max_run_bytes"]:
+        raise ValueError("storage.pi_artifact_max_bytes cannot exceed storage.max_run_bytes")
     supervision = result["supervision"]
     for key in ("poll_interval_s", "evaluation_interval_s", "resource_check_interval_s", "resource_sample_interval_s", "shutdown_timeout_s"):
         _number(supervision[key], "supervision." + key, maximum=86400)
@@ -202,6 +299,10 @@ def validate_config(raw: dict) -> dict:
     _integer(supervision["max_recoveries"], "supervision.max_recoveries", minimum=0, maximum=1000)
     _number(supervision["recovery_base_s"], "supervision.recovery_base_s", inclusive=True, maximum=3600)
     _number(supervision["recovery_max_s"], "supervision.recovery_max_s", minimum=supervision["recovery_base_s"], inclusive=True, maximum=3600)
+    if supervision.get("agent_failure_policy") not in {"isolate", "fail_run"}:
+        raise ValueError("supervision.agent_failure_policy must be 'isolate' or 'fail_run'")
+    if supervision.get("observer_failure_policy") not in {"degrade", "fail_run"}:
+        raise ValueError("supervision.observer_failure_policy must be 'degrade' or 'fail_run'")
     if result["observer"]["mode"] not in {"rules", "llm"}:
         raise ValueError("observer.mode must be rules or llm")
     if result['observer']['mode'] == 'llm' and 'observer' in ids:
@@ -219,19 +320,38 @@ def validate_config(raw: dict) -> dict:
         # during configuration instead of losing the Observer mid-run.
         for label, value in (("agents.context_chars", agents["context_chars"]),
                              ("observer.context_chars", observer_context)):
-            if value > model["max_request_bytes"]:
-                raise ValueError(f"model.max_request_bytes must be at least {label} ({value})")
+            # Worst-case UTF-8 is three bytes per character; the request also
+            # carries tool schemas, role framing and JSON escaping. Reject a
+            # byte ceiling that cannot hold the configured context plus margin,
+            # rather than losing a long-running agent at its first compaction.
+            required = value * 3 + 65_536
+            if required > model["max_request_bytes"]:
+                raise ValueError(
+                    f"model.max_request_bytes must be at least {required} bytes for {label} "
+                    f"({value} characters)")
     for key in ("provision",):
         if type(result["workspace"][key]) is not bool:
             raise ValueError("workspace." + key + " must be boolean")
     if type(result["web"]["enabled"]) is not bool:
         raise ValueError("web.enabled must be boolean")
+    if result["web"].get("provider") not in {"custom", "deepseek"}:
+        raise ValueError('web.provider must be custom or deepseek')
     if result["web"].get("search_url"):
         _endpoint(result["web"]["search_url"], "web.search_url")
-        if urlparse(result['web']['search_url']).scheme != 'https':
-            raise ValueError('web.search_url must use HTTPS')
-    if result["web"].get("search_key_env"):
-        _environment_name(result["web"]["search_key_env"], "web.search_key_env")
+        parsed = urlparse(result['web']['search_url'])
+        local = parsed.scheme == 'http' and parsed.hostname in {'127.0.0.1', 'localhost'} and parsed.port not in (None, 443)
+        if parsed.scheme != 'https' and not local:
+            raise ValueError('web.search_url must use HTTPS, or loopback HTTP for a local operator adapter')
+    if result["web"].get("fetch_url"):
+        _endpoint(result["web"]["fetch_url"], "web.fetch_url")
+        if urlparse(result['web']['fetch_url']).scheme != 'https':
+            raise ValueError('web.fetch_url must use HTTPS')
+    for key in ("search_key_env", "api_key_env", "fetch_key_env"):
+        if result["web"].get(key):
+            _environment_name(result["web"][key], "web." + key)
+    _integer(result["web"]["count"], "web.count", minimum=1, maximum=50)
+    if type(result["web"]["need_content"]) is not bool:
+        raise ValueError("web.need_content must be boolean")
     if not isinstance(result['web']['allowed_hosts'], list) or any(not isinstance(host, str) or not re.fullmatch(r'[A-Za-z0-9.-]+', host) for host in result['web']['allowed_hosts']):
         raise ValueError('web.allowed_hosts must be a list of explicit HTTPS host names')
     _number(result["web"]["timeout_s"], "web.timeout_s", minimum=1, inclusive=True, maximum=60)

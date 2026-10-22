@@ -1,9 +1,15 @@
 import hashlib
 import json
 import unittest
+from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
+import yaml
+
 from minecraft_harness.deployment import capture_deployment, DeploymentInspectionError, _docker_projection, _CONTAINER
+from minecraft_harness.deployment_generation import render_compose
+
+ROOT = Path(__file__).resolve().parents[1]
 
 SERVER_IMAGE = 'sha256:' + '1' * 64
 WORKSPACE_IMAGE = 'sha256:' + '2' * 64
@@ -192,3 +198,21 @@ class DeploymentTests(unittest.IsolatedAsyncioTestCase):
                 self.assertLess(time.monotonic() - start, 2)
                 self.assertTrue(children)
                 self.assertIsNotNone(children[0].returncode)
+
+
+class GeneratedComposeRestartPolicyTests(unittest.TestCase):
+    def test_generated_compose_restarts_player_services_but_not_server(self):
+        rendered = render_compose(ROOT / "infra" / "compose.paper.yaml", 4, "mc-deploy-test")
+        services = rendered["services"]
+        self.assertEqual(services["server"]["restart"], "no")
+        for name, service in services.items():
+            if name.startswith(("identity", "launcher", "bot")):
+                self.assertEqual(service["restart"], "unless-stopped", name)
+
+    def test_checked_in_paper_template_restart_policies(self):
+        document = yaml.safe_load((ROOT / "infra" / "compose.paper.yaml").read_text(encoding="utf-8"))
+        services = document["services"]
+        self.assertEqual(services["server"]["restart"], "no")
+        self.assertTrue(any(
+            service["restart"] == "unless-stopped" for name, service in services.items()
+            if name.startswith(("identity", "launcher", "bot"))))

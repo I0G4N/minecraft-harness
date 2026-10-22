@@ -94,6 +94,22 @@ class WorkspaceProvisionTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(any(command[0] == "start" for command in commands))
         self.assertFalse(any(command[0] == "run" for command in commands))
 
+    async def test_workspace_cap_covers_sixteen_players_and_observer(self):
+        identities = [f"player{i}" for i in range(1, 17)] + ["observer"]
+        commands = []
+        async def docker(*args, **kwargs):
+            commands.append(args)
+            if args[:2] == ("image", "inspect"):
+                return json.dumps([self.image])
+            if args[0] == "inspect":
+                raise WorkspaceDockerError("container not found", not_found=True)
+            return "fixture"
+        with patch.object(self.provisioner, "_docker", docker), patch.object(self.provisioner, "_documentation", return_value=self.docs):
+            names = await self.provisioner.provision(identities)
+        self.assertEqual(set(names), set(identities))
+        self.assertEqual(len([command for command in commands if command[0] == "run"]),
+                         len(identities))
+
     async def test_resume_fences_old_workspace_process_namespace_before_reuse(self):
         info = self.existing()
         info['State'] = {'Running': True}

@@ -80,7 +80,9 @@ class WorkspaceProvisioner:
         image_info = json.loads(await self._docker('image', 'inspect', image))[0]
         if not image_info.get('Id'):
             raise RuntimeError('Coding workspace image inspection did not return an immutable image ID')
-        if (not isinstance(agent_ids, list) or not 1 <= len(agent_ids) <= 5 or any(
+        # Up to 16 players plus the independent Observer.  Keep this in sync
+        # with config.MAX_AGENTS and the dynamic exact-N deployment generator.
+        if (not isinstance(agent_ids, list) or not 1 <= len(agent_ids) <= 17 or any(
                 not isinstance(agent, str) or not re.fullmatch(r'[A-Za-z0-9_]{1,16}', agent) for agent in agent_ids)
                 or len(set(agent_ids)) != len(agent_ids)):
             raise ValueError('Unique safe coding workspace identities are required')

@@ -1,0 +1,117 @@
+experiment:
+  name: four-agent-paper-final-20261022
+  profile: paper_aligned
+  seed: null
+  task: kill_dragon
+  goal: The objective is to defeat the Ender Dragon, starting from the spawn of the
+    session's shared Minecraft survival world. This is the only criterion. Any means
+    of meeting it within the rules of survival mode is permitted, and the players
+    decide how to share the work.
+  stop_on_success: false
+agents:
+  count: 4
+  max_turns: 100000
+  max_no_progress_turns: 120
+  max_model_failures: 20
+  max_event_failures: 20
+  max_tool_result_chars: 224000
+  paper_single_program: true
+  paper_tight_interface: true
+  retry_base_s: 2
+  retry_max_s: 60
+  context_chars: 224000
+  paper_cli_output: true
+  paper_shell_cli: true
+  max_shell_output_bytes: 67108864
+  max_shell_timeout_s: 194400
+  default_shell_timeout_s: 120
+model:
+  kind: chat_completions
+  base_url: https://api.deepseek.com
+  model: deepseek-flash
+  api_key_env: DEEPSEEK_API_KEY
+  max_output_tokens: 4096
+  max_retries: 0
+  extra_body:
+    thinking:
+      type: disabled
+  timeout_s: 180
+collaboration:
+  game_chat: true
+  shared_memory: true
+  chat_delivery: program_output
+runtime:
+  mode: minecraft
+  lifecycle: paper_aligned
+  leftover_policy: allow
+  recover_session_loss: true
+  program_timeout_default_s: 60
+  program_timeout_max_s: 194400
+  response_max_bytes: 268435456
+  max_background_jobs: 8
+  max_background_ttl_ms: 129600000
+  urls:
+    player1: http://127.0.0.1:3101
+    player2: http://127.0.0.1:3102
+    player3: http://127.0.0.1:3103
+    player4: http://127.0.0.1:3104
+  token_envs:
+    player1: BOT1_ADMIN_TOKEN
+    player2: BOT2_ADMIN_TOKEN
+    player3: BOT3_ADMIN_TOKEN
+    player4: BOT4_ADMIN_TOKEN
+  viewer_ports:
+    player1: 3105
+    player2: 3106
+    player3: 3107
+    player4: 3108
+server:
+  world_dir: ../infra/server-data/world
+  managed_container: minecraft-paper-server
+  log_path: ../infra/server-data/logs/latest.log
+  save_interval_s: 300
+  log_interval_s: 1
+  require_fresh_world: true
+workspace:
+  provision: true
+  image: minecraft-harness-workspace:local
+  network: none
+observer:
+  mode: llm
+  interval_s: 60
+  allow_infra_requests: true
+web:
+  enabled: true
+  provider: deepseek
+  search_url: https://api.deepseek.com/v1/tools/search
+  fetch_url: https://api.deepseek.com/v1/tools/fetch
+  api_key_env: DEEPSEEK_API_KEY
+  count: 10
+  need_content: false
+  timeout_s: 30
+  max_response_bytes: 128000
+  allowed_hosts:
+  - github.com
+  - prismarinejs.github.io
+  - nodejs.org
+  - minecraft.wiki
+  - minecraft.fandom.com
+storage:
+  max_artifact_bytes: 34359738368
+  max_run_bytes: 51539607552
+  min_free_disk_bytes: 2147483648
+supervision:
+  recovery_attempts: 8
+  max_recoveries: 60
+  recovery_base_s: 5
+  recovery_max_s: 120
+  shutdown_timeout_s: 60
+budgets:
+  wall_time_minutes: 3240
+  total_model_calls: 30000
+  max_cost_usd: 1500.0
+  max_input_tokens: 250000
+  prices_per_million:
+    input: 0.3
+    cached_input: 0.006
+    output: 1.2

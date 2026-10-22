@@ -120,7 +120,7 @@ class FigureBuilderTests(unittest.TestCase):
         self.assertEqual(stages["ten_crystals"]["state"], "reached")
         self.assertEqual(stages["ten_crystals"]["precision"], "player_program_observation")
         order = [stage["key"] for stage in figures["stages"]]
-        self.assertLess(order.index("ender_pearls"), order.index("blaze_rods"))
+        self.assertLess(order.index("blaze_rods"), order.index("ender_pearls"))
 
     def test_dragon_observation_channel_is_parsed_but_agent_reported(self):
         self.make_ledger([

@@ -138,6 +138,65 @@ class PaperAgentsTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("after", result)
         self.assertEqual(result["result"], "ok")
 
+    async def test_paper_program_output_is_cli_text_not_structured_json(self):
+        class LogsExecutor(Executor):
+            async def execute(self, agent, source, **options):
+                return {'execution_id': 'e1', 'status': 'succeeded',
+                        'logs': [{'message': 'first line'}, {'message': 'second line'}],
+                        'result': 'x' * 3000}
+        player = AgentLoop({
+            "agent_id": "a", "profile": "paper_aligned", "lifecycle": "paper_aligned",
+            "paper_single_program": True, "paper_tight_interface": True,
+            "paper_cli_output": False, "context_chars": 12000,
+            "max_tool_result_chars": 1000, "goal": "Observe", "max_turns": 1,
+        }, self.root, self.recorder, LogsExecutor(), FakeModel(), self.budget, None)
+        result = await player._dispatch("mc_execute", {"source": "return 1"}, "call")
+        self.assertIn("__paper_cli_text__", result)
+        player._tool_result({"id": "call", "function": {"name": "mc_execute"}}, result)
+        content = player.messages[-1]["content"]
+        self.assertFalse(content.lstrip().startswith("{"))
+        self.assertIn("first line", content)
+        self.assertIn("second line", content)
+        self.assertIn("Returned: " + "x" * 3000, content)
+        self.assertNotIn("output truncated", content)
+
+    async def test_paper_output_truncates_only_at_the_context_budget(self):
+        class HugeExecutor(Executor):
+            async def execute(self, agent, source, **options):
+                return {'status': 'succeeded', 'result': 'y' * 5000}
+        player = AgentLoop({
+            "agent_id": "a", "profile": "paper_aligned", "lifecycle": "paper_aligned",
+            "paper_single_program": True, "paper_cli_output": True,
+            "context_chars": 4000, "max_tool_result_chars": 100,
+            "goal": "Observe", "max_turns": 1,
+        }, self.root, self.recorder, HugeExecutor(), FakeModel(), self.budget, None)
+        result = await player._dispatch("mc_execute", {"source": "return 1"}, "call")
+        player._tool_result({"id": "call", "function": {"name": "mc_execute"}}, result)
+        content = player.messages[-1]["content"]
+        self.assertIn("output exceeded the model context budget", content)
+        self.assertLessEqual(len(content), 4100)
+        # The complete output remains addressable even when the model-facing
+        # transcript has to be bounded by the context budget.
+        events = self.recorder.read_events()
+        self.assertTrue(any(event["kind"] == "tool_result" and
+                            event["payload"].get("format") == "paper_cli_text"
+                            for event in events))
+
+    async def test_paper_output_marks_runtime_truncation_without_hiding_logs(self):
+        class TruncatedExecutor(Executor):
+            async def execute(self, agent, source, **options):
+                return {'status': 'succeeded', 'logs': [{'message': 'seen'}],
+                        'result': 'ok', 'output_truncated': True}
+        player = AgentLoop({
+            "agent_id": "a", "profile": "paper_aligned", "lifecycle": "paper_aligned",
+            "paper_single_program": True, "paper_cli_output": True,
+            "context_chars": 12000, "goal": "Observe", "max_turns": 1,
+        }, self.root, self.recorder, TruncatedExecutor(), FakeModel(), self.budget, None)
+        result = await player._dispatch("mc_execute", {"source": "return 1"}, "call")
+        self.assertTrue(result["__paper_cli_text__"].endswith(
+            '[program output was truncated by the runtime; full output is incomplete]'))
+        self.assertTrue(result["__paper_cli_text__"].startswith("seen"))
+
     async def test_observer_retries_transient_model_failure(self):
         observer = ObserverAgent({"retry_base_s": 0, "max_model_failures": 3},
                                  self.root, self.recorder, FakeModel(), self.budget)

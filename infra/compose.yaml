@@ -16,7 +16,7 @@ x-bot: &bot
   pids_limit: 64
   cpus: 1
   init: true
-  restart: "no"
+  restart: "unless-stopped"
   logging:
     driver: local
     options: {max-size: "10m", max-file: "3"}

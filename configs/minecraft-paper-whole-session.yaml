@@ -1,43 +1,24 @@
-# Whole-session paper template: 27h14m pre-win + the day after (~51h).
-# DeepSeek model; fill budgets before running.
-# Provision a fresh trial with `mc-harness prepare-trials`; this accepts no EULA.
 experiment:
   name: four-agent-paper-whole-session
   profile: paper_aligned
   seed: null
   task: kill_dragon
-  # Paper §2 objective paragraph (p96), kept verbatim apart from the elided bracket.
-  goal: >-
-    The objective is to defeat the Ender Dragon, starting from the spawn of the session's shared
-    Minecraft survival world. This is the only criterion. Any means of meeting it within the rules
-    of survival mode is permitted, and the players decide how to share the work.
-  # The paper reports both "up to the win" and a whole session that includes the day after;
-  # set false with a longer wall/budget to collect the whole-session window too.
+  goal: The objective is to defeat the Ender Dragon, starting from the spawn of the
+    session's shared Minecraft survival world. This is the only criterion. Any means
+    of meeting it within the rules of survival mode is permitted, and the players
+    decide how to share the work.
   stop_on_success: false
 agents:
   count: 4
   max_turns: 100000
-  # The paper did not describe a stall cutoff. This is a deliberately high
-  # framework safety bound for long runs; wall/call/cost budgets remain tighter.
   max_no_progress_turns: 120
-  # 27h runs see transient provider/network errors. Retryable agent calls back off
-  # and are admitted/settled individually; non-retryable errors still stop the agent.
   max_model_failures: 20
   max_event_failures: 20
   max_tool_result_chars: 128000
-  # Paper §2.1 exposes one synchronous program at a time, not this framework's
-  # async submit/wait/jobs API. Keep the extra execution tools out of the model schema.
   paper_single_program: true
-  # Hide history_read/artifact_read and strip structured before/after snapshots from
-  # the model-visible tool result; server evidence still records both.
   paper_tight_interface: true
   retry_base_s: 2
   retry_max_s: 60
-  # The paper's players averaged ~56k input tokens per model call; use a
-  # context budget sized for the chosen large-context model rather than a
-  # small-model default. 160000 chars is roughly 40k tokens.
-  # Paper §6 averages ~56k input tokens/call; 224000 chars is roughly 56k at
-  # 4 chars/token. Actual provider tokenizer/cache behavior still differs.
   context_chars: 224000
 model:
   kind: chat_completions
@@ -49,29 +30,23 @@ model:
   extra_body:
     thinking:
       type: disabled
-  # Long contexts / slower providers need more than the 90s default; the Supervisor
-  # still enforces its own per-call deadline.
   timeout_s: 180
 collaboration:
-  # Paper §2.1: chat appears in the output of the next program.
   game_chat: true
   shared_memory: true
   chat_delivery: program_output
 runtime:
   mode: minecraft
   lifecycle: paper_aligned
-  # Paper §4 relies on timed-out/returned programs leaving async work, timers and
-  # globals alive (1,519 programs used stop counters). This only takes effect in
-  # bot containers configured with LEFTOVER_POLICY=allow (compose.paper.yaml).
   leftover_policy: allow
   recover_session_loss: true
-  # Keep the paper's default 60s while allowing agents to choose longer bounded
-  # programs (paper reports a 33.5s median and no stated hard maximum).
+  runner_mode: process
+  runner_restart_limit: 5
+  runner_startup_timeout_s: 90
+  runner_heartbeat_timeout_s: 180
   program_timeout_default_s: 60
   program_timeout_max_s: 600
   response_max_bytes: 67108864
-  # NOTE: mc_submit/mc_wait/mc_jobs/jobs.start are framework extras, not described in the
-  # paper's single-program CLI; they change execution concurrency. See PAPER_AUDIT_2026-10-21.md §2.2.
   max_background_jobs: 8
   max_background_ttl_ms: 129600000
   urls:
@@ -84,6 +59,11 @@ runtime:
     player2: BOT2_ADMIN_TOKEN
     player3: BOT3_ADMIN_TOKEN
     player4: BOT4_ADMIN_TOKEN
+  viewer_ports:
+    player1: 3105
+    player2: 3106
+    player3: 3107
+    player4: 3108
 server:
   world_dir: ../infra/server-data/world
   managed_container: minecraft-paper-server
@@ -101,16 +81,15 @@ observer:
   allow_infra_requests: true
 web:
   enabled: false
-  allowed_hosts: [github.com, prismarinejs.github.io, nodejs.org]
+  allowed_hosts:
+  - github.com
+  - prismarinejs.github.io
+  - nodejs.org
 storage:
-  # Extrapolated from real runs: ~36 MiB artifacts / 400 calls at ~13k input
-  # tokens/call. The paper's ~24k calls at ~56k tokens/call need roughly
-  # 6-12 GiB of model/tool artifacts; 32 GiB gives a safety margin.
   max_artifact_bytes: 34359738368
   max_run_bytes: 51539607552
   min_free_disk_bytes: 2147483648
 supervision:
-  # Paper had 6 server restarts; leave room for gateway/server/network faults.
   recovery_attempts: 8
   max_recoveries: 60
   recovery_base_s: 5
@@ -118,11 +97,10 @@ supervision:
   shutdown_timeout_s: 60
 budgets:
   wall_time_minutes: 3240
-  total_model_calls: 30000 # REQUIRED: total calls including Observer and compression
-  max_cost_usd: 1500.0     # REQUIRED for a paid run
+  total_model_calls: 30000
+  max_cost_usd: 1500.0
   max_input_tokens: 250000
   prices_per_million:
-    # DeepSeek list-price estimate verified 2026-10-21; update if pricing changes.
-    input: 0.30
+    input: 0.3
     cached_input: 0.006
-    output: 1.20
+    output: 1.2

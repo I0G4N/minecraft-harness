@@ -20,8 +20,67 @@ def _tool(name: str, description: str, properties: dict, required: list[str] | N
                            "required": required or [], "additionalProperties": False}}}
 
 
+def _paper_tool_schemas(shell_enabled: bool, web_enabled: bool) -> list[dict[str, Any]]:
+    """Minimal model-visible tool surface for the paper-aligned profile.
+
+    The paper's agents have a code workspace, a shell, file editing, web search
+    and a private/team persistent memory; the game is reachable only through the
+    command-line client inside the shell.  Framework tools (game RPC, events,
+    history, artifacts) are intentionally absent, and descriptions carry no
+    harness terminology.
+    """
+    string = {"type": "string"}
+    integer = {"type": "integer"}
+    tools = [
+        _tool("workspace_read", "Read a UTF-8 text file from your workspace.",
+              {"path": string, "offset": integer, "limit": integer}, ["path"]),
+        _tool("workspace_write", "Create or replace a UTF-8 text file in your workspace.",
+              {"path": string, "content": string}, ["path", "content"]),
+        _tool("workspace_list", "List files in your workspace.", {"path": string}),
+        _tool("workspace_remove", "Remove a file or empty directory from your workspace.",
+              {"path": string}, ["path"]),
+    ]
+    if shell_enabled:
+        tools.append(_tool(
+            "shell", "Run a shell command in your development environment.",
+            {"command": string, "timeout_s": integer}, ["command"]))
+    tools.extend([
+        _tool("memory_read", "Read one of your own notes or a note shared by a teammate.",
+              {"scope": {"enum": ["private", "team"], "type": "string"}, "path": string,
+               "author": string, "revision": integer, "offset": integer, "limit": integer},
+              ["scope", "path"]),
+        _tool("memory_write", "Create or update one of your own notes. Use expected_revision=0 to "
+              "create a new note; otherwise pass the revision you last read.",
+              {"scope": {"enum": ["private", "team"], "type": "string"}, "path": string,
+               "content": string, "expected_revision": integer},
+              ["scope", "path", "content", "expected_revision"]),
+        _tool("memory_list", "List note metadata.",
+              {"scope": {"enum": ["private", "team"], "type": "string"}, "author": string,
+               "offset": integer, "limit": integer}),
+        _tool("memory_search", "Search your private notes and the team's shared notes for ranked "
+              "matching snippets.",
+              {"query": string, "scope": {"enum": ["all", "private", "team"], "type": "string"},
+               "author": string, "limit": integer}, ["query"]),
+    ])
+    if web_enabled:
+        tools.extend([
+            _tool("web_search", "Search the web for reference material.", {"query": string}, ["query"]),
+            _tool("web_fetch", "Fetch a public HTTPS page for reference.", {"url": string}, ["url"]),
+        ])
+    return tools
+
+
+PAPER_TOOL_NAMES = frozenset({
+    "workspace_read", "workspace_write", "workspace_list", "workspace_remove", "shell",
+    "memory_read", "memory_write", "memory_list", "memory_search", "web_search", "web_fetch",
+})
+
+
 def tool_schemas(shell_enabled: bool = False, background_enabled: bool = False, web_enabled: bool = False,
-                 paper_single_program: bool = False, leftover_policy: str = "reset", paper_tight_interface: bool = False) -> list[dict[str, Any]]:
+                 paper_single_program: bool = False, leftover_policy: str = "reset", paper_tight_interface: bool = False,
+                 paper_shell_cli: bool = False, paper_profile: bool = False) -> list[dict[str, Any]]:
+    if paper_profile:
+        return _paper_tool_schemas(shell_enabled, web_enabled)
     string = {"type": "string"}
     integer = {"type": "integer"}
     tools = [
@@ -68,6 +127,10 @@ def tool_schemas(shell_enabled: bool = False, background_enabled: bool = False, 
                        {"hash": string, "offset": integer, "limit": integer}, ["hash"]))
     if paper_single_program:
         tools = [item for item in tools if item["function"]["name"] not in {"mc_status", "mc_cancel", "mc_pending", "events_read"}]
+    if paper_shell_cli:
+        # Paper §2.1: the player interacts through a command-line client, not a
+        # direct game-execution tool. Commands run through the shell tool.
+        tools = [item for item in tools if item["function"]["name"] != "mc_execute"]
     if paper_tight_interface:
         tools = [item for item in tools if item["function"]["name"] not in {"history_read", "artifact_read"}]
     if background_enabled:
@@ -100,7 +163,8 @@ class WorkspaceTools:
 
     def __init__(self, root: Path, shell_enabled: bool = False, shell_container: str | None = None,
                  max_workspace_bytes: int = 64_000_000, max_workspace_files: int = 4096,
-                 shell_env: dict[str, str] | None = None):
+                 shell_env: dict[str, str] | None = None, max_shell_output_bytes: int = 65536,
+                 max_shell_timeout_s: int = 120, default_shell_timeout_s: int = 120):
         self.root = root.resolve()
         self.root.mkdir(parents=True, exist_ok=True)
         self.shell_enabled = bool(shell_enabled and shell_container)
@@ -115,6 +179,9 @@ class WorkspaceTools:
                 or "\x00" in value or "\n" in value or "\r" in value for value in self.shell_env.values())):
             raise ValueError("Only bounded player submission-broker environment keys are permitted")
         self.max_workspace_bytes, self.max_workspace_files = max_workspace_bytes, max_workspace_files
+        self.max_shell_output_bytes = max(1024, min(int(max_shell_output_bytes), 512 * 1024 ** 2))
+        self.max_shell_timeout_s = max(1, min(int(max_shell_timeout_s), 7 * 24 * 3600))
+        self.default_shell_timeout_s = max(1, min(int(default_shell_timeout_s), self.max_shell_timeout_s))
         self._write_lock = threading.RLock()
         if shell_enabled and not shell_container:
             raise ValueError("shell_enabled requires a separately isolated shell_container")
@@ -264,10 +331,10 @@ class WorkspaceTools:
             os.fsync(directory)
         return {"path": str(Path(*parts)), "removed": True}
 
-    async def shell(self, command: str, timeout_s: int = 30) -> dict[str, Any]:
+    async def shell(self, command: str, timeout_s: int | None = None) -> dict[str, Any]:
         if not self.shell_enabled:
             raise PermissionError("Shell is disabled; it requires an isolated workspace container")
-        timeout_s = max(1, min(int(timeout_s), 120))
+        timeout_s = self.default_shell_timeout_s if timeout_s is None else max(1, min(int(timeout_s), self.max_shell_timeout_s))
         if not isinstance(command, str) or len(command.encode()) > 128000:
             raise ValueError("Shell command must be text no larger than 128 KB")
         await self._shell_quota_check()
@@ -298,9 +365,9 @@ class WorkspaceTools:
             while chunk := await process.stdout.read(8192):
                 total += len(chunk)
                 capture_state["total"] = total
-                output.extend(chunk[:max(0, 65536 - len(output))])
+                output.extend(chunk[:max(0, self.max_shell_output_bytes - len(output))])
             await process.wait()
-            return bytes(output), total > 65536
+            return bytes(output), total > self.max_shell_output_bytes
 
         async def cleanup():
             script = ('job="$1"; : > "$job.cancel"; '
@@ -371,7 +438,7 @@ class WorkspaceTools:
                 quota_error = str(exc)
                 await self._fence_workspace_container()
         output = bytes(capture_state["output"])
-        truncated = capture_state["total"] > 65536
+        truncated = capture_state["total"] > self.max_shell_output_bytes
         result = {"exit_code": process.returncode, "output": output.decode(errors="replace"), "truncated": truncated}
         if quota_error is not None:
             result.update(status="workspace_quota_exceeded", error=quota_error,

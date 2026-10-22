@@ -10,7 +10,7 @@ from pathlib import Path
 import sqlite3
 from typing import Any, Iterable
 
-from .collector import artifact_bytes, registered_evidence
+from .collector import artifact_bytes, registered_evidence, iter_registered_evidence
 
 SUPPORTED_TASKS = ("observe_only", "obtain_logs", "craft_table", "obtain_iron_ingot", "kill_dragon")
 CRITERION_VERSION = "minecraft-java-1.20.4-server-files-v1"
@@ -72,6 +72,25 @@ def _advancement(files: dict, name: str, players: set[str] | None) -> set[str]:
         if isinstance(entry, dict) and entry.get("done") is True:
             result.add(Path(relative).stem)
     return result
+
+
+def _server_log_success(run_dir: Path) -> dict | None:
+    """Paper §5 authority: the server log's [Free the End] advancement line."""
+    for row in iter_registered_evidence(run_dir):
+        if row.get("kind") != "server_log_segment":
+            continue
+        try:
+            document = json.loads(artifact_bytes(run_dir, row["artifact_sha256"]))
+        except (OSError, ValueError, UnicodeError):
+            continue
+        for item in document.get("events", []) if isinstance(document, dict) else []:
+            message = item.get("raw_message") if isinstance(item, dict) else None
+            if isinstance(message, str) and "free the end" in message.lower():
+                return {"event_seq": row.get("event_seq"), "evidence_id": row.get("evidence_id"),
+                        "artifact_sha256": row.get("artifact_sha256"), "source_time": item.get("source_time"),
+                        "raw_message": message[:1000], "actor_id": item.get("actor_id"),
+                        "method": "server log [Free the End] line"}
+    return None
 
 
 def _load_snapshot(run_dir: Path, row: dict) -> dict:
@@ -283,6 +302,24 @@ def evaluate(
     if latest_snapshot is None:
         result.update(status="insufficient_evidence", reason="No valid post-baseline server snapshot")
         return result
+    log_success = _server_log_success(run_dir) if name == "kill_dragon" else None
+    if name == "kill_dragon" and log_success:
+        result.update(status="succeeded", capability_success=True,
+                      first_success_event_seq=log_success["event_seq"],
+                      success_authority="server_log_free_the_end", success_log=log_success)
+        result["criteria"] = [{"name": name, "method": "server_log_free_the_end",
+                               "observed_delta": 1, "required_delta": 1, "passed": True}]
+        result["evidence_refs"] = [{key: log_success.get(key) for key in
+                                    ("event_seq", "evidence_id", "artifact_sha256", "source_time", "raw_message")}]
+        return result
+    if name == "kill_dragon" and successful is not None:
+        # A world-file advancement alone is no longer sufficient: the paper's
+        # authoritative win record is the server's [Free the End] log line.
+        result.update(status="insufficient_evidence", capability_success=False,
+                      reason="advancement found but authoritative [Free the End] server-log line is missing")
+        result.setdefault("warnings", []).append({"error": "success_log_required",
+                                                  "event_seq": successful["event_seq"]})
+        return result
     chosen = successful or best_snapshot
     if _frontier:
         result["_frontier"] = sorted({baseline["event_seq"], best_snapshot["event_seq"], chosen["event_seq"], latest_snapshot["event_seq"]})
@@ -329,14 +366,14 @@ class IncrementalEvaluator:
             with closing(sqlite3.connect(database.as_uri() + "?mode=ro", uri=True)) as connection:
                 connection.row_factory = sqlite3.Row
                 query = """SELECT event_seq,world_epoch,kind,source,actor_id,
-                    CASE WHEN kind IN ('server_world_snapshot','world_restored','world_recovered','world_checkpoint_restored','execution_completed','program_succeeded','execution_succeeded','execution_finished','program_finished')
+                    CASE WHEN kind IN ('server_world_snapshot','world_restored','world_recovered','world_checkpoint_restored','server_log_segment','execution_completed','program_succeeded','execution_succeeded','execution_finished','program_finished')
                     THEN payload_json ELSE '{}' END AS payload_json
                     FROM events WHERE event_seq>? ORDER BY event_seq"""
                 for row in connection.execute(query, (self.cursor,)):
                     # Filter before parsing large program/tool payloads.
                     self.cursor = row["event_seq"]
                     self.epoch = max(self.epoch, row["world_epoch"])
-                    if row["kind"] not in {"server_world_snapshot", "world_restored", "world_recovered", "world_checkpoint_restored", "execution_completed", "program_succeeded", "execution_succeeded", "execution_finished", "program_finished"}:
+                    if row["kind"] not in {"server_world_snapshot", "world_restored", "world_recovered", "world_checkpoint_restored", "server_log_segment", "execution_completed", "program_succeeded", "execution_succeeded", "execution_finished", "program_finished"}:
                         continue
                     if row["kind"] in {"execution_completed", "program_succeeded", "execution_succeeded", "execution_finished", "program_finished"} and (self.diagnostic_event is not None or diagnostic is not None):
                         continue

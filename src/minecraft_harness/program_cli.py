@@ -88,6 +88,31 @@ async def invoke(args):
         return response.json()
 
 
+def render_program_text(result):
+    """Paper CLI output: the program's logs followed by its returned value."""
+    lines = []
+    for entry in result.get("logs") or []:
+        if isinstance(entry, dict):
+            lines.append(str(entry.get("message", "")))
+        else:
+            lines.append(str(entry))
+    returned = result.get("result")
+    if returned is not None:
+        if isinstance(returned, str):
+            lines.append("Returned: " + returned)
+        else:
+            lines.append("Returned: " + json.dumps(returned, ensure_ascii=False, default=str))
+    error = result.get("error")
+    if isinstance(error, dict):
+        lines.append("Error: " + str(error.get("message", error)))
+    elif error:
+        lines.append("Error: " + str(error))
+    status = result.get("status")
+    if status and status not in {"succeeded", "done"}:
+        lines.append("Status: " + str(status))
+    return "\n".join(lines) if lines else "(program produced no output)"
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description="Submit agent-written JS to your Mineflayer bot")
     parser.add_argument("--url")
@@ -100,6 +125,7 @@ def main(argv=None):
         execute.add_argument("--timeout-ms", type=int, default=60000)
         execute.add_argument("--wait-ms", type=int, default=65000 if command == "exec" else 0)
         execute.add_argument("--request-id")
+        execute.add_argument("--json", action="store_true", help="print the raw JSON result")
     commands.add_parser("jobs")
     job_cancel = commands.add_parser("job-cancel")
     job_cancel.add_argument("--job-id", required=True)
@@ -109,7 +135,10 @@ def main(argv=None):
     args = parser.parse_args(argv)
     try:
         result = asyncio.run(invoke(args))
-        print(json.dumps(result, ensure_ascii=False, indent=2))
+        if args.command == "exec" and not getattr(args, "json", False):
+            print(render_program_text(result))
+        else:
+            print(json.dumps(result, ensure_ascii=False, indent=2))
         return 1 if result.get("status") in {"failed", "timed_out", "unknown", "interrupted", "rejected"} else 0
     except (ValueError, OSError, httpx.HTTPError) as exc:
         print(f"mc error: {type(exc).__name__}", file=sys.stderr)

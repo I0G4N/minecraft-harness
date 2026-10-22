@@ -15,11 +15,21 @@ class AgentLoop(AgentCore):
     """Independent coding-agent loop; the supervisor owns global success/budgets."""
 
     TERMINAL_EXECUTIONS = {"succeeded", "failed", "cancelled", "timed_out", "interrupted", "rejected", "invalidated"}
+    # Pi-durable "effect sandwich" classification: read-only intents are safe to
+    # reason about after a crash, side effects are never assumed to have happened.
+    READ_ONLY_TOOLS = frozenset({
+        "workspace_read", "workspace_list", "memory_read", "memory_list",
+        "memory_search", "events_read", "history_read", "artifact_read",
+        "mc_status", "mc_pending", "mc_jobs", "web_search", "web_fetch",
+    })
 
     def __init__(self, config: dict[str, Any], run_dir: Path, recorder: Any,
-                 executor: Any, model: Any, budget: Any, memory: Any):
+                 executor: Any, model: Any, budget: Any, memory: Any, *,
+                 state_root: Path | None = None, workspace: Any = None,
+                 artifact_api: Any = None):
         self.executor, self.memory = executor, memory
-        super().__init__(config, run_dir, recorder, model, budget, role="player")
+        super().__init__(config, run_dir, recorder, model, budget, role="player",
+                         state_root=state_root, workspace=workspace, artifact_api=artifact_api)
 
     def _prompt(self) -> str:
         return player_prompt(self.config)
@@ -41,28 +51,64 @@ class AgentLoop(AgentCore):
             self.pending_jobs = {}
         return (self.world_epoch, self.runtime_epoch) != before
 
+    def _record_tool_intent(self, name: str, arguments: dict[str, Any], call_id: str) -> None:
+        """Durably record tool intent before dispatch (never raw args/secrets).
+
+        Together with the existing ``tool_result`` ledger event this gives the
+        intent -> execution -> result sandwich used for crash reconstruction. A
+        crash between the two events means the effect is unknown and is never
+        replayed automatically.
+        """
+        try:
+            encoded = json.dumps({"name": name, "arguments": arguments},
+                                 ensure_ascii=False, sort_keys=True, default=str)
+            args_sha256 = hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+            self._append("tool_intent", {
+                "tool": str(name)[:100],
+                "call_id": str(call_id)[:200],
+                "args_sha256": args_sha256,
+                "idempotency": "read_only" if name in self.READ_ONLY_TOOLS else "side_effect",
+            })
+        except Exception:
+            # Intent bookkeeping must not block a real tool action.
+            return
+
     async def _recover(self) -> None:
         # Never redispatch an interrupted tool. A crash could have occurred after
-        # a side effect but before its completion checkpoint was committed.
+        # a side effect but before its completion checkpoint was committed, so
+        # every pending call is recorded as an unknown effect and only the
+        # durable result placeholder is written back.
         for call in list(self.pending_tools):
             name = call["function"]["name"]
             result = {"status": "unknown" if name in {"mc_execute", "mc_submit"} else "interrupted",
                       "error": "Harness restarted during this tool; it was not replayed. Observe current state before acting."}
+            self._append("tool_effect_unknown", {
+                "tool": str(name)[:100], "tool_call_id": str(call.get("id", ""))[:200],
+                "idempotency": "read_only" if name in self.READ_ONLY_TOOLS else "side_effect",
+                "replayed": False,
+                "status": result["status"],
+            })
             self._tool_result(call, result)
             self.pending_tools.pop(0)
             self._checkpoint()
+        recovered = []
         if self.pending_executions:
-            recovered = []
             for execution_id in list(self.pending_executions):
                 try:
-                    result = await self.executor.status(self.agent_id, execution_id)
+                    status = await self.executor.status(self.agent_id, execution_id)
                 except Exception as exc:
-                    result = {"status": "unknown", "execution_id": execution_id, "error": type(exc).__name__}
-                recovered.append(result)
-                if result.get("status") in self.TERMINAL_EXECUTIONS:
+                    status = {"status": "unknown", "execution_id": execution_id, "error": type(exc).__name__}
+                recovered.append(status)
+                if status.get("status") in self.TERMINAL_EXECUTIONS:
                     self.pending_executions.pop(execution_id, None)
-            self.messages.append({"role": "user", "content": "Recovered execution status; old actions were not replayed: " + json.dumps(recovered)})
-        self.messages.append({"role": "user", "content": "Harness conversation resumed. Runtime globals may have reset; inspect runtime events and actual game state before relying on previous observations."})
+        # One structured branch summary instead of generic "resumed" sentences:
+        # reason, epoch, lost globals, pending handles, next steps and an explicit
+        # no-replay rule. It is also journaled for dashboard/evidence audit.
+        message = self._recovery_branch_message(
+            "harness_restart",
+            details={"recovered_executions": recovered} if recovered else None)
+        self.messages.append({"role": "user",
+                              "content": json.dumps(message, ensure_ascii=False)})
         self._checkpoint()
 
     async def run(self) -> dict[str, Any]:
@@ -142,6 +188,9 @@ class AgentLoop(AgentCore):
                                 if not isinstance(arguments, dict):
                                     raise ValueError("Tool arguments must be an object")
                                 result = await self._dispatch(call["function"]["name"], arguments, call["id"])
+                                # File effects feed the context projection used by
+                                # the next compaction (never raises).
+                                self.context.track_tool(call["function"]["name"], arguments, result)
                                 fingerprint = hashlib.sha256(json.dumps({
                                     "name": call["function"]["name"], "args": arguments,
                                     "result": {key: value for key, value in result.items() if key not in {
@@ -182,6 +231,8 @@ class AgentLoop(AgentCore):
         return result
 
     async def _dispatch(self, name: str, args: dict[str, Any], call_id: str) -> dict[str, Any]:
+        # Intent is durable before any side effect can happen.
+        self._record_tool_intent(name, args, call_id)
         if name == "artifact_read":
             return self._artifact_read(**args)
         if name in {"web_search", "web_fetch"}:
@@ -212,6 +263,11 @@ class AgentLoop(AgentCore):
             execution_id = result.get("execution_id")
             if execution_id and result.get("status") not in self.TERMINAL_EXECUTIONS:
                 self.pending_executions[execution_id] = call_id
+            if self.paper_cli_output:
+                # Paper §2.1: the player CLI returns the program's logs and
+                # returned value, not the harness's structured execution record.
+                # The raw record remains in the durable ledger/artifact.
+                return {"__paper_cli_text__": self._paper_program_text(result)}
             try:
                 await self._refresh_jobs()
             except Exception as exc:
@@ -263,6 +319,16 @@ class AgentLoop(AgentCore):
             offset, limit = args.get("offset", 0), args.get("limit", 100)
             return {"notes": notes, "offset": offset,
                     "next_offset": offset + limit if len(notes) == limit else None}
+        if name == "memory_search":
+            if self.memory is None:
+                raise ValueError("Memory search is unavailable in this configuration")
+            query = args.get("query")
+            results = self.memory.search(
+                self.agent_id, query,
+                scope=args.get("scope", "all"),
+                author=args.get("author"),
+                limit=args.get("limit", 20))
+            return {"query": query, "results": results, "count": len(results)}
         if name == "events_read":
             return await self._read_events(max(1, min(int(args.get("limit", 100)), 100)))
         if name == "history_read":

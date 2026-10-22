@@ -47,6 +47,70 @@ class MemoryStore:
             connection.execute("""INSERT OR IGNORE INTO author_usage
                 SELECT author, SUM(length(CAST(content AS BLOB))+length(CAST(evidence_refs AS BLOB))+length(CAST(path AS BLOB))+512),
                 COUNT(DISTINCT scope || ':' || path) FROM notes GROUP BY author""")
+            # Search projects only the latest revision of every note; the full
+            # revision history stays in ``notes`` for CAS and explicit reads.
+            connection.execute("""CREATE TABLE IF NOT EXISTS notes_latest (
+                scope TEXT NOT NULL, author TEXT NOT NULL, path TEXT NOT NULL,
+                revision INTEGER NOT NULL, content TEXT NOT NULL,
+                written_at TEXT NOT NULL, world_epoch INTEGER NOT NULL,
+                evidence_refs TEXT NOT NULL,
+                PRIMARY KEY(scope, author, path))""")
+            self.fts_enabled = False
+            self._rebuild_latest(connection)
+            self._init_search_index(connection)
+
+    def _rebuild_latest(self, connection: sqlite3.Connection) -> None:
+        """Repair the latest-revision projection from the durable notes table.
+
+        Older databases predate the projection; this is also the restart-safe
+        recovery path when no search side table exists yet.
+        """
+        connection.execute("""DELETE FROM notes_latest WHERE NOT EXISTS (
+            SELECT 1 FROM notes AS n
+            WHERE n.scope=notes_latest.scope AND n.author=notes_latest.author
+              AND n.path=notes_latest.path AND n.revision=notes_latest.revision)""")
+        connection.execute("""INSERT INTO notes_latest
+            (scope, author, path, revision, content, written_at, world_epoch, evidence_refs)
+            SELECT n.scope, n.author, n.path, n.revision, n.content,
+                   n.written_at, n.world_epoch, n.evidence_refs
+            FROM notes AS n
+            JOIN (SELECT scope, author, path, MAX(revision) AS revision
+                  FROM notes GROUP BY scope, author, path) AS newest
+              ON n.scope=newest.scope AND n.author=newest.author
+             AND n.path=newest.path AND n.revision=newest.revision
+            WHERE NOT EXISTS (SELECT 1 FROM notes_latest AS latest
+                              WHERE latest.scope=n.scope
+                                AND latest.author=n.author
+                                AND latest.path=n.path)""")
+
+    def _init_search_index(self, connection: sqlite3.Connection) -> None:
+        """Create the FTS5 index (or degrade to the LIKE fallback) and rebuild.
+
+        The index stores only the latest revision of each note. If FTS5 is not
+        available in this SQLite build, ``search()`` transparently falls back to
+        a bounded LIKE scan over the same projection.
+        """
+        try:
+            connection.execute("""CREATE VIRTUAL TABLE IF NOT EXISTS notes_fts USING fts5(
+                scope UNINDEXED, author UNINDEXED, path UNINDEXED,
+                revision UNINDEXED, written_at UNINDEXED, world_epoch UNINDEXED,
+                content)""")
+        except sqlite3.OperationalError:
+            self.fts_enabled = False
+            return
+        self.fts_enabled = True
+        indexed = connection.execute("SELECT COUNT(*) FROM notes_fts").fetchone()[0]
+        current = connection.execute("SELECT COUNT(*) FROM notes_latest").fetchone()[0]
+        stale = connection.execute("""SELECT COUNT(*) FROM notes_fts AS f
+            WHERE NOT EXISTS (SELECT 1 FROM notes_latest AS l
+                WHERE l.rowid=f.rowid AND l.scope=f.scope AND l.author=f.author
+                  AND l.path=f.path AND l.revision=f.revision)""").fetchone()[0]
+        if indexed != current or stale:
+            connection.execute("DELETE FROM notes_fts")
+            connection.execute("""INSERT INTO notes_fts
+                (rowid, scope, author, path, revision, written_at, world_epoch, content)
+                SELECT rowid, scope, author, path, revision, written_at, world_epoch, content
+                FROM notes_latest""")
 
     @contextmanager
     def _connect(self):
@@ -155,12 +219,178 @@ class MemoryStore:
             connection.execute("INSERT INTO notes VALUES (?,?,?,?,?,?,?,?)",
                                (scope, owner, path, revision, content, timestamp, epoch, encoded_references))
             connection.execute("UPDATE author_usage SET bytes=bytes+?,notes=notes+? WHERE author=?", (charge, int(not current), owner))
+            # Keep the latest-revision projection and its search index in step.
+            replaced = connection.execute(
+                "SELECT rowid FROM notes_latest WHERE scope=? AND author=? AND path=?",
+                (scope, owner, path)).fetchone()
+            if replaced is not None and self.fts_enabled:
+                connection.execute("DELETE FROM notes_fts WHERE rowid=?", (replaced[0],))
+            connection.execute("DELETE FROM notes_latest WHERE scope=? AND author=? AND path=?",
+                               (scope, owner, path))
+            inserted = connection.execute("""INSERT INTO notes_latest
+                (scope, author, path, revision, content, written_at, world_epoch, evidence_refs)
+                VALUES (?,?,?,?,?,?,?,?)""",
+                (scope, owner, path, revision, content, timestamp, epoch, encoded_references))
+            if self.fts_enabled:
+                connection.execute("""INSERT INTO notes_fts
+                    (rowid, scope, author, path, revision, written_at, world_epoch, content)
+                    VALUES (?,?,?,?,?,?,?,?)""",
+                    (inserted.lastrowid, scope, owner, path, revision, timestamp, epoch, content))
         result = {"scope": scope, "author": owner, "path": path, "revision": revision,
                   "content": content, "written_at": timestamp, "world_epoch": epoch,
                   "evidence_refs": references, "provenance": "agent_claim"}
         if self.recorder is not None:
             self.recorder.append("memory_written", result, actor_id=actor_id, source="agent_claim", world_epoch=epoch)
         return result
+
+    @staticmethod
+    def _search_terms(query: str) -> list[str]:
+        """Split a user query into bounded literal FTS terms (never raw syntax)."""
+        terms: list[str] = []
+        for term in re.findall(r"\w+", query.lower(), re.UNICODE):
+            if term not in terms:
+                terms.append(term)
+            if len(terms) >= 16:
+                break
+        return terms
+
+    @staticmethod
+    def _like_snippet(content: str, terms: list[str], width: int = 80) -> str:
+        """Bounded snippet with the earliest matching query term highlighted."""
+        lowered = content.lower()
+        positions = [lowered.find(term) for term in terms]
+        positions = [position for position in positions if position >= 0]
+        if not positions:
+            return content[:width] + ("..." if len(content) > width else "")
+        position = min(positions)
+        start = max(0, position - width // 3)
+        end = min(len(content), start + width)
+        body = content[start:end]
+        for term in sorted(terms, key=len, reverse=True):
+            match = re.search(re.escape(term), body, re.IGNORECASE)
+            if match:
+                body = body[:match.start()] + "[" + body[match.start():match.end()] + "]" + body[match.end():]
+                break
+        return ("..." if start > 0 else "") + body + ("..." if end < len(content) else "")
+
+    def _search_scope(self, actor_id: str, scope: str,
+                      author: str | None) -> tuple[str, list[Any]] | None:
+        """Resolve the caller's accessible scope to a SQL predicate + parameters.
+
+        Private notes are always author-only; team notes are readable across
+        authors only when shared memory is enabled. ``None`` means the request
+        cannot see anything (e.g. team notes while sharing is disabled).
+        """
+        self._identity(actor_id)
+        if scope not in {"all", "private", "team"}:
+            raise ValueError("Memory search scope must be all, private or team")
+        if author is not None:
+            author = self._identity(author)
+        conditions: list[str] = []
+        params: list[Any] = []
+        if scope == "private":
+            owner = self._access(actor_id, "private", author)
+            conditions.append("scope='private' AND author=?")
+            params.append(owner)
+        elif scope == "team":
+            if not self.shared_enabled:
+                raise MemoryPermissionError("Shared memory is disabled in this experiment")
+            if author is None:
+                conditions.append("scope='team'")
+            else:
+                conditions.append("scope='team' AND author=?")
+                params.append(author)
+        elif author is None:
+            conditions.append("scope='private' AND author=?")
+            params.append(actor_id)
+            if self.shared_enabled:
+                conditions.append("scope='team'")
+        elif author == actor_id:
+            conditions.append("scope='private' AND author=?")
+            params.append(actor_id)
+            if self.shared_enabled:
+                conditions.append("scope='team' AND author=?")
+                params.append(author)
+        elif self.shared_enabled:
+            conditions.append("scope='team' AND author=?")
+            params.append(author)
+        else:
+            return None
+        if not conditions:
+            return None
+        return "(" + " OR ".join("(" + condition + ")" for condition in conditions) + ")", params
+
+    def _search_fts(self, terms: list[str], where: str, params: list[Any],
+                    limit: int) -> list[dict[str, Any]]:
+        # Quote every term so FTS5 operators in user text cannot inject syntax.
+        match = " OR ".join('"' + term.replace('"', '""') + '"' for term in terms)
+        query = ("SELECT scope, author, path, revision, written_at, world_epoch, "
+                 "snippet(notes_fts, 6, '[', ']', '...', 24) AS snippet, "
+                 "bm25(notes_fts) AS relevance FROM notes_fts "
+                 "WHERE notes_fts MATCH ? AND " + where +
+                 " ORDER BY relevance ASC, author, path LIMIT ?")
+        with self._connect() as connection:
+            rows = connection.execute(query, [match, *params, limit]).fetchall()
+        return [{"scope": row["scope"], "author": row["author"], "path": row["path"],
+                 "revision": row["revision"], "written_at": row["written_at"],
+                 "world_epoch": row["world_epoch"], "snippet": row["snippet"],
+                 "rank": -float(row["relevance"]), "mode": "fts5"} for row in rows]
+
+    def _search_like(self, terms: list[str], where: str, params: list[Any],
+                     limit: int) -> list[dict[str, Any]]:
+        escaped = [term.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+                   for term in terms]
+        clauses = " OR ".join("(content LIKE ? ESCAPE '\\' OR path LIKE ? ESCAPE '\\')"
+                              for _ in escaped)
+        query = ("SELECT scope, author, path, revision, written_at, world_epoch, content "
+                 "FROM notes_latest WHERE " + where + " AND (" + clauses + ") LIMIT 500")
+        arguments: list[Any] = [*params]
+        for term in escaped:
+            arguments.extend((f"%{term}%", f"%{term}%"))
+        with self._connect() as connection:
+            rows = connection.execute(query, arguments).fetchall()
+        hits = []
+        for row in rows:
+            content = row["content"]
+            lowered = content.lower()
+            score = sum(lowered.count(term) for term in terms)
+            rank = score / (1.0 + len(content) / 1024.0)
+            hits.append({"scope": row["scope"], "author": row["author"],
+                         "path": row["path"], "revision": row["revision"],
+                         "written_at": row["written_at"],
+                         "world_epoch": row["world_epoch"],
+                         "snippet": self._like_snippet(content, terms),
+                         "rank": rank, "mode": "like"})
+        hits.sort(key=lambda item: (-item["rank"], item["author"], item["path"]))
+        return hits[:limit]
+
+    def search(self, actor_id: str, query: str, scope: str = "all",
+               author: str | None = None, limit: int = 20) -> list[dict[str, Any]]:
+        """Ranked full-text search over the latest revision of accessible notes.
+
+        Returns bounded snippets plus note metadata only; the caller's ``actor_id``
+        decides private/team visibility, so the harness (not the model) supplies it.
+        FTS5 is used when available, with a bounded LIKE scan as fallback.
+        """
+        if not isinstance(query, str) or not 1 <= len(query.strip()) <= 1000:
+            raise ValueError("Memory search query must be 1-1000 characters")
+        if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 100:
+            raise ValueError("Memory search limit must be between 1 and 100")
+        terms = self._search_terms(query)
+        if not terms:
+            return []
+        plan = self._search_scope(actor_id, scope, author)
+        if plan is None:
+            return []
+        where, params = plan
+        if self.fts_enabled:
+            try:
+                return self._search_fts(terms, where, params, limit)
+            except sqlite3.DatabaseError:
+                # A malformed index/build must not break the agent: use the
+                # documented bounded fallback for this call.
+                pass
+        return self._search_like(terms, where, params, limit)
 
     def list(self, actor_id: str, scope: str = "private", author: str | None = None,
              offset: int = 0, limit: int = 100) -> list[dict[str, Any]]:

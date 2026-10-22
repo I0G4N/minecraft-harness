@@ -74,6 +74,9 @@ class EvaluationTests(unittest.TestCase):
         self.collector.collect_world(self.world, baseline=True)
         self.save("advancements", {"minecraft:end/kill_dragon": {"done": True}, "minecraft:story/smelt_iron": {"done": True}})
         self.collector.collect_world(self.world)
+        log = self.root / "latest.log"
+        log.write_text("[12:00:00] [Server thread/INFO]: player1 has made the advancement [Free the End]\n")
+        self.collector.collect_log(log)
         self.assertEqual(self.score("kill_dragon")["status"], "succeeded")
         self.assertEqual(self.score("obtain_iron_ingot")["status"], "succeeded")
         self.assertEqual(self.score({"name": "obtain_iron_ingot", "min_count": 2})["status"], "not_succeeded")

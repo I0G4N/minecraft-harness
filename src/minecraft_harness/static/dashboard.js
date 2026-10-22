@@ -48,6 +48,7 @@
   };
   const pageState = () => ({items: [], cursor: null, hasMore: false, loaded: false, busy: false, revision: 0, queuedReset: false, scope: {}, completeness: {}, filters: {}});
   const state = {
+    liveAgent: 'all',
     run: new URLSearchParams(location.search).get('run') || '', runs: [], overview: {}, status: {}, report: null, reportState: 'not_loaded',
     view: 'overview', programTab: 'programs', measurementWindow: 'full_session', generation: 0,
     poll: true, coreBusy: null, resourcesBusy: null, resourceItems: [], resourceCursor: null,
@@ -446,7 +447,17 @@
       do {
         result = await api('/api/report', {format: 'json', offset, limit: 64000});
         if (generation !== state.generation) return;
-        if (result.available === false) { state.reportState = 'unavailable'; renderEvaluation(); return; }
+        if (result.available === false) {
+          // Active runs have no finalized report yet. Build a read-only live
+          // snapshot for the evidence page instead of leaving every metric unknown.
+          const live = await api('/api/live-report', { run: state.run });
+          if (generation !== state.generation) return;
+          if (live && live.available && live.report) {
+            state.report = obj(live.report); state.reportState = 'loaded';
+            renderEvaluation(); renderActors(); renderResources(); return;
+          }
+          state.reportState = 'unavailable'; renderEvaluation(); return;
+        }
         text += result.content || '';
         if (text.length > 512000) { state.reportState = 'too_large'; renderEvaluation(); return; }
         offset = result.next_offset;
@@ -530,7 +541,25 @@
       const report = node('article', null, 'observer-report card'), heading = node('div', null, 'observer-report-head');
       const details = node('button', '查看事件 #' + event.event_seq + ' ↗', 'text-button'); details.addEventListener('click', () => showEvent(event));
       heading.append(node('span', time(event.received_at, true) + ' · 世界 epoch ' + (event.world_epoch ?? '未知')), details); report.append(heading);
-      const findings = arr(event.findings || inner(event).findings);
+      const body = inner(event);
+      const progress = event.progress_summary ?? body.progress_summary;
+      const verified = arr(event.verified_events ?? body.verified_events);
+      const infrastructure = arr(event.infrastructure_findings ?? body.infrastructure_findings);
+      if (progress) { const summary = node('div', null, 'observer-progress'); summary.append(node('strong', '进展摘要'), node('p', progress)); report.append(summary); }
+      if (verified.length) {
+        const block = node('div', null, 'observer-verified'); block.append(node('strong', '已核实事件'));
+        for (const item of verified.slice(0, 30)) {
+          const row = node('div', null, 'finding'); row.append(node('p', item.claim || '未提供事件文本'));
+          const refs = node('div'); arr(item.evidence_refs).slice(0, 20).forEach(ref => refs.append(referenceButton(ref))); row.append(refs); block.append(row);
+        }
+        report.append(block);
+      }
+      if (infrastructure.length) {
+        const block = node('div', null, 'observer-infra'); block.append(node('strong', '基础设施发现'));
+        for (const item of infrastructure) block.append(node('p', String(item)));
+        report.append(block);
+      }
+      const findings = arr(event.findings || body.findings);
       for (const finding of findings) {
         const row = node('div', null, 'finding'); row.append(badge(label(finding.status), tone(finding.status)), node('p', finding.claim || '未提供结论文本'));
         const refs = node('div'); arr(finding.evidence_refs).slice(0, 20).forEach(ref => refs.append(referenceButton(ref))); row.append(refs); report.append(row);
@@ -797,20 +826,44 @@
   function renderLive() {
     const grid = $('live-grid'), note = $('live-note');
     if (!grid) return;
-    grid.replaceChildren();
     const ports = Object.entries(obj(state.status.viewers));
     const host = location.hostname || '127.0.0.1';
     if (!ports.length) {
+      grid.replaceChildren();
       note.hidden = false;
       note.textContent = '当前运行未配置 runtime.viewer_ports，因此没有可播放的第一视角。启用方式：给对应 bot 设置 VIEWER_PORT=<端口>，并在实验配置中写入 runtime.viewer_ports: {player1: <端口>}。';
+      state.liveSignature = '';
       return;
     }
     const tunnels = ports.map(([, port]) => '-L ' + port + ':127.0.0.1:' + port).join(' ');
+    const viewerProxy = new URLSearchParams(location.search).get('viewer_proxy') === '1';
     note.hidden = false;
-    note.textContent = '浏览器会直接连接下列端口；非本机访问时请为工作台和每个 Viewer 端口建立 SSH 隧道（示例）：ssh -N -L 8896:127.0.0.1:8896 ' + tunnels + ' <user>@<server>。画面由 prismarine-viewer 在浏览器中实时渲染 bot 的真实游戏状态，不是视频录像。';
+    note.textContent = viewerProxy
+      ? '第一视角通过同一观测台来源代理加载（/viewer/<player>/），不需要为每个 viewer 单独开放端口。'
+      : '浏览器会直接连接下列端口；非本机访问时请为工作台和每个 Viewer 端口建立 SSH 隧道（示例）：ssh -N -L 8896:127.0.0.1:8896 ' + tunnels + ' <user>@<server>。画面由 prismarine-viewer 在浏览器中实时渲染 bot 的真实游戏状态，不是视频录像。';
+    if (!['all', ...ports.map(([agent]) => agent)].includes(state.liveAgent)) state.liveAgent = 'all';
+    // The 5s core poll must not recreate iframes: rebuilding them reloads the
+    // prismarine-viewer WebGL page and makes the world flash/repaint blue.
+    const liveSignature = state.run + '|' + JSON.stringify(ports) + '|' + state.liveAgent;
+    if (state.liveSignature === liveSignature && grid.children.length) return;
+    state.liveSignature = liveSignature;
+    grid.replaceChildren();
+    const switcher = node('div', null, 'live-switch');
+    const addTab = (value, label) => {
+      const tab = node('button', label, 'button button-secondary' + (state.liveAgent === value ? ' active' : ''));
+      tab.type = 'button'; tab.setAttribute('role', 'tab');
+      tab.setAttribute('aria-selected', String(state.liveAgent === value));
+      tab.addEventListener('click', () => { state.liveAgent = value; renderLive(); });
+      switcher.append(tab);
+    };
+    addTab('all', '全部玩家');
+    for (const [agent] of ports) addTab(agent, agent);
+    grid.append(switcher);
+    const selected = state.liveAgent;
     for (const [agent, port] of ports) {
-      const source = location.protocol + '//' + host + ':' + port + '/';
-      const card = node('div', undefined, 'live-card');
+      if (selected !== 'all' && selected !== agent) continue;
+      const source = viewerProxy ? '/viewer/' + encodeURIComponent(agent) + '/' : location.protocol + '//' + host + ':' + port + '/';
+      const card = node('div', undefined, 'live-card' + (selected !== 'all' ? ' live-card-single' : ''));
       const head = node('div', undefined, 'live-head');
       const title = node('strong', agent);
       const hint = node('span', '端口 ' + port, 'subtle');
@@ -829,6 +882,7 @@
       grid.append(card);
     }
   }
+
 
   // Paper-figure gallery v3: HTML/CSS figures matching the paper's visual language.
   const FIG_TABS = {timeline:'图 3 · 整个运行', progress:'图 1/4 · 十三步', chat:'图 5/6/8/14 · 聊天', dragon:'图 12 · 末地', behavior:'图 13 · 行为与死因'};
@@ -1415,11 +1469,11 @@
       plot.append(yAxis, area);
       right.append(plot, node('p', '需要 kill_dragon 运行中的玩家程序观测记录', 'fig-empty-note'));
       missing.append(left, right);
-      body.append(head, missing, figCaption('图 12 | harness 尚未采集末地水晶/龙血观测通道；页面只显示现有证据，不伪造数据。'));
+      body.append(head, missing, figCaption('图 12 | 服务端快照尚未出现末地水晶实体；龙血来自玩家程序观测，页面只显示现有证据，不伪造数据。'));
       figLegend([]);
       return;
     }
-    const health = arr(dragon.health), crystals = arr(dragon.crystals);
+    const health = arr(dragon.health), crystals = arr(dragon.crystals), serverCrystals = arr(dragon.server_crystals);
     const wrap = node('div', null, 'fig-dragon-live');
     const left = node('div', null, 'fig-dragon-panel');
     left.append(node('h3', 'Ten crystals, destroyed from pillars of dirt'));
@@ -1428,19 +1482,30 @@
     center.append(figItem('ender_dragon', 46));
     wheel.append(center);
     const latestCrystal = crystals.length ? crystals[crystals.length - 1] : null;
-    const remaining = latestCrystal && Number.isFinite(Number(latestCrystal.count)) ? Math.max(0, Math.min(10, Number(latestCrystal.count))) : null;
+    const latestServer = serverCrystals.length ? serverCrystals[serverCrystals.length - 1] : null;
+    const remaining = latestServer && Number.isFinite(Number(latestServer.count))
+      ? Math.max(0, Math.min(10, Number(latestServer.count)))
+      : (latestCrystal && Number.isFinite(Number(latestCrystal.count)) ? Math.max(0, Math.min(10, Number(latestCrystal.count))) : null);
     for (let index = 0; index < 10; index += 1) {
       const angle = (index / 10) * Math.PI * 2 - Math.PI / 2;
       const slot = node('span', null, 'fig-crystal-slot');
       slot.style.left = (50 + Math.cos(angle) * 38) + '%';
       slot.style.top = (50 + Math.sin(angle) * 38) + '%';
       if (remaining != null && index >= remaining) slot.classList.add('destroyed');
-      slot.title = 'End crystal ' + (index + 1) + (remaining != null && index >= remaining ? ' · observed destroyed' : ' · observed present');
+      slot.title = 'End crystal ' + (index + 1) + (remaining != null && index >= remaining ? ' · server-save destroyed' : ' · server-save present') + (latestServer ? ' · server save' : '');
       slot.append(figItem('ten_crystals', 22));
       wheel.append(slot);
     }
     left.append(wheel);
-    left.append(node('p', latestCrystal ? 'Latest player observation: ' + remaining + '/10 crystals at ' + figPlusTime(latestCrystal.t) : 'No crystal count observed yet.', 'fig-empty-note'));
+    const sourceNote = latestServer ? 'Server save: ' + latestServer.count + '/10 End Crystals at ' + figPlusTime(latestServer.t)
+      : (latestCrystal ? 'Player-observed count: ' + latestCrystal.count + '/10 at ' + figPlusTime(latestCrystal.t) : 'No crystal count observed yet.');
+    left.append(node('p', sourceNote, 'fig-empty-note'));
+    if (latestCrystal && latestServer && Number(latestCrystal.count) !== Number(latestServer.count)) {
+      left.append(node('p', 'Player claim disagrees with server save: ' + latestCrystal.count + '/10 at ' + figPlusTime(latestCrystal.t), 'fig-empty-note'));
+    }
+    if (latestServer && latestServer.positions?.length) {
+      left.append(node('p', 'Server save positions: ' + latestServer.positions.map(position => '(' + [position[0], position[1], position[2]].join(', ') + ')').slice(0, 10).join(' · '), 'fig-empty-note'));
+    }
     const right = node('div', null, 'fig-dragon-panel');
     right.append(node('h3', "The dragon's health, as the players' programs read it"));
     const plot = node('div', null, 'fig-health-empty');
@@ -1460,7 +1525,7 @@
     plot.append(yAxis, area);
     right.append(plot, node('p', latestHealth ? 'Latest player observation: ' + latestHealth.hp + ' HP at ' + figPlusTime(latestHealth.t) : '等待玩家程序的龙血观测 JSON 行（dragon_health/crystals）。', 'fig-empty-note'));
     wrap.append(left, right);
-    body.append(head, wrap, figCaption('图 12 | 水晶与龙血来自玩家程序主动记录的 observation 行，是 agent 观测而非服务端真值；absence 不按 0 处理。'), figLegend([]));
+    body.append(head, wrap, figCaption('图 12 | 左图数量由服务端存档的 End Crystal 实体确认；哪个玩家摧毁仍只能来自玩家程序观测。右图龙血是玩家程序读取值（player-observed），不是服务端真值；absence 不按 0 处理。'), figLegend([]));
   }
 
   function renderFigWorld() {
@@ -1474,15 +1539,115 @@
       return;
     }
     const card = node('div', null, 'fig-world-card');
+    const stage = node('div', null, 'fig-world-stage');
     const image = node('img', null, 'fig-world-image');
-    image.src = world.url; image.alt = 'Minecraft 存档出生点与基地地形图';
-    image.loading = 'lazy';
+    const overlay = node('div', null, 'fig-world-avatars');
     const caption = node('p', world.caption || '只读存档地形图', 'fig-caption');
     const method = node('p', world.method || '', 'fig-footnote');
+    const controls = node('div', null, 'fig-world-controls');
+    const focusNote = node('p', '头像来自最新持久化位置快照；点击头像可跳转。位置不是实时位置流。', 'fig-world-hint');
+    let view = { cx: null, cz: null, w: null, d: null, focus: null };
+    function withQuery(url, extra) {
+      const separator = String(url).includes('?') ? '&' : '?';
+      return String(url) + separator + extra;
+    }
+    function viewParams() {
+      const params = { run: state.run, style: 'mesh' };
+      if (view.cx != null) { params.cx = view.cx; params.cz = view.cz; }
+      if (view.w != null) { params.w = view.w; params.d = view.d; }
+      if (view.focus) params.focus = view.focus;
+      return params;
+    }
+    function imageUrl() {
+      if (view.cx == null && view.w == null) return world.url;
+      let url = withQuery(world.url, 'cx=' + view.cx + '&cz=' + view.cz + '&w=' + (view.w || 160) + '&d=' + (view.d || 160));
+      if (view.focus) url += '&focus=' + encodeURIComponent(view.focus);
+      return url;
+    }
+    function drawAvatars(metadata, players, focus) {
+      overlay.replaceChildren();
+      const projection = metadata?.projection, c = projection?.camera;
+      if (!projection || !c) return;
+      const outW = Number(projection.output_size?.[0]) || 1024;
+      const outH = Number(projection.output_size?.[1]) || 640;
+      const eye = Number(projection.eye_height) || 1.62;
+      const project = (x, y, z) => {
+        const rel = [x - c.position[0], y - c.position[1], z - c.position[2]];
+        const depth = rel[0] * c.forward[0] + rel[1] * c.forward[1] + rel[2] * c.forward[2];
+        if (depth <= 0.05) return null;
+        const xc = rel[0] * c.right[0] + rel[1] * c.right[1] + rel[2] * c.right[2];
+        const yc = rel[0] * c.up[0] + rel[1] * c.up[1] + rel[2] * c.up[2];
+        return { x: (c.center_x + c.focal * xc / depth) * (outW / projection.internal_size[0]),
+                 y: (c.center_y - c.focal * yc / depth) * (outH / projection.internal_size[1]), depth };
+      };
+      const colors = [['#8bc34a', '#4f8f2f'], ['#5b9bd5', '#2f5f8f'], ['#d9a441', '#8f5f20'], ['#b56c9c', '#6f365f']];
+      arr(players).forEach((player, index) => {
+        if (focus && player.agent_id !== focus) return;
+        const point = project(Number(player.x), Number(player.y) + eye, Number(player.z));
+        if (!point || point.x < -30 || point.x > outW + 30 || point.y < -30 || point.y > outH + 30) return;
+        const avatar = node('button', null, 'world-avatar');
+        avatar.type = 'button';
+        avatar.style.left = (point.x / outW * 100) + '%';
+        avatar.style.top = (point.y / outH * 100) + '%';
+        avatar.title = player.agent_id + ' · X=' + Math.round(player.x) + ' Y=' + Math.round(player.y) + ' Z=' + Math.round(player.z);
+        const canvas = document.createElement('canvas'); canvas.width = 16; canvas.height = 16;
+        const ctx = canvas.getContext('2d'); if (ctx) {
+          const [hair, shirt] = colors[index % colors.length];
+          ctx.imageSmoothingEnabled = false;
+          ctx.fillStyle = '#2b1d14'; ctx.fillRect(0, 0, 16, 5);
+          ctx.fillStyle = '#d9a27a'; ctx.fillRect(1, 5, 14, 9);
+          ctx.fillStyle = hair; ctx.fillRect(1, 4, 14, 3);
+          ctx.fillStyle = '#263238'; ctx.fillRect(4, 8, 2, 2); ctx.fillRect(10, 8, 2, 2);
+          ctx.fillStyle = '#8a5a44'; ctx.fillRect(7, 11, 2, 1);
+          ctx.fillStyle = shirt; ctx.fillRect(1, 14, 14, 2);
+          ctx.strokeStyle = '#111'; ctx.strokeRect(0.5, 0.5, 15, 15);
+        }
+        avatar.append(canvas, node('span', player.agent_id, 'world-avatar-label'));
+        avatar.addEventListener('click', () => {
+          view = { cx: Math.round(player.x), cz: Math.round(player.z), w: 96, d: 96, focus: player.agent_id };
+          image.src = imageUrl();
+          caption.textContent = '以 ' + player.agent_id + ' 位置 X=' + Math.round(player.x) + ' Z=' + Math.round(player.z) + ' 为中心的 96×96 3D 局部视图。';
+          focusNote.textContent = '位置来源：' + player.source + ' 事件 #' + player.event_seq + '；点击头像跳转，不是实时位置流。';
+        });
+        overlay.append(avatar);
+      });
+    }
+    async function loadMarkers() {
+      try {
+        const [meta, players] = await Promise.all([
+          api('/api/world-meta', viewParams()),
+          api('/api/players', { run: state.run })
+        ]);
+        drawAvatars(meta.metadata || {}, players.players || [], view.focus);
+      } catch (error) { overlay.replaceChildren(); }
+    }
+    function showView(next, text, note) {
+      view = next;
+      image.src = imageUrl();
+      if (text) caption.textContent = text;
+      if (note) focusNote.textContent = note;
+    }
+    image.addEventListener('load', loadMarkers);
     image.addEventListener('error', () => {
-      card.replaceChildren(figEmpty('地形图暂不可用', '世界存档读取失败或当前 run 没有可读存档。'));
+      stage.replaceChildren(figEmpty('地形图暂不可用', '世界存档读取失败或当前 run 没有可读存档。'));
     });
-    card.append(image, caption, method);
+    image.alt = 'Minecraft 存档出生点、基地与玩家位置'; image.loading = 'lazy'; image.src = world.url;
+    stage.append(image, overlay);
+    const all = node('button', '全景 160×160', 'button button-secondary');
+    all.type = 'button';
+    all.addEventListener('click', () => showView({ cx: null, cz: null, w: null, d: null, focus: null }, world.caption || '只读存档地形图', '全景 160×160；头像为最新持久化位置，点击头像跳转。'));
+    controls.append(all);
+    api('/api/players', { run: state.run }).then(result => {
+      for (const player of arr(result.players)) {
+        const button = node('button', player.agent_id + ' · ' + Math.round(player.x) + ',' + Math.round(player.z), 'button button-secondary');
+        button.type = 'button';
+        button.addEventListener('click', () => showView({ cx: Math.round(player.x), cz: Math.round(player.z), w: 96, d: 96, focus: player.agent_id },
+          '以 ' + player.agent_id + ' 位置为中心的 96×96 3D 局部视图。',
+          '位置来源：' + player.source + ' 事件 #' + player.event_seq + '。'));
+        controls.append(button);
+      }
+    }).catch(() => {});
+    card.append(stage, controls, focusNote, caption, method);
     body.append(head, card, figCaption('数据来源：overworld region 存档与 Pixel Perfection 材质；160×160 表面窗口，不是完整世界或三角网格全精度。'));
     figLegend([]);
   }

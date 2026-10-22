@@ -23,6 +23,42 @@ class LongRunConfigurationTests(unittest.TestCase):
         template = Path(__file__).resolve().parents[1] / 'configs/minecraft-longrun.yaml'
         self.assertEqual(load_config(template)['budgets']['wall_time_minutes'], 1440)
 
+    def test_pi_alignment_defaults_and_paper_runner_template(self):
+        config = validate_config({})
+        self.assertEqual(config['model']['max_request_bytes'], 4_000_000)
+        self.assertIsNone(config['budgets']['max_web_calls'])
+        self.assertEqual(config['supervision']['agent_failure_policy'], 'isolate')
+        self.assertEqual(config['supervision']['observer_failure_policy'], 'degrade')
+        self.assertEqual(config['runtime']['runner_rpc_timeout_s'], 120)
+        template = load_config(Path(__file__).resolve().parents[1] /
+                               'configs/minecraft-paper-runner-20261022.yaml')
+        self.assertEqual(template['model']['max_request_bytes'], 4_000_000)
+        self.assertEqual(template['budgets']['max_web_calls'], 2000)
+        self.assertEqual(template['supervision']['agent_failure_policy'], 'isolate')
+        self.assertEqual(template['supervision']['observer_failure_policy'], 'degrade')
+        self.assertEqual(template['runtime']['runner_rpc_timeout_s'], 120)
+        self.assertTrue(template['agents']['paper_single_program'])
+        self.assertTrue(template['agents']['paper_tight_interface'])
+        self.assertTrue(template['agents']['paper_shell_cli'])
+        self.assertTrue(template['agents']['paper_cli_output'])
+
+    def test_pi_alignment_limits_fail_before_start(self):
+        invalid = [
+            {'supervision': {'agent_failure_policy': 'continue'}},
+            {'supervision': {'observer_failure_policy': 'ignore'}},
+            {'budgets': {'max_web_calls': -1}},
+            {'budgets': {'max_web_calls': True}},
+            {'runtime': {'runner_rpc_timeout_s': 0}},
+            # 4000 characters need 3*4000 + 64 KiB bytes; 70000 is below that.
+            {'model': {'kind': 'chat_completions', 'base_url': 'https://example.test',
+                       'model': 'm', 'max_request_bytes': 70000},
+             'agents': {'context_chars': 4000}},
+        ]
+        for configuration in invalid:
+            with self.subTest(configuration=configuration):
+                with self.assertRaises(ValueError):
+                    validate_config(configuration)
+
     def test_invalid_longrun_limits_fail_before_start(self):
         invalid = [
             {'agents': {'context_chars':3999}},

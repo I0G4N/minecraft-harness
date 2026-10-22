@@ -89,7 +89,8 @@ def artifact_page(run_dir, digest, offset=0, limit=32000):
             'size_bytes': size, 'offset_unit': 'utf8_bytes'}
 
 
-def world_image(run_dir: Path, style: str = "mesh") -> tuple[bytes, dict]:
+def world_image(run_dir: Path, style: str = "mesh", *, center=None, width=None, depth=None,
+                focus: str | None = None) -> tuple[bytes, dict]:
     """Render/cache a read-only block map from the run's configured server save."""
     manifest_path = Path(run_dir) / "manifest.json"
     manifest = json.loads(manifest_path.read_text()) if manifest_path.is_file() else {}
@@ -106,10 +107,19 @@ def world_image(run_dir: Path, style: str = "mesh") -> tuple[bytes, dict]:
     if reports.is_symlink():
         raise ValueError("report cache must not be a symlink")
     reports.mkdir(parents=True, exist_ok=True)
-    suffix = "_160" if style == "mesh" else ""
+    base = 160 if style == "mesh" else 64
+    view_w = int(width or base)
+    view_d = int(depth or base)
+    if center is not None:
+        center = (int(center[0]), int(center[1]))
+    if center is None and view_w == base and view_d == base:
+        suffix = "_160" if style == "mesh" else ""
+    else:
+        digest = hashlib.sha256(json.dumps([style, center, view_w, view_d], sort_keys=True).encode()).hexdigest()[:12]
+        suffix = f"_{view_w}x{view_d}_{digest}"
     png, meta_path = reports / f"world_render_{style}{suffix}.png", reports / f"world_render_{style}{suffix}.json"
     with _WORLD_IMAGE_LOCK:
-        lock = _WORLD_IMAGE_LOCKS.setdefault((str(Path(run_dir).resolve()), style), threading.Lock())
+        lock = _WORLD_IMAGE_LOCKS.setdefault((str(Path(run_dir).resolve()), style, suffix), threading.Lock())
     with lock:
         fingerprint = world_fingerprint(path)
         cached = {}
@@ -118,12 +128,65 @@ def world_image(run_dir: Path, style: str = "mesh") -> tuple[bytes, dict]:
                 cached = json.loads(meta_path.read_text())
             except (OSError, ValueError):
                 cached = {}
-        if cached.get("input_fingerprint", {}).get("sha256") != fingerprint.get("sha256") or not png.is_file():
-            metadata = render_world(path, png, style=style, width=160 if style == 'mesh' else 64,
-                                    depth=160 if style == 'mesh' else 64, full_world=False)
+        if (cached.get("input_fingerprint", {}).get("sha256") != fingerprint.get("sha256")
+                or not png.is_file() or (style == "mesh" and not cached.get("projection"))):
+            metadata = render_world(path, png, style=style, center=center, width=view_w,
+                                    depth=view_d, full_world=False)
+            metadata["view"] = {"center": center, "width": view_w, "depth": view_d, "focus": focus}
             meta_path.write_text(json.dumps(metadata, ensure_ascii=False, indent=2))
             return png.read_bytes(), metadata
         return png.read_bytes(), cached
+
+
+def player_positions(run_dir: Path, limit: int = 5000) -> dict:
+    """Latest observable position per configured player, from persisted snapshots."""
+    database = Path(run_dir) / "events.sqlite3"
+    if not database.is_file():
+        return {"players": [], "method": "no ledger"}
+    connection = sqlite3.connect(database.as_uri() + "?mode=ro", uri=True)
+    connection.row_factory = sqlite3.Row
+    latest = {}
+    try:
+        rows = connection.execute(
+            "SELECT event_seq,kind,actor_id,payload_json FROM events WHERE actor_id LIKE 'player%' "
+            "AND kind IN ('runtime_ready','execution_finished','execution_succeeded') "
+            "ORDER BY event_seq DESC LIMIT ?", (limit,)).fetchall()
+    finally:
+        connection.close()
+
+    def find(value):
+        if isinstance(value, dict):
+            pos = value.get("position")
+            if isinstance(pos, dict) and all(isinstance(pos.get(axis), (int, float)) for axis in ("x", "y", "z")):
+                return {"x": pos["x"], "y": pos["y"], "z": pos["z"]}
+            for child in value.values():
+                found = find(child)
+                if found:
+                    return found
+        elif isinstance(value, list):
+            for child in value:
+                found = find(child)
+                if found:
+                    return found
+        return None
+
+    for row in rows:
+        actor = row["actor_id"]
+        if actor in latest:
+            continue
+        payload_text = row["payload_json"]
+        if len(payload_text) > 1_000_000:
+            continue
+        try:
+            payload = json.loads(payload_text)
+        except ValueError:
+            continue
+        position = find(payload)
+        if position:
+            latest[actor] = {"agent_id": actor, "x": position["x"], "y": position["y"],
+                             "z": position["z"], "event_seq": row["event_seq"], "source": row["kind"]}
+    return {"players": [latest[key] for key in sorted(latest)],
+            "method": "latest persisted runtime/execution snapshot; approximate and not a live position stream"}
 
 
 def _asset(name):
@@ -172,7 +235,12 @@ def create_dashboard(run_dir, port, status_reader, control_writer):
                 if len(values) != 1 or len(self.path) > 8192:
                     return False
                 host = urlsplit('http://' + values[0])
-                return (host.hostname in {'127.0.0.1', 'localhost'} and host.port == self.server.server_port
+                # SSH local forwarding changes the browser's Host port (for example
+                # 127.0.0.1:18896 -> 127.0.0.1:8896) while the TCP peer remains
+                # loopback. Accept that port only for a loopback client; keep
+                # rejecting non-local Host names and malformed authorities.
+                loopback_peer = self.client_address[0] in {'127.0.0.1', '::1'}
+                return (host.hostname in {'127.0.0.1', 'localhost'} and loopback_peer
                         and not host.username and not host.password and not host.path and not host.query and not host.fragment)
             except ValueError:
                 return False
@@ -196,6 +264,10 @@ def create_dashboard(run_dir, port, status_reader, control_writer):
             self.send_header('Cache-Control', 'no-store')
             self.send_header('X-Content-Type-Options', 'nosniff')
             self.send_header('X-Frame-Options', 'DENY')
+            # prismarine-viewer uses SharedArrayBuffer; isolate the top-level
+            # dashboard so its same-origin viewer iframe can be crossOriginIsolated.
+            self.send_header('Cross-Origin-Opener-Policy', 'same-origin')
+            self.send_header('Cross-Origin-Embedder-Policy', 'require-corp')
             for header, value in (extra_headers or {}).items():
                 self.send_header(header, value)
             # frame-src allows the optional live viewer iframes: same operator
@@ -280,8 +352,42 @@ def create_dashboard(run_dir, port, status_reader, control_writer):
                     style = value('style', 'mesh')
                     if style not in {'top', 'iso', 'mesh'}:
                         raise ValueError('unsupported world style')
-                    raw, metadata = world_image(run_path, style)
+                    cx, cz = value('cx'), value('cz')
+                    center = (int(cx), int(cz)) if cx is not None and cz is not None else None
+                    view_w = integer('w') if value('w') is not None else None
+                    view_d = integer('d') if value('d') is not None else None
+                    focus = value('focus')
+                    raw, metadata = world_image(run_path, style, center=center, width=view_w,
+                                                depth=view_d, focus=focus if focus and re.fullmatch(r'[A-Za-z0-9_]{1,16}', focus) else None)
                     self.send_bytes(raw, 'image/png')
+                    return
+                if parsed.path == '/api/players':
+                    run_path = catalog.resolve(value('run'))
+                    self.send_json(player_positions(run_path))
+                    return
+                if parsed.path == '/api/world-meta':
+                    run_path = catalog.resolve(value('run'))
+                    style = value('style', 'mesh')
+                    if style not in {'top', 'iso', 'mesh'}:
+                        raise ValueError('unsupported world style')
+                    cx, cz = value('cx'), value('cz')
+                    center = (int(cx), int(cz)) if cx is not None and cz is not None else None
+                    view_w = integer('w') if value('w') is not None else None
+                    view_d = integer('d') if value('d') is not None else None
+                    focus = value('focus')
+                    _raw, metadata = world_image(run_path, style, center=center, width=view_w,
+                                                 depth=view_d, focus=focus if focus and re.fullmatch(r'[A-Za-z0-9_]{1,16}', focus) else None)
+                    self.send_json({'metadata': metadata})
+                    return
+                if parsed.path == '/api/live-report':
+                    run_path = catalog.resolve(value('run'))
+                    from .observer.report import build_report
+                    try:
+                        report = build_report(run_path)
+                    except (OSError, ValueError, sqlite3.Error) as error:
+                        self.send_json({'available': False, 'error': str(error)[:500]}, 200)
+                        return
+                    self.send_json({'available': True, 'report': report}, compress=True)
                     return
                 path = catalog.resolve(value('run'))
                 if parsed.path == '/api/status':

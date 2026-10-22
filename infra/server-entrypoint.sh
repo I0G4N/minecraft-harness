@@ -10,6 +10,17 @@ if [ ! -f /data/server.properties ]; then
         ''|*[!0-9-]*) echo 'MC_SEED must be a signed integer' >&2; exit 64 ;;
     esac
     printf '\nlevel-seed=%s\n' "${MC_SEED:-42}" >> /data/server.properties
+    if [ -n "${MAX_PLAYERS:-}" ]; then
+        case "$MAX_PLAYERS" in
+            ''|*[!0-9]*) echo 'MAX_PLAYERS must be a positive integer' >&2; exit 64 ;;
+        esac
+        [ "$MAX_PLAYERS" -ge 1 ] || { echo 'MAX_PLAYERS must be a positive integer' >&2; exit 64; }
+        if grep -q '^max-players=' /data/server.properties; then
+            sed -i "s/^max-players=.*/max-players=$MAX_PLAYERS/" /data/server.properties
+        else
+            printf 'max-players=%s\n' "$MAX_PLAYERS" >> /data/server.properties
+        fi
+    fi
 fi
 printf 'eula=true\n' > /data/eula.txt
 control=${HARNESS_CONTROL_DIR:-/tmp/harness-control}

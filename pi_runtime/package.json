@@ -1,0 +1,12 @@
+{
+  "name": "minecraft-harness-pi-runtime",
+  "private": true,
+  "type": "module",
+  "description": "Pinned Pi coding-agent runtime used as the agent harness for the Minecraft paper run",
+  "dependencies": {
+    "@earendil-works/pi-coding-agent": "1.4.0"
+  },
+  "engines": {
+    "node": ">=22.19.0"
+  }
+}

@@ -2,10 +2,18 @@
 
 日期：2026-10-21；分支：`harness_embodiment_v1`。论文实验框架已实现，完整单元/集成与隔离短测通过。**原冻结一小时脚本验收为 failed：14/16 运行检查通过，最终导出/报告在仍开启 tracemalloc 时超过夹具的 45 秒等待。**已定位并只修测试仪器，同一冻结框架的完整账本重放和独立收尾补证通过；不将原一小时改写为通过。真实 Vanilla 单 Agent 已通过（见下文），4 Agent paper_aligned、付费模型能力实验和日尺度运行仍未建立通过证据。
 
+## 2026-10-22 paper 可见面 + Pi context/memory + 长程稳定性
+
+- 玩家和 Observer 都使用真实 Pi coding-agent CLI（`runtime.runner_runtime: pi`，RPC 模式）：Pi 负责 loop/session/context/compaction；玩家工具为 built-in read/write/edit/bash + memory/web extension，游戏只经 `mc exec --file`；Observer 使用只读 `records_read/evidence_read/observer_report/infra_issue`，无 bash/mc/team-memory/broker。Python 只保留 Supervisor、ledger、budget、Minecraft gateway 和 python-mode 回退。下一轮 `minecraft-paper-runner-20261022.yaml` 已切 `runner_runtime: pi` + container。`pi_runtime` 依赖 pin 到 1.4.0，首次部署需 `npm ci --prefix pi_runtime`。
+- 内部仍保留 Python runtime 的 Pi 风格 context projection / compaction / branch summary / effect sandwich：工具先写 `tool_intent`（仅参数 SHA256），崩溃后 `tool_effect_unknown` 且不重放；团队记忆 FTS5 ranked `memory_search`。这些只在 `runner_runtime=python` 或 Observer 路径使用。
+- 长程稳定性：单玩家 model/infra 失败按 `agent_failure_policy=isolate` 记录 `agent_degraded` 并继续；Observer 失败默认 `observer_degraded` 降级；pause 不再消耗 wall budget；web 调用受 `budgets.max_web_calls` 限制；runner RPC 有默认超时；Compose 的 identity/launcher/bot 使用 `unless-stopped`；runner 重启加载 `run_dir/source-snapshot` 冻结源码。runner-mode Observer 通过 ledger 重要事件在 ≤1 s 内唤醒 review。
+- 验证：Python **738 passed, 3 skipped, 731 subtests**；Pi/Observer 定向 **182 passed / 116 subtests**（含真实 Pi CLI host e2e、memory/web extension、fixture observer bridge/RPC、session/artifact retention）；Node **51 passed**。**本窗口未重跑容器 Pi smoke**：3 个 Docker-gated 测试仍为 skipped，历史一次性 smoke（先前窗口）不能作为本窗口证据；完整 4-agent compose 长测仍未执行。`run-paper.sh --prepare` 现在会在 compose up 之前检查**两个** Pi extension（`minecraft-tools.js` + `observer-tools.js`），并跑一次无启动容器镜像 probe（Node ≥ 22 / Pi CLI / 两扩展 / Python imports，`docker run --rm --network none`）；Docker 不可用时只报告并拒绝启动。`final11` 保持 paused，未重启或迁移；`run-paper.sh` 默认只 prepare，`--start` 才启动。
+- 详细设计、偏差与验收命令见 [PI_METHOD_ALIGNMENT.md](PI_METHOD_ALIGNMENT.md) 第 9 节。
+
 ## 2026-10-21 真实模型复核与修复（独立运行）
 
 - **独立运行**：`--network none` 下 `configs/offline-smoke.yaml` 通过（`diagnostic_pass`）；框架自带 `pyproject.toml`、`uv.lock`、`node_modules`，不导入 `ai_native_harness`、`ai_native_world`、`sim2real` 或 `skill_engine`，不需要 zkdx 产品运行时、模型密钥或网络。
-- **回归**：Python **350 项通过**（含 leftover 语义、单程序工具集、Observer 完整报告、in-game days、session-loss 恢复回归），Node **51 项通过**。
+- **回归**：Python **347 项通过**（含 leftover 语义、单程序工具集、Observer 完整报告、in-game days、session-loss 恢复回归），Node **51 项通过**。
 - **真实 DeepSeek（deepseek-flash）1 Agent + 1 LLM Observer、fake 游戏**：8 分钟 106 次模型调用（player 81 / observer 25）、**11 条 `observer_report`**、3 次补报失败、成本约 $0.24；期间一次停机取消产生的 unknown usage 按最坏预留计费后继续运行到墙钟上限。强制补报 + 补报重试后的 4 分钟复核：66 次调用（player 45 / observer 21）、**10 条 `observer_report`**、2 次补报失败、成本约 $0.13，报告正常生成。
 - **修复前**：单一玩家 380 秒内触发 **190 次 Observer 调用（占 72% 成本）、0 条报告**（Observer 追自身记账事件，评审间隔失效）。修复后 Observer 评审间隔为硬下限，8 分钟 25 次调用、11 条报告。
 - **收尾竞态修复**：paper_aligned 下 Observer 在停止/成功收尾时自然退出，此前会被判为 unexpected 并让整次运行以 `infra_failed` 结束；修复后 `paper_lifecycle_soak` 连续 25 次通过，全量套件连续 3 次通过。
@@ -110,3 +118,26 @@
 - 普通恢复保留最早基线；真正 rollback 按 checkpoint 的 run 身份、source epoch 和证据 cutoff 截断分支。旧配置补默认值会留迁移事件，绝对期限不补回停机时间。
 - 无法确认旧 worker 停止时安全终止；`shutdown_timeout_s` 只限定等待 Agent 取消，服务端保存和世界复制安全结束另计。
 - Minecraft EULA 尚未明确接受；准备目录、下载或构建镜像不等于接受。真实 Vanilla 短任务、付费模型实际用量、完整通关和小时/日尺度真实运行均需独立验收。
+
+## 2026-10-23 目标收口
+
+- `/proc` 凭据：runner 进程 `PR_SET_DUMPABLE=0`，container runner 去掉 `--init` 使 hardened runner 为 PID 1；同 uid 读取 `/proc/1/environ` 已实测拒绝。
+- Pi session/artifact retention：session 启动剪枝/活跃超限轮转，artifact 共享预算超限转 metadata-only；paper run 配置 1 GB/8 GB。
+- Observer：`runner_runtime=pi` 时改用 `pi_observer_runner.py` + observer 只读 tool bridge/ServiceHub RPC，Python ObserverAgent 仅作回退。
+- 安全审计 F1–F6 已修（PID1 env、artifact grant 所有权、viewed-event 证据、report key 注入、bridge 错误泄漏、infra issue id/kinds）。
+- 验证：738 passed / 3 skipped / 731 subtests；Pi/Observer 定向 182 passed / 116 subtests。容器 Pi smoke 仅为**先前窗口**的一次性证据；本窗口未执行（3 个 Docker-gated 测试 skipped，也未启动 Docker），完整 compose 长测仍未执行。`run-paper.sh --prepare` 新增无启动镜像 probe：要求两个 Pi extension，检查 Node ≥ 22 / Pi CLI / Python imports，Docker 不可用或 probe 失败即拒绝 `--start`。
+
+### 已知残余与未验证（2026-10-23，accepted / 后续 task）
+
+- **Pi 子进程凭据残余（P2-3/P2-6，accepted）**：`/proc/<runner>/environ` 已不再暴露 model key / RPC token（`PR_SET_DUMPABLE=0`，container runner 无 `--init`）；但 Pi 子进程 env 仍含 bridge token（只授权 memory/web/observer 工具）和 player `MC_AGENT_TOKEN`（游戏/CLI 必需）。model 可用自身 bash 读取该 env 并直接调用 loopback bridge，从而绕过 Pi 的 `tool_intent/tool_result` 投影（ServiceHub 仍记录 memory/reference 事件）。该偏差已记录并接受，**不得据此宣称完整工具事件审计**。
+- **active session 停止不自动轮转（P2-4，accepted residual）**：达到 `storage.pi_session_max_bytes` 的活跃 session 会 clean abort 并记录事件，但**不会在进程内自动归档/重启**，也**没有操作者告警阈值**；player 映射为 `infra_failed`/`agent_degraded`，Observer 为 `observer_degraded`，run 继续但已失去该 agent。54h run 需人工监控，自动轮转/告警为后续改进。
+- **run-wide retention（P1-5 已修）**：artifact 会计由 ServiceHub `<run_dir>/pi-budget.sqlite3` 集中控制（per-agent + global cap、原子 take、RPC fail-closed）；model-writable `/state/pi-artifact-budget.json` 伪造/删除不能重置 usage。Session retention 仍为 filesystem-based。
+- **容器 Pi smoke 本窗口未验证（P2-5）**：只有历史一次性 smoke；本窗口 3 个 Docker-gated 测试 skipped。付费长 run 前必须用专用 Docker 窗口跑真实 container Pi/Compose 短 smoke 并记录实际 image ID。
+
+## 2026-10-23 P1 审计收口
+
+- P1-1：Pi runtime 全树哈希（bundle/node_modules/两个 extension）fail closed。
+- P1-2：mid-stream SSE 不再二次 HTTP 响应/终止符，只有 model_error + 一次 UNKNOWN settle。
+- P1-3：paper pi+container 默认 `runner_egress=model_only`：runner `--network none`，host UDS PiModelForwarder 只转发 `/v1/chat/completions`，provider key 不进入 runner env。
+- P1-4：ArtifactBudget 持久化（含 metadata）、玩家/Observer 关闭 retention、90% pressure、paper 5-agent 40GB < 51.5GB 上限。
+- P2：wrapper 双 extension + no-start image probe；docs 当前 738 passed / 3 skipped / 731 subtests；bridge/MC token、active-session 无自动轮转、完整 Docker 全栈 smoke 仍是 residual。

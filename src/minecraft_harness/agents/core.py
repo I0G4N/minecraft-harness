@@ -14,6 +14,7 @@ from contextlib import closing
 from pathlib import Path
 from typing import Any
 
+from .context import ContextEngine
 from .tools import WorkspaceTools, tool_schemas, _tool
 from .web import WebTools
 from ..budget import BudgetExhausted
@@ -30,27 +31,60 @@ class AgentCore:
     """
 
     def __init__(self, config: dict[str, Any], run_dir: Path, recorder: Any,
-                 model: Any, budget: Any, *, role: str = "player"):
+                 model: Any, budget: Any, *, role: str = "player",
+                 state_root: Path | None = None, workspace: Any = None,
+                 artifact_api: Any = None):
         self.config, self.recorder = config, recorder
         self.model, self.budget, self.role = model, budget, role
         self.run_dir = Path(run_dir)
         self.agent_id = config["agent_id"]
         if not re.fullmatch(r"[A-Za-z0-9_.-]+", self.agent_id) or self.agent_id in {".", ".."}:
             raise ValueError("Invalid agent_id")
-        self.state_dir = Path(run_dir) / "agents" / self.agent_id
+        # The runner process owns only this agent's state directory; in-process
+        # runs keep the historical layout. Artifacts and the ledger stay in the
+        # control plane when an artifact API is supplied.
+        self.state_dir = Path(state_root) if state_root is not None else Path(run_dir) / "agents" / self.agent_id
         self.state_dir.mkdir(parents=True, exist_ok=True)
         self.checkpoint_path = self.state_dir / "checkpoint.json"
-        self.workspace = WorkspaceTools(Path(run_dir) / "workspaces" / self.agent_id,
-                                        config.get("shell_enabled", False), config.get("shell_container"),
-                                        config.get("max_workspace_bytes", 64_000_000),
-                                        config.get("max_workspace_files", 4096),
-                                        shell_env=config.get("shell_env"))
-        if role == "observer" and self.workspace.shell_env:
+        self.artifact_api = artifact_api
+        # Deterministic Pi-style context projection (files/WIP summary/journal).
+        self.context = ContextEngine(self.state_dir, agent_id=self.agent_id,
+                                     goal=config.get("goal", ""))
+        if workspace is not None:
+            self.workspace = workspace
+        else:
+            self.workspace = WorkspaceTools(Path(run_dir) / "workspaces" / self.agent_id,
+                                            config.get("shell_enabled", False), config.get("shell_container"),
+                                            config.get("max_workspace_bytes", 64_000_000),
+                                            config.get("max_workspace_files", 4096),
+                                            shell_env=config.get("shell_env"),
+                                            max_shell_output_bytes=config.get("max_shell_output_bytes", 65536),
+                                            max_shell_timeout_s=config.get("max_shell_timeout_s", 120),
+                                            default_shell_timeout_s=config.get("default_shell_timeout_s", 120))
+        shell_env = getattr(self.workspace, "shell_env", None) or {}
+        if role == "observer" and shell_env:
             raise ValueError("Observer must not receive player submission credentials")
-        if self.workspace.shell_env and self.workspace.shell_env.get("MC_AGENT_ID") != self.agent_id:
+        if shell_env and shell_env.get("MC_AGENT_ID") != self.agent_id:
             raise ValueError("Workspace submission identity does not match this agent")
+        self.paper_profile = config.get("profile") == "paper_aligned"
         self.paper_single_program = bool(config.get("paper_single_program", False))
         self.paper_tight_interface = bool(config.get("paper_tight_interface", False))
+        self.paper_shell_cli = bool(config.get("paper_shell_cli", False))
+        self.paper_cli_output = bool(config.get("paper_cli_output", False))
+        if self.paper_profile and self.workspace.shell_enabled:
+            # Paper §2.1: the player is one generic coding agent whose game
+            # interface is the single-program CLI inside its shell. Force the
+            # whole paper surface from the profile itself so a legacy template
+            # that forgot one flag can never fall back to direct mc_* tools or
+            # the harness's structured execution record.
+            self.paper_single_program = True
+            self.paper_tight_interface = True
+            self.paper_shell_cli = True
+            self.paper_cli_output = True
+        elif self.paper_profile and (self.paper_single_program or self.paper_shell_cli):
+            # Legacy/synthetic single-program fixtures may not have a shell but
+            # still print the paper CLI text form (logs + returned value).
+            self.paper_cli_output = True
         self.leftover_policy = str(config.get("leftover_policy", "reset"))
         self.schemas = tool_schemas(
             self.workspace.shell_enabled,
@@ -59,11 +93,14 @@ class AgentCore:
             paper_single_program=self.paper_single_program,
             leftover_policy=self.leftover_policy,
             paper_tight_interface=self.paper_tight_interface,
+            paper_shell_cli=self.paper_shell_cli,
+            paper_profile=self.paper_profile,
         )
         self.pending_jobs: dict[str, dict[str, Any]] = {}
         self.handoff: dict[str, Any] = {}
         self._compaction_prepared = False
-        self.web = WebTools(config.get("web", {}))
+        self.web = WebTools(config.get("web", {}), budget=self.budget,
+                            agent_id=self.agent_id)
         self.turns = 0
         self.no_progress_turns = 0
         self.event_cursor = 0
@@ -77,10 +114,13 @@ class AgentCore:
         self.deferred_events: list[dict[str, Any]] = []
         self.model_failures = 0
         self._resume()
-        self.artifact_index = self.state_dir / "artifact-access.sqlite3"
-        with closing(sqlite3.connect(self.artifact_index)) as connection:
-            connection.execute("CREATE TABLE IF NOT EXISTS owned_artifacts(hash TEXT PRIMARY KEY)")
-            connection.commit()
+        if artifact_api is not None:
+            self.artifact_index = None
+        else:
+            self.artifact_index = self.state_dir / "artifact-access.sqlite3"
+            with closing(sqlite3.connect(self.artifact_index)) as connection:
+                connection.execute("CREATE TABLE IF NOT EXISTS owned_artifacts(hash TEXT PRIMARY KEY)")
+                connection.commit()
 
 
     def _append(self, kind: str, payload: dict[str, Any], **kwargs: Any) -> dict[str, Any]:
@@ -99,7 +139,8 @@ class AgentCore:
                  "pending_executions": self.pending_executions, "event_cursor": self.event_cursor,
                  "archives": self.archives, "world_epoch": self.world_epoch,
                  "runtime_epoch": self.runtime_epoch, "progress_fingerprints": self.progress_fingerprints,
-                 "deferred_events": self.deferred_events, "model_failures": self.model_failures}
+                 "deferred_events": self.deferred_events, "model_failures": self.model_failures,
+                 "context": self.context.state()}
         temporary = self.checkpoint_path.with_suffix(".tmp")
         with temporary.open("w", encoding="utf-8") as handle:
             json.dump(state, handle, ensure_ascii=False)
@@ -124,6 +165,7 @@ class AgentCore:
         for name in ("world_epoch", "runtime_epoch"):
             if type(getattr(self, name)) is not int or getattr(self, name) < 0:
                 setattr(self, name, 0)
+        self.context.load_state(saved.get("context"))
 
     async def _stopped(self) -> bool:
         result = self.budget.stop_requested()
@@ -143,7 +185,75 @@ class AgentCore:
             await asyncio.sleep(part)
             delay -= part
 
+    def _paper_program_text(self, result: dict[str, Any]) -> str:
+        """Render a program result as the paper CLI would: logs then returned value."""
+        lines = []
+        logs = result.get("logs")
+        if isinstance(logs, list):
+            for entry in logs:
+                if isinstance(entry, dict):
+                    message = entry.get("message")
+                else:
+                    message = entry
+                if message is not None:
+                    lines.append(str(message))
+        returned = result.get("result")
+        if returned is not None:
+            if isinstance(returned, str):
+                lines.append('Returned: ' + returned)
+            else:
+                lines.append('Returned: ' + json.dumps(returned, ensure_ascii=False, default=str))
+        error = result.get("error")
+        if isinstance(error, dict):
+            lines.append('Error: ' + str(error.get("message", error)))
+        elif error:
+            lines.append('Error: ' + str(error))
+        status = result.get("status")
+        if status and status not in {"succeeded", "done"}:
+            lines.append('Status: ' + str(status))
+        cleanup = result.get("cleanup")
+        if result.get("output_truncated") or (isinstance(cleanup, dict) and cleanup.get("logs_truncated")):
+            lines.append('[program output was truncated by the runtime; full output is incomplete]')
+        return "\n".join(lines) if lines else "(program produced no output)"
+
+    def _paper_text_limit(self) -> int:
+        """Paper CLI output is bounded by the model context, not a tool-result cap.
+
+        A small reserve keeps the system prompt and the tool bundle representable
+        after this message is appended; the paper itself has no disclosed output
+        limit, so this is the unavoidable model-context bound rather than the
+        smaller ``max_tool_result_chars`` display cap.
+        """
+        context = max(4000, int(self.config.get("context_chars", 60000)))
+        system = len(json.dumps(self.messages[:1], ensure_ascii=False)) + 2000
+        return max(1000, context - system)
+
     def _tool_result(self, call: dict[str, Any], result: dict[str, Any]) -> None:
+        if self.paper_shell_cli and call["function"]["name"] == "shell" and isinstance(result, dict):
+            text = str(result.get("output", ""))
+            reference = self._artifact({"output": text, "exit_code": result.get("exit_code"),
+                                        "truncated": result.get("truncated", False)})
+            truncated = len(text) > self._paper_text_limit()
+            self._append("tool_result", {"tool_call_id": call["id"], "tool": "shell",
+                                         "result_ref": reference, "format": "paper_cli_text",
+                                         "truncated": truncated})
+            if truncated:
+                text = text[:self._paper_text_limit()] + (
+                    "\n[output exceeded the model context budget; full text retained as evidence]")
+            self.messages.append({"role": "tool", "tool_call_id": call["id"], "content": text})
+            return
+        if isinstance(result, dict) and "__paper_cli_text__" in result:
+            text = str(result["__paper_cli_text__"])
+            reference = self._artifact({"output": text})
+            truncated = len(text) > self._paper_text_limit()
+            self._append("tool_result", {"tool_call_id": call["id"], "tool": call["function"]["name"],
+                                         "result_ref": reference, "format": "paper_cli_text",
+                                         "truncated": truncated})
+            if truncated:
+                text = text[:self._paper_text_limit()] + (
+                    "\n[output exceeded the model context budget; full text retained as evidence]")
+            self.messages.append({"role": "tool", "tool_call_id": call["id"], "content": text})
+            return
         reference = self._artifact(result)
         self._append("tool_result", {"tool_call_id": call["id"], "tool": call["function"]["name"], "result_ref": reference})
         encoded = json.dumps(result, ensure_ascii=False, default=str)
@@ -205,32 +315,35 @@ class AgentCore:
             self.archives.append(archive)
         self.archives = self.archives[-64:]
         intentions = [message.get("content") or "" for message in old if message["role"] == "assistant"][-3:]
+        handoff = self.handoff or self._fallback_handoff()
+        # Pi-style projection: the deterministic summary carries objective, WIP,
+        # next steps, decisions, verified/failed work, file effects, blockers and
+        # pending handles so a compaction is a software-work hand-off rather than
+        # a harness bookkeeping dump.
+        projection = self.context.build_summary(
+            handoff=handoff, goal=self.config.get("goal", ""),
+            pending_executions=self.pending_executions,
+            pending_jobs=self.pending_jobs,
+            world_epoch=self.world_epoch, runtime_epoch=self.runtime_epoch)
         summary = {
-            "notice": "Older raw conversation archived. This deterministic checkpoint is not a fresh observation.",
-            "world_epoch": self.world_epoch,
-            "runtime_epoch": self.runtime_epoch, "event_cursor": self.event_cursor,
+            **projection,
+            "notice": ("Older messages were archived from the active conversation. "
+                       "This deterministic checkpoint is not a fresh observation."),
+            "event_cursor": self.event_cursor,
             "recent_agent_intentions_unverified": [str(item)[-150:] for item in intentions],
-            "handoff_ref": self._artifact(self.handoff or self._fallback_handoff()),
-            "handoff": self.handoff or self._fallback_handoff(),
+            "handoff_ref": self._artifact(handoff),
+            "handoff": handoff,
             "pending_job_count": len(self.pending_jobs),
-            "pending_jobs": list(self.pending_jobs)[:8],
             "pending_execution_count": len(self.pending_executions),
-            "pending_executions": dict(list(self.pending_executions.items())[:2]),
-            "next_step": ("Read notes/source and verify game state before continuing." if self.paper_tight_interface
-                          else "Read notes/source/history and mc_pending for unresolved execution handles; verify game state before continuing."),
+            "next_step": ("Read notes/source and verify game state before continuing."
+                          if self.paper_tight_interface else
+                          "Read notes/source/history and mc_pending for unresolved execution handles; verify game state before continuing."),
         }
         if not self.paper_tight_interface:
             summary["archive"] = archive
             summary["access"] = "history_read"
+        summary = self._fit_compaction_summary(summary, limit)
         messages = [self.messages[0], {"role": "user", "content": json.dumps(summary, ensure_ascii=False)}]
-        if len(json.dumps(messages, ensure_ascii=False)) > limit:
-            summary = {key: summary[key] for key in ("world_epoch", "runtime_epoch", "event_cursor", "pending_execution_count", "pending_job_count", "handoff_ref")}
-            if not self.paper_tight_interface:
-                summary.update({"archive": archive, "access": "history_read"})
-                summary["notice"] = "Old context archived; verify state. Use mc_pending for unresolved handles, history_read for original results. Never replay uncertain actions."
-            else:
-                summary["notice"] = "Old context archived; verify state from the handoff and fresh observations. Never replay uncertain actions."
-            messages = [self.messages[0], {"role": "user", "content": json.dumps(summary, ensure_ascii=False)}]
         if len(json.dumps(messages, ensure_ascii=False)) > limit:
             raise ValueError("Conversation limit cannot hold the system prompt and recovery state")
         # Keep a recent suffix only when the entire assistant/tool bundle fits.
@@ -238,28 +351,134 @@ class AgentCore:
         # archive + fsync on almost every subsequent request in a long run.
         target = max(len(json.dumps(messages, ensure_ascii=False)), int(limit * .6))
         starts = [index for index, message in enumerate(self.messages) if index > 0 and message["role"] == "assistant"]
+        retained_start = len(old)
         for cut in starts:
             candidate = messages + self.messages[cut:]
             if len(json.dumps(candidate, ensure_ascii=False)) <= target:
                 messages = candidate
+                retained_start = cut - 1  # archived messages start at messages[1]
                 break
         self.messages = messages
         self._compaction_prepared = False
-        self._append("context_compacted", {"archive": archive, "original_ref": self._artifact(old), "summary": summary})
+        retained_range = [max(0, retained_start), len(old)]
+        self._append("context_compacted", {"archive": archive, "original_ref": self._artifact(old),
+                                           "summary": summary, "retained_range": retained_range})
+        self.context.record_compaction(archive, summary, retained_range)
         self._checkpoint()
+
+    _COMPACTION_LIST_FIELDS = ("work_in_progress", "next_steps", "decisions",
+                               "verified_facts", "failed_attempts", "files_read",
+                               "files_modified", "blockers")
+
+    def _fit_compaction_summary(self, summary: dict[str, Any], limit: int) -> dict[str, Any]:
+        """Bound the compaction summary so the next request always fits.
+
+        Recovery-critical fields (epochs, pending handles, handoff reference) are
+        kept even in the smallest projection; descriptive lists are trimmed
+        first. The full handoff is always durably available through handoff_ref.
+        """
+        system = self.messages[0]
+
+        def encoded_size(value: dict[str, Any]) -> int:
+            # Measure the real request message: the summary is JSON text nested
+            # inside the message, so quote escaping must be counted too.
+            message = {"role": "user", "content": json.dumps(value, ensure_ascii=False)}
+            return len(json.dumps([system, message], ensure_ascii=False))
+
+        def fits(value: dict[str, Any]) -> bool:
+            return encoded_size(value) <= limit
+
+        candidate = dict(summary)
+        if not fits(candidate):
+            candidate.pop("handoff", None)
+            candidate["handoff_omitted"] = "Full handoff is retained through handoff_ref."
+        if not fits(candidate):
+            original = candidate.get("recent_agent_intentions_unverified")
+            if isinstance(original, list):
+                candidate["recent_agent_intentions_unverified"] = [item[:100] for item in original[:2]]
+        for max_items in (8, 4, 2, 1):
+            if fits(candidate):
+                return candidate
+            for field in self._COMPACTION_LIST_FIELDS:
+                value = candidate.get(field)
+                if isinstance(value, list) and len(value) > max_items:
+                    candidate[field] = [str(item)[:200] for item in value[:max_items]]
+        if fits(candidate):
+            return candidate
+        # Last resort: the scalars and pending handles needed for safe recovery.
+        minimal = {key: candidate[key] for key in (
+            "objective", "world_epoch", "runtime_epoch", "event_cursor",
+            "pending_execution_count", "pending_job_count", "handoff_ref",
+            "notice", "next_step", "archive", "access", "handoff_omitted") if key in candidate}
+        pending_executions = candidate.get("pending_executions")
+        if isinstance(pending_executions, dict):
+            minimal["pending_executions"] = dict(list(pending_executions.items())[:2])
+        pending_jobs = candidate.get("pending_jobs")
+        if isinstance(pending_jobs, list):
+            minimal["pending_jobs"] = [str(item)[:100] for item in pending_jobs[:2]]
+        if fits(minimal):
+            return minimal
+        # The system prompt and a few recovery scalars must always be the floor.
+        smallest = {key: candidate[key] for key in (
+            "world_epoch", "runtime_epoch", "event_cursor",
+            "pending_execution_count", "pending_job_count") if key in candidate}
+        if isinstance(pending_executions, dict):
+            smallest["pending_executions"] = dict(list(pending_executions.items())[:2])
+        if isinstance(pending_jobs, list):
+            smallest["pending_jobs"] = [str(item)[:100] for item in pending_jobs[:2]]
+        return smallest
+
+    def _recovery_branch_message(self, reason: str, *,
+                                 previous_epoch: tuple[int, int] | None = None,
+                                 details: Any = None) -> dict[str, Any]:
+        """One structured branch/recovery summary emitted when a run resumes."""
+        handoff = self.handoff if isinstance(self.handoff, dict) else {}
+        message = self.context.recovery_message(
+            reason,
+            previous_epoch=previous_epoch,
+            world_epoch=self.world_epoch,
+            runtime_epoch=self.runtime_epoch,
+            pending_executions=self.pending_executions,
+            pending_jobs=self.pending_jobs,
+            next_steps=handoff.get("next_steps") or handoff.get("plans"),
+            globals_may_be_lost=True,
+            details=details,
+        )
+        self.context.record_recovery(reason, message.get("details", details))
+        self._append("context_branch_summary", {
+            "reason": message["reason"],
+            "epoch_changed": message["epoch_changed"],
+            "previous_epoch": message.get("previous_epoch"),
+            "world_epoch": self.world_epoch,
+            "runtime_epoch": self.runtime_epoch,
+            "pending_execution_count": len(self.pending_executions),
+            "pending_job_count": len(self.pending_jobs),
+        })
+        return message
 
     def _grant_artifact(self, reference: Any) -> None:
         digest = reference.get("hash", reference.get("sha256")) if isinstance(reference, dict) else None
         if isinstance(digest, str) and re.fullmatch(r"[a-f0-9]{64}", digest):
+            if self.artifact_api is not None:
+                self.artifact_api.grant(self.agent_id, digest)
+                return
             with closing(sqlite3.connect(self.artifact_index)) as connection:
                 connection.execute("INSERT OR IGNORE INTO owned_artifacts VALUES(?)", (digest,))
                 connection.commit()
+
+    def _artifact_owned(self, digest: str) -> bool:
+        if self.artifact_api is not None:
+            return bool(self.artifact_api.owned(self.agent_id, digest))
+        with closing(sqlite3.connect(self.artifact_index)) as connection:
+            return connection.execute("SELECT 1 FROM owned_artifacts WHERE hash=?", (digest,)).fetchone() is not None
 
     def _artifact_read(self, hash: str, offset: int = 0, limit: int = 12000) -> dict[str, Any]:
         if not isinstance(hash, str) or not re.fullmatch(r"[a-f0-9]{64}", hash):
             raise ValueError("Artifact hash must be SHA256")
         if type(offset) is not int or offset < 0 or type(limit) is not int or not 1 <= limit <= 32000:
             raise ValueError("Artifact offset must be nonnegative and limit between 1 and 32000")
+        if self.artifact_api is not None:
+            return self.artifact_api.read(self.agent_id, hash, offset, limit)
         with closing(sqlite3.connect(self.artifact_index)) as connection:
             allowed = connection.execute("SELECT 1 FROM owned_artifacts WHERE hash=?", (hash,)).fetchone()
         if not allowed and hasattr(self.recorder, "db") and hasattr(self.recorder, "lock"):
@@ -366,6 +585,14 @@ class AgentCore:
                 "pending_executions": dict(self.pending_executions), "pending_jobs": self.pending_jobs,
                 "previous_handoff_ref": self._artifact(self.handoff) if self.handoff else None,
                 "facts_require_reobservation": True,
+                # Deterministic Pi-style projection fields (kept alongside the
+                # historical handoff keys for compatibility).
+                "work_in_progress": [],
+                "next_steps": [],
+                "decisions": list(self.context.decisions[-8:]),
+                "files_read": list(self.context.files_read[-12:]),
+                "files_modified": list(self.context.files_modified[-12:]),
+                "blockers": [],
                 "warning": "Handoff is incomplete. Read original history, notes and source; do not replay unknown actions."}
 
     async def _prepare_compaction(self) -> None:
@@ -383,13 +610,25 @@ class AgentCore:
         self.handoff = fallback
         fields = {name: {"type": "array", "items": {"type": "string"}, "maxItems": 20}
                   for name in ("plans", "verified_facts", "failed_attempts", "source_paths", "unresolved_tasks")}
-        handoff_schema = _tool("context_handoff", "Write the durable context handoff. Facts must include time, epoch and evidence references; mark stale facts.",
-                               {"objective": {"type": "string"}, **fields}, ["objective", *fields])
+        # Pi-style projection fields extend (but do not replace) the historical
+        # handoff schema, so old checkpoints and fixtures stay compatible.
+        projection_fields = {
+            name: {"type": "array", "items": {"type": "string"}, "maxItems": 20}
+            for name in ("work_in_progress", "next_steps", "decisions",
+                         "files_read", "files_modified", "blockers")}
+        handoff_schema = _tool(
+            "context_handoff",
+            "Write the durable context handoff. Facts must include time, epoch and evidence references; mark stale facts.",
+            {"objective": {"type": "string"}, **fields, **projection_fields},
+            ["objective", *fields])
         allowed_names = {"workspace_write", "memory_write"} if self.role == "player" else {"workspace_write"}
         allowed = [item for item in self.schemas if item["function"]["name"] in allowed_names]
-        request = [{"role": "system", "content": "Prepare a context handoff. You may update your own working notes before calling context_handoff. "
-                    "Preserve plans, evidence timestamps, failures, source references and uncertain execution handles. "
-                    "Do not invent game facts or execute game actions. Call context_handoff in this or the next response."},
+        request = [{"role": "system", "content": (
+                        "Prepare a context handoff for a long software-work session. First update your own notes or "
+                        "memory with the work in progress and the exact next steps you will take; those notes survive "
+                        "compaction. Then call context_handoff with the objective, plans, verified and failed work, "
+                        "source references, blockers, files read or modified, and uncertain execution handles. "
+                        "Do not invent game facts or execute game actions. Call context_handoff in this or the next response.")},
                    {"role": "user", "content": json.dumps({"recovery": fallback,
                      "recent_messages": [{**item, "content": str(item.get("content") or "")[-600:]}
                                          for item in self.messages[-6:]]}, ensure_ascii=False)}]
@@ -409,11 +648,16 @@ class AgentCore:
             request[-1]["content"] = json.dumps(payload, ensure_ascii=False)
         recovery = {"objective": self.config.get("goal", ""), "agent_id": self.agent_id,
                     "world_epoch": self.world_epoch, "runtime_epoch": self.runtime_epoch,
-                    "pending_executions": dict(self.pending_executions), "pending_job_ids": list(self.pending_jobs)}
+                    "pending_executions": dict(self.pending_executions), "pending_job_ids": list(self.pending_jobs),
+                    "files_read": list(self.context.files_read[-8:]),
+                    "files_modified": list(self.context.files_modified[-8:]),
+                    "work_in_progress": fallback.get("work_in_progress", []),
+                    "next_steps": fallback.get("next_steps", [])}
         full_context_request = [request[0], *self.messages[1:], {"role": "user", "content":
             "Prepare the durable context handoff now. Authoritative recovery metadata (facts still require verification): "
             + json.dumps(recovery, ensure_ascii=False) +
-            ". Include evidence times/epochs and source paths. You may update your own notes first."}]
+            ". Record what you are working on, your next steps, and any files you read or changed. "
+            "You may update your own notes first."}]
         if len(json.dumps(full_context_request, ensure_ascii=False)) <= limit - 1800:
             request = full_context_request
         base_request = list(request)
@@ -434,13 +678,25 @@ class AgentCore:
                                     not isinstance(args.get(key), list) or len(args[key]) > 20 or
                                     any(not isinstance(value, str) or len(value) > 2000 for value in args[key]) for key in fields)):
                                 raise ValueError("Incomplete handoff fields")
+                            projected = {}
+                            for optional in projection_fields:
+                                if optional not in args:
+                                    continue
+                                values = args[optional]
+                                if (not isinstance(values, list) or len(values) > 20 or
+                                        any(not isinstance(value, str) or len(value) > 2000
+                                            for value in values)):
+                                    raise ValueError(f"Invalid handoff field: {optional}")
+                                projected[optional] = values
                             valid = {"schema_version": 1, "complete": True, "source": "agent_handoff",
                                      **{key: args[key] for key in ("objective", *fields)},
+                                     **projected,
                                      "world_epoch": self.world_epoch, "runtime_epoch": self.runtime_epoch,
                                      "pending_executions": dict(self.pending_executions), "pending_jobs": self.pending_jobs}
                             result = {"status": "saved"}
                         elif name in allowed_names:
                             result = await self._dispatch(name, args, "handoff:" + call["id"])
+                            self.context.track_tool(name, args, result)
                             receipt = {"tool": name, "path": str(args.get("path", ""))[:200],
                                        "scope": str(args.get("scope", ""))[:20],
                                        "result_ref": self._artifact(result)}

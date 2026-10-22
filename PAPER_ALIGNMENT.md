@@ -23,7 +23,7 @@
 
 | 论文位置 | 对应要求与解释 | 本项目处理 |
 | --- | --- | --- |
-| §1，p2 | 对等团队长期编程协作 | 不设中央游戏规划器；人数仍支持 1/2/4，paper 配置为四人 |
+| §1，p2 | 对等团队长期编程协作 | 不设中央游戏规划器；`agents.count` 支持 1..16 并动态生成同等数量的服务/runner，paper 配置仍固定四人 |
 | §2，p2–4 | 文本程序接口、原生游戏状态与寻路 | 保留 Mineflayer/pathfinder；不添加人写的游戏技能，不把代码感知包装成像素控制 |
 | §2.1，p3–4 | 通用工作区、工具、记忆和长驻代码 | 编程容器、版本控制、搜索适配、globals 与显式 jobs；通用模块权限有版本化清单 |
 | §2.2，p4 | 观察、验证、短任务试验、经验与诚实报告 | `agents/prompts.py` 将通用原则、环境说明、目标/队友分开；提示词和 schema 哈希进 manifest |
@@ -64,7 +64,28 @@
 - 实际世界身份和 seed 保留在操作者侧；Observer 只看到脱敏记录，不能由该记录取得私有产物。新 run、trial 和世界数据目录默认仅操作者可访问，已有目录权限由操作者维护。
 - 原生模块白名单不是安全边界。可信 launcher 持有 Docker 管理权限；它不运行玩家代码，其管理接口不能对外公开。
 - 聊天关闭仍允许物品、建筑和移动等游戏内物理协作，不能称为“完全无通信”。
+- `infra/server.properties` 设置 `allow-flight=true`：这是长程稳定性偏差，不是论文明确要求。Mineflayer
+  的移动更新在 `allow-flight=false` 下会被 vanilla 判定为 invalid_player_movement 并踢出（实测 81 分钟
+  70 次）；正式报告应把该 server property 列入 deviation，或改为 `false` 后先做真实 4-bot 10 分钟零踢出验证。
 - 同一 seed 不保证模型和多玩家调度轨迹相同；每个 trial 独立世界、记忆和工作区，预算范围明确为每个 trial。
+
+## Prompt 与 harness 原始性
+
+论文只公开了方法层面的指令类别，没有公开原始 system prompt、消息模板、上下文压缩算法、工具 JSON schema、完整 harness 或统计代码；因此“原始性”只能逐项说明，不能声称逐字复刻。
+
+| 维度 | 论文公开内容 | 当前实现 |
+| --- | --- | --- |
+| 玩家 prompt | 一段固定目标 + 通用编程 Agent 指令（观察/验证、复用工具、记录经验、诚实报告、不要利用评测漏洞）+ 简短环境说明和队友列表；不包含游戏策略 | `agents/prompts.py` 的 `paper-framework-v4` 按论文 §2.2 的类别重新组织：目标段落 + 通用指令 + 简短环境说明 + 队友；文本仍是独立撰写，但不再把本 harness 的 artifact/history/evidence/context 恢复/超时 reset/leftover 等规则写进玩家 prompt。`strict` 仍使用字节兼容的 v3 |
+| Observer prompt | 同一通用 coding agent 的 Observer 变体：核对玩家声明、报告 specification gaming/伪造结果、不改游戏、只在环境故障时介入；发布 progress/verified events/infrastructure findings | `paper-framework-v4` 只写 §2.3 的角色语义和报告类别；报告字段/只读边界放在 Observer 工具 schema 与 harness 内部，不写进 prompt。不是作者原文 |
+| 工具接口 | 玩家只通过 CLI 发送 JavaScript；程序接收 `bot` 和 pathfinding 插件，无额外 helper；可读 Node/Mineflayer 模块；不能写文件/起进程；globals 跨程序；聊天进入下一个程序输出 | paper profile 的模型可见工具面收敛为 `workspace_read/write/list/remove`、`shell`、`memory_read/write/list/search`、`web_search/fetch`；游戏只能通过 shell 中的 `mc exec --file`。不再暴露 `mc_execute`/`mc_*`/`events_read`/`history_read`/`artifact_read`。程序输出仍是日志 + returned value 文本 |
+| 环境/工具面 | 代码工作区、shell、文件编辑、web search、私有/共享 memory、上下文压缩；服务器记录聊天、死亡、advancement，保存世界 | 都有对应实现；确定性 evaluator、SQLite 证据账本、预算/费用上限、checkpoint/restore、runner 容器隔离、workspace broker、dashboard/viewer 等论文未描述工程层继续存在于 harness 内部，但 paper profile 不再把它们作为模型可见工具或 prompt 规则 |
+| 上下文压缩 | 论文只说 coding agent 会 compact context，并要求把工作进度/下一步写进 memory | 借鉴 Pi 的 context projection：压缩条目保存 goal/WIP/next steps/decisions/verified facts/failed attempts/files read+modified/blockers/pending；原始消息仍归档，保留最近 tail，tool-call/result 配对不破坏。触发阈值和摘要生成仍不是作者实现 |
+| 模型/主机 | Gemini 4 Argon；5 个 agent 各自一台 cloud machine | DeepSeek `deepseek-flash`；同机独立 runner 容器 + Supervisor；模型 tokenizer、上下文窗口、工具调用格式、故障模式和资源隔离都不同 |
+| 评测/统计 | 服务端日志 `[Free the End]` 是胜利权威；记录全部程序和输出；报告人工/统计口径 | 采用同一日志权威并保留 advancement 旁证；但 evaluator、stages/Figure 13 分类、费用分账和图表重建是本项目规则，不是作者原始统计程序 |
+
+结论：当前可以声明“按论文公开方法独立实现，并复现了核心接口/流程”，但**不能**声明“使用原始 prompt/harness”或“与 Gemini 4 Argon 的原始运行同分布”。需要精确复现时，必须补齐作者未公开的 prompt、compactor、工具 schema 和统计代码，或者把差异作为方法附录明确列出。下一轮的模型可见面对齐、Pi 风格 context/memory 借鉴与长程稳定性修复见 [PI_METHOD_ALIGNMENT.md](PI_METHOD_ALIGNMENT.md)。
+
+2026-10-22 晚补充：下一轮玩家 runtime 直接采用真实 Pi coding-agent CLI（`runtime.runner_runtime: pi`）。因此模型可见工具变为 Pi built-in `read/write/edit/bash`，游戏仍只能经 bash 的 `mc exec --file`；memory 改为文件目录（private/team），没有 Python runtime 的 `memory_*`/`web_search` 工具。上表描述的是 Python runtime/Observer 路径的实现；Pi runtime 的完整映射与 deviation 见 [PI_METHOD_ALIGNMENT.md](PI_METHOD_ALIGNMENT.md) 第 9 节。
 
 ## 当前验证边界
 
@@ -91,7 +112,7 @@ Vanilla 的真实短任务、小时/日尺度运行和真实模型费用均等�
 | 论文测量参数 | paper 模板 `context_chars` 调至 160000 并注明依据（论文玩家平均每次调用约 56k 输入 token）；Observer 与玩家共享同一模型/上下文口径（论文同为 coding agent），可用 `observer.context_chars` 单独放大。 | `configs/minecraft-paper-aligned.yaml` |
 | 真实 Minecraft 单 Agent 验证 | EULA 接受后在本机 Mojang 1.20.4/Easy 服务端用真实 Mineflayer + DeepSeek 跑通 `obtain_logs`（stats 原木 delta=3）与 `craft_table`（stats 工作台 delta=6），报告 token/费用在修复收尾竞态后为已知值；4 Agent paper_aligned 与日尺度未验证。 | `validation/2026-10-21-real-minecraft/` |
 
-验证：仓库内 Python **350 项通过**、Node **51 项通过**；`--network none` 离线 smoke 独立运行通过；真实 DeepSeek 1 Agent + LLM Observer 8 分钟运行 106 次调用、11 条报告、成本约 $0.24，未知用量发生后继续到墙钟上限；加入强制补报与补报重试后的 4 分钟复核为 66 次调用、10 条报告、2 次补报失败、成本约 $0.13。真实 Minecraft 1 Agent（strict，真实服务器 stats 证据）已在上表通过；4 Agent paper_aligned、付费模型能力实验与日尺度运行仍未验收；原冻结一小时 failed 结论保持不变。
+验证：仓库内 Python **347 项通过**、Node **51 项通过**；`--network none` 离线 smoke 独立运行通过；真实 DeepSeek 1 Agent + LLM Observer 8 分钟运行 106 次调用、11 条报告、成本约 $0.24，未知用量发生后继续到墙钟上限；加入强制补报与补报重试后的 4 分钟复核为 66 次调用、10 条报告、2 次补报失败、成本约 $0.13。真实 Minecraft 1 Agent（strict，真实服务器 stats 证据）已在上表通过；4 Agent paper_aligned、付费模型能力实验与日尺度运行仍未验收；原冻结一小时 failed 结论保持不变。
 
 ## 2026-10-21 二次深入审计
 
@@ -123,7 +144,7 @@ Vanilla 的真实短任务、小时/日尺度运行和真实模型费用均等�
   "Ten crystals" 没有 advancement/统计对应，固定 unavailable；in-game days（论文 ~81 天）需要 level.dat
   DayTime；论文的完整 3D 世界渲染只做到 160×160 mesh/full-world LOD，不是全精度全景。
 - 数据来源与边界见 [DASHBOARD.md](DASHBOARD.md#论文图表的动态回放)；回归测试 `tests/test_figures.py`，
-  Python 350 项 / Node 51 项通过。
+  Python 347 项 / Node 51 项通过。
 
 ## 2026-10-21 二次复核：仍未对齐的论文设计
 
@@ -176,7 +197,7 @@ Observer schema/报告、成功时间日志佐证等，然后声明更接近复�
 
 ### 2026-10-21 深夜修复结果（覆盖上述历史缺口）
 
-已实现并通过 350 项 Python + 51 项 Node 测试：
+已实现并通过 347 项 Python + 51 项 Node 测试：
 
 - `runtime.leftover_policy: allow` + bot `LEFTOVER_POLICY=allow`：正常返回和超时都保留 globals/timers/listeners/异步动作；超时执行被 detach，下一程序可运行。循环型 CPU 死循环由 loop instrumentation 在下一迭代中断并保留 globals；非循环超长 CPU 仍有 fallback reset。
 - `agents.paper_single_program: true`：paper 模板只暴露同步 `mc_execute`，async submit/wait/jobs/status/cancel/pending/events_read 全部从 schema 隐藏。

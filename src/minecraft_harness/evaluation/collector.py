@@ -22,6 +22,7 @@ from typing import Any, Iterable
 import uuid
 
 from ..environment import read_level
+from ..entity_evidence import end_crystal_summary
 
 UUID_RE = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
 SERVER_LINE = re.compile(r"^\[\d{2}:\d{2}:\d{2}\] \[Server thread/(?:INFO|WARN|ERROR)\]: (?P<message>.*)$")
@@ -218,7 +219,8 @@ class ServerEvidenceCollector:
                 level = {"error": "level_dat_unavailable"}
         document = {"schema_version": 1, "kind": "world_snapshot", "files": files,
                     "player_ids": sorted(allowed) if allowed is not None else None,
-                    "scope": "explicit_players" if allowed is not None else "whole_experiment_world"}
+                    "scope": "explicit_players" if allowed is not None else "whole_experiment_world",
+                    "end_crystals": end_crystal_summary(world_dir)}
         if level is not None:
             document["level"] = level
         if not baseline:

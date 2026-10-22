@@ -30,8 +30,8 @@ STAGE_ORDER = (
     ("flint_and_steel", "Flint and steel", "overworld"),
     ("nether_portal", "Nether portal", "nether"),
     ("nether_fortress", "Nether fortress", "nether"),
-    ("ender_pearls", "Ender pearls", "nether"),
     ("blaze_rods", "Blaze rods", "nether"),
+    ("ender_pearls", "Ender pearls", "nether"),
     ("eyes_of_ender", "Eyes of Ender", "stronghold"),
     ("stronghold", "Stronghold", "stronghold"),
     ("the_end", "The End", "end"),
@@ -397,7 +397,27 @@ def _in_game_days(conn, run_dir):
             "snapshot_event_seq": row["event_seq"]}
 
 
-def _dragon_payload(connection, origin):
+def _server_crystal_series(connection, run_dir, origin):
+    out = []
+    for row in connection.execute("SELECT event_seq, received_at, payload_json FROM events WHERE kind='server_world_snapshot' ORDER BY event_seq"):
+        payload = _json(row["payload_json"]) or {}
+        document = _artifact(run_dir, payload.get("artifact_sha256"))
+        if not isinstance(document, dict):
+            continue
+        summary = document.get("end_crystals")
+        if not isinstance(summary, dict) or summary.get("available") is not True:
+            continue
+        count = summary.get("count")
+        if type(count) is not int or not 0 <= count <= 10:
+            continue
+        when = _ts(row["received_at"])
+        out.append({"t": _clamp(when, origin), "count": count,
+                    "positions": summary.get("positions") or [],
+                    "event_seq": row["event_seq"], "source": "server save"})
+    return out
+
+
+def _dragon_payload(connection, origin, run_dir):
     """Parse structured observation JSON lines emitted by player programs.
 
     This is deliberately observation-only: values are agent-observed, never
@@ -405,6 +425,7 @@ def _dragon_payload(connection, origin):
     agents use the normal console.log path.
     """
     health, crystals = [], []
+    server_crystals = _server_crystal_series(connection, run_dir, origin)
     for row in connection.execute("SELECT event_seq, actor_id, received_at, payload_json FROM events WHERE kind='program_log' ORDER BY event_seq DESC LIMIT 5000"):
         payload = _json(row["payload_json"]) or {}
         message = payload.get("message") if isinstance(payload, dict) else None
@@ -429,10 +450,11 @@ def _dragon_payload(connection, origin):
             crystals.append({"t": _clamp(stamp, origin), "count": int(count), **base})
     health.sort(key=lambda item: (item["t"] or 0, item["event_seq"]))
     crystals.sort(key=lambda item: (item["t"] or 0, item["event_seq"]))
-    available = bool(health or crystals)
+    available = bool(health or crystals or server_crystals)
     return {"available": available, "health": health[-MAX_SERIES:], "crystals": crystals[-MAX_SERIES:],
-            "reason": None if available else "no player program emitted a dragon_health/crystals observation JSON line",
-            "basis": "player program observations (agent-reported), not server truth"}
+            "server_crystals": server_crystals[-MAX_SERIES:],
+            "reason": None if available else "no server crystal snapshot and no player dragon_health/crystals observation",
+            "basis": "server save counts End Crystal entities; health and per-crystal attribution are player observations, not server truth"}
 
 
 def _state(conn):
@@ -499,12 +521,18 @@ def build_figures(run_dir, *, max_series=MAX_SERIES):
             if stage:
                 precise[stage].append({"t": item["t"], "agent": item.get("agent"), "precision": "source_time",
                                        "source": "server_log:" + str(item.get("title")), "evidence": item.get("evidence")})
-        dragon = _dragon_payload(connection, origin)
+        dragon = _dragon_payload(connection, origin, run_dir)
         zero_crystals = [item for item in dragon.get("crystals", []) if item.get("count") == 0]
         if zero_crystals:
             first = min(zero_crystals, key=lambda item: (item.get("t") or 0, item.get("event_seq") or 0))
             candidates["ten_crystals"].append({"t": first["t"], "agent": first.get("agent"),
                 "precision": "player_program_observation", "source": "program_observation:ten_crystals",
+                "evidence": {"event_seq": first.get("event_seq")}})
+        server_zero = [item for item in dragon.get("server_crystals", []) if item.get("count") == 0]
+        if server_zero:
+            first = min(server_zero, key=lambda item: (item.get("t") or 0, item.get("event_seq") or 0))
+            candidates["ten_crystals"].append({"t": first["t"], "agent": None,
+                "precision": "snapshot_observation_upper_bound", "source": "server_save:end_crystals",
                 "evidence": {"event_seq": first.get("event_seq")}})
         stages = _stage_payload(candidates, precise, origin, duration, running)
         for item in chats + deaths + advancements:
@@ -544,14 +572,22 @@ def build_figures(run_dir, *, max_series=MAX_SERIES):
                                 "messages": sum(1 for item in chats if item["agent"] == agent),
                                 "deaths": sum(1 for item in deaths if item["agent"] == agent),
                                 "advancements": sum(1 for item in advancements if item["agent"] == agent)})
+        # Paper Figure 3 orange marks are *world-server restarts*, not worker
+        # runtime resets. Keep the two phenomena separate so a 16-reset soak
+        # run cannot visually masquerade as 16 paper-style server restarts.
         restarts = []
+        runtime_resets = []
         for row in connection.execute("SELECT event_seq, kind, actor_id, received_at, payload_json FROM events WHERE kind IN ('server_stopped','server_started','world_restored','runtime_recovery_started','runtime_reset') ORDER BY event_seq"):
             payload = _json(row["payload_json"]) or {}
             when = _ts(row["received_at"])
             if when is None:
                 continue
-            restarts.append({"t": _clamp(when, origin), "kind": row["kind"], "reason": (payload.get("reason") if isinstance(payload, dict) else None),
-                             "event_seq": row["event_seq"]})
+            item = {"t": _clamp(when, origin), "kind": row["kind"], "reason": (payload.get("reason") if isinstance(payload, dict) else None),
+                    "event_seq": row["event_seq"]}
+            if row["kind"] in {'server_stopped', 'server_started', 'world_restored'}:
+                restarts.append(item)
+            else:
+                runtime_resets.append(item)
         evaluation = state.get("evaluation") if isinstance(state.get("evaluation"), dict) else {}
         payload = {
             "schema_version": SCHEMA_VERSION,
@@ -566,7 +602,8 @@ def build_figures(run_dir, *, max_series=MAX_SERIES):
             "agents": agent_cards, "programs": programs, "jobs": jobs,
             "chats": chats, "deaths": deaths, "advancements": advancements,
             "stages": stages, "dimension_bands": dimension_bands,
-            "restarts": restarts, "behavior": _behavior_counts(chats), "death_causes": _deaths_payload(deaths),
+            "restarts": restarts, "runtime_resets": runtime_resets,
+            "behavior": _behavior_counts(chats), "death_causes": _deaths_payload(deaths),
             "dragon": dragon, "in_game_days": _in_game_days(connection, run_dir),
             "world": _world_payload(manifest, run_dir),
             "omitted": {"programs": programs_omitted, "jobs": jobs_omitted, "chats": chats_omitted,

@@ -197,7 +197,7 @@ class Session {
     if (!this.reservedRuntimeEpoch) this.runtimeEpoch += 1;
     this.reservedRuntimeEpoch = false;
     const workerConfig = { mode: this.config.mode, username: this.username, host: this.config.mcHost,
-      port: this.config.mcPort, version: this.config.mcVersion, lifecycle: this.lifecycle, maxBackgroundJobs: this.maxBackgroundJobs, remainingRunMs: Math.max(0, Math.floor(this.runDeadline - performance.now())), runDeadlineAt: Date.now() + Math.max(0, this.runDeadline - performance.now()), maxLogs: this.config.maxLogs, maxLogBytes: this.config.maxLogBytes, maxResultBytes: this.config.maxResultBytes, leftoverPolicy: this.config.leftoverPolicy, chatDelivery: this.config.chatDelivery, maxLeftoverScopes: Number(process.env.MAX_LEFTOVER_SCOPES ?? 256) };
+      port: this.config.mcPort, version: this.config.mcVersion, lifecycle: this.lifecycle, paperSingleProgram: this.config.paperSingleProgram, maxBackgroundJobs: this.maxBackgroundJobs, remainingRunMs: Math.max(0, Math.floor(this.runDeadline - performance.now())), runDeadlineAt: Date.now() + Math.max(0, this.runDeadline - performance.now()), maxLogs: this.config.maxLogs, maxLogBytes: this.config.maxLogBytes, maxResultBytes: this.config.maxResultBytes, leftoverPolicy: this.config.leftoverPolicy, chatDelivery: this.config.chatDelivery, maxLeftoverScopes: Number(process.env.MAX_LEFTOVER_SCOPES ?? 256) };
     // Never pass gateway/model secrets to code execution children.
     const remote = this.config.workerEndpoints[this.agentId];
     let child;
@@ -231,7 +231,7 @@ class Session {
     }
     this.worker = child;
     let stderr = '';
-    child.stderr.on('data', chunk => { stderr = (stderr + chunk.toString()).slice(-8192); });
+    child.stderr.on('data', chunk => { stderr = (stderr + chunk.toString()).slice(-8192); console.error('WORKER_STDERR', chunk.toString().slice(-2000)); });
     let readyResolve; let readyReject;
     const ready = new Promise((resolve, reject) => { readyResolve = resolve; readyReject = reject; });
     const startupTimer = setTimeout(() => {
@@ -290,7 +290,13 @@ class Session {
         else { readyReject(new Error(message.error)); this.killWorker('worker_fatal').catch(() => {}); }
       }
     });
-    child.once('error', error => readyReject(error));
+    child.on('error', error => {
+      if (!child.ready) { readyReject(error); return; }
+      // A remote control-channel loss is an execution fault, not a reason to
+      // crash the entire bot process. Let the supervisor recover the session.
+      this.event('runtime_error', { error: String(error?.message ?? error).slice(0, 1000) });
+      this.killWorker('remote_worker_error').catch(() => {});
+    });
     child.once('exit', (code, signal) => {
       for (const [executionId, entry] of this.aborting) {
         if (entry.active?.child === child) { clearTimeout(entry.timer); this.aborting.delete(executionId); }
@@ -304,6 +310,7 @@ class Session {
       if (this.worker === child) this.worker = null;
       if (this.lifecycle === 'paper_aligned') { this.runtimeEpoch += 1; this.reservedRuntimeEpoch = true; }
       for (const job of this.jobs.values()) if (!TERMINAL.has(job.status)) this.finishJob(job.job_id, 'interrupted', { reset_reason: child.fenceReason ?? 'worker_exit' });
+      console.error('WORKER_EXIT', code, signal, Boolean(child.expectedExit), stderr.slice(-2000));
       this.event('runtime_exit', { code, signal, expected: Boolean(child.expectedExit) });
       if (!child.expectedExit && this.current?.child === child) {
         this.finish(this.current, 'interrupted', { error: { message: `Worker exited (${code ?? signal})` }, reset_reason: child.fenceReason ?? 'worker_exit' }, false).catch(() => {});
@@ -566,6 +573,7 @@ export async function start(options = {}) {
     mcVersion: options.mcVersion ?? process.env.MC_VERSION ?? '1.20.4',
     startupTimeoutMs: options.startupTimeoutMs ?? Number(process.env.STARTUP_TIMEOUT_MS ?? 45000),
     lifecycle: options.lifecycle ?? process.env.LIFECYCLE ?? 'strict',
+    paperSingleProgram: options.paperSingleProgram ?? ['1', 'true'].includes(String(process.env.PAPER_SINGLE_PROGRAM ?? 'false').toLowerCase()),
     leftoverPolicy: options.leftoverPolicy ?? process.env.LEFTOVER_POLICY ?? 'reset',
     chatDelivery: options.chatDelivery ?? process.env.CHAT_DELIVERY ?? 'events',
     abortGraceMs: options.abortGraceMs ?? Number(process.env.ABORT_GRACE_MS ?? 5000),

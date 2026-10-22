@@ -32,12 +32,16 @@ export async function startWorkerHost(options = {}) {
     mcHost: options.mcHost ?? process.env.WORKER_MC_HOST,
     mcPort: Number(options.mcPort ?? process.env.WORKER_MC_PORT ?? 25565),
     maxWatchdogMs: Number(options.maxWatchdogMs ?? 10000),
-    maxWorkerMemory: options.maxWorkerMemory ?? '512m',
+    maxWorkerMemory: options.maxWorkerMemory ?? process.env.WORKER_MAX_MEMORY ?? '512m',
     sandboxRuntime: options.sandboxRuntime ?? process.env.WORKER_SANDBOX_RUNTIME ?? '',
+    viewerPort: Number(options.viewerPort ?? process.env.WORKER_VIEWER_PORT ?? 0),
+    workerIp: options.workerIp ?? process.env.WORKER_IP ?? '',
   };
   if (!/^[A-Za-z0-9_]{1,16}$/.test(config.agentId ?? '') || !/^[A-Za-z0-9_-]{1,48}$/.test(config.id ?? '') || typeof config.token !== 'string' || config.token.length < 16) throw new Error('Fixed WORKER_AGENT_ID, stable WORKER_HOST_ID and strong WORKER_HOST_TOKEN required');
   if (!/^[A-Za-z0-9][A-Za-z0-9_.:/@-]*$/.test(config.image) || !/^[A-Za-z0-9][A-Za-z0-9_.-]*$/.test(config.network)) throw new Error('Invalid fixed worker image/network');
   if (config.sandboxRuntime && !/^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$/.test(config.sandboxRuntime)) throw new Error('Invalid OCI sandbox runtime name');
+  if (!(config.viewerPort === 0 || (Number.isInteger(config.viewerPort) && config.viewerPort >= 1024 && config.viewerPort <= 65535))) throw new Error('Invalid WORKER_VIEWER_PORT');
+  if (config.workerIp && !/^(?:\d{1,3}\.){3}\d{1,3}$/.test(config.workerIp)) throw new Error('Invalid WORKER_IP');
   if (!Number.isSafeInteger(config.maxWatchdogMs) || config.maxWatchdogMs < 100 || config.maxWatchdogMs > 60000) throw new Error('Invalid worker watchdog');
   const label = `mc-harness.worker-host=${config.id}`;
   // A launcher crash must not strand a sandbox before a replacement connects.
@@ -63,6 +67,7 @@ export async function startWorkerHost(options = {}) {
     socket.write(line + '\n');
   }
   async function stop(record, reason = 'control_stopped') {
+    console.error('WORKER_STOP', reason, record.name);
     if (record.stopping) return record.stopping;
     record.stopping = (async () => {
       clearInterval(record.guard);
@@ -110,7 +115,7 @@ export async function startWorkerHost(options = {}) {
         if (worker.mode === 'minecraft' && (config.network === 'none' || !config.mcHost || !config.identityProxy)) throw new Error('Minecraft worker requires fixed identity-proxy network and target');
         const watchdog = Math.min(config.maxWatchdogMs, Math.max(100, Number(message.watchdog_ms) || config.maxWatchdogMs));
         // Copy only declared fields. No incoming environment / container flags.
-        const safeWorker = Object.fromEntries(['mode', 'username', 'version', 'lifecycle', 'maxBackgroundJobs', 'remainingRunMs', 'runDeadlineAt', 'maxLogs', 'maxLogBytes', 'maxResultBytes'].map(key => [key, worker[key]]));
+        const safeWorker = Object.fromEntries(['mode', 'username', 'version', 'lifecycle', 'maxBackgroundJobs', 'remainingRunMs', 'runDeadlineAt', 'maxLogs', 'maxLogBytes', 'maxResultBytes', 'leftoverPolicy', 'chatDelivery', 'maxLeftoverScopes', 'paperSingleProgram'].map(key => [key, worker[key]]));
         safeWorker.host = config.mcHost; safeWorker.port = config.mcPort;
         const name = `mc-worker-${config.id}-${randomUUID().slice(0, 8)}`;
         // gVisor (`runsc`) is an optional OCI sandbox runtime here. It adds a
@@ -118,7 +123,13 @@ export async function startWorkerHost(options = {}) {
         // network-isolated worker container; the legacy seccomp/LD_PRELOAD guard
         // remains in the image as defense in depth.
         const runtime = config.sandboxRuntime ? ['--runtime', config.sandboxRuntime] : [];
-        const args = ['create', '--name', name, '--label', label, '--read-only', '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges', '--user', '1000:1000', '--pids-limit', '64', '--memory', config.maxWorkerMemory, '--cpus', '1', '--network', config.network, '--dns', '127.0.0.1', ...runtime, '--interactive', '--attach', 'stdin', '--attach', 'stdout', '--attach', 'stderr', '--log-driver', 'none', '--env', `BOT_WORKER_CONFIG=${JSON.stringify(safeWorker)}`, config.image];
+        const resourceLimits = ['--memory', config.maxWorkerMemory, '--cpus', '1'];
+        // runsc rejects --pids-limit (unsupported cgroup knob) and would fail to
+        // create the sandbox; keep the limit under runc and rely on gVisor's own
+        // process isolation otherwise.
+        if (!config.sandboxRuntime) resourceLimits.push('--pids-limit', '64');
+        const viewerArgs = config.viewerPort ? ['--env', `VIEWER_PORT=${config.viewerPort}`, '--env', 'VIEWER_BIND=0.0.0.0', '--env', 'VIEWER_FIRST_PERSON=true', '--env', 'VIEWER_VIEW_DISTANCE=2'] : [];
+        const args = ['create', '--name', name, '--label', label, '--read-only', '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges', '--user', '1000:1000', ...resourceLimits, ...viewerArgs, ...(config.workerIp ? ['--ip', config.workerIp] : []), '--network', config.network, ...runtime, '--interactive', '--attach', 'stdin', '--attach', 'stdout', '--attach', 'stderr', '--log-driver', 'none', '--env', `BOT_WORKER_CONFIG=${JSON.stringify(safeWorker)}`, config.image];
         const record = { name, proc: null, connectionId: message.connection_id, socket, lastPulse: performance.now(), watchdog, stopping: null };
         attached = record; active.set(record.connectionId, record);
         record.creating = docker(args);

@@ -24,7 +24,8 @@ class PaperSupervisorTests(unittest.IsolatedAsyncioTestCase):
             self.assertFalse(result["actual_minecraft"])
             self.assertFalse(result["paid_model"])
 
-    async def _observer_failure_run(self, profile="paper_aligned", model_calls=1000, stop_when_degraded=False):
+    async def _observer_failure_run(self, profile="paper_aligned", model_calls=1000, stop_when_degraded=False,
+                                    observer_failure_policy=None):
         import asyncio
         from contextlib import closing
         import json
@@ -48,11 +49,14 @@ class PaperSupervisorTests(unittest.IsolatedAsyncioTestCase):
                 raise ModelError("private-provider-message")
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "run"
+            supervision = {"poll_interval_s": .01}
+            if observer_failure_policy is not None:
+                supervision["observer_failure_policy"] = observer_failure_policy
             supervisor = Supervisor({"experiment": {"profile": profile, "task": "observe_only"},
                 "runtime": {"lifecycle": "paper_aligned", "mode": "fake", "heartbeat_interval_s": .2},
                 "agents": {"count": 4, "max_turns": 10000, "max_no_progress_turns": 1000},
                 "observer": {"mode": "llm", "interval_s": .01}, "budgets": {"total_model_calls": model_calls},
-                "supervision": {"poll_interval_s": .01}}, path)
+                "supervision": supervision}, path)
             created = []
             def build(config):
                 model = PlayerModel() if len(created) < 4 else BrokenObserver()
@@ -68,7 +72,7 @@ class PaperSupervisorTests(unittest.IsolatedAsyncioTestCase):
                 task = asyncio.create_task(supervisor.run())
                 try:
                     if stop_when_degraded:
-                        deadline = time.monotonic() + 5
+                        deadline = time.monotonic() + 10
                         while not task.done() and time.monotonic() < deadline:
                             if supervisor.recorder and supervisor.recorder.get_state("observer_degraded"):
                                 self.assertEqual(supervisor.status, "running")
@@ -77,7 +81,7 @@ class PaperSupervisorTests(unittest.IsolatedAsyncioTestCase):
                             await asyncio.sleep(.02)
                         else:
                             self.fail("Optional Observer failure was not reported as degraded")
-                    result = await asyncio.wait_for(task, 15)
+                    result = await asyncio.wait_for(task, 30)
                 finally:
                     if not task.done():
                         task.cancel()
@@ -88,11 +92,19 @@ class PaperSupervisorTests(unittest.IsolatedAsyncioTestCase):
             self.assertNotIn("private-provider-message", raw)
             return result, state
 
-    async def test_required_observer_failure_stops_and_is_not_overwritten_by_game_evaluation(self):
-        result, state = await self._observer_failure_run()
+    async def test_required_observer_failure_stops_under_fail_run_policy(self):
+        result, state = await self._observer_failure_run(observer_failure_policy="fail_run")
         self.assertEqual(result["status"], "model_failed")
         self.assertEqual(state["observer_outcome"]["status"], "model_failed")
         self.assertTrue(state["observer_outcome"]["required"])
+        self.assertEqual(state["evaluation"]["status"], "insufficient_evidence")
+
+    async def test_required_observer_failure_degrades_by_default_while_players_continue(self):
+        result, state = await self._observer_failure_run(stop_when_degraded=True)
+        self.assertEqual(result["status"], "stopped")
+        self.assertTrue(state["observer_degraded"])
+        self.assertTrue(state["observer_outcome"]["required"])
+        self.assertEqual(state["observer_outcome"]["status"], "model_failed")
         self.assertEqual(state["evaluation"]["status"], "insufficient_evidence")
 
     async def test_optional_observer_failure_is_explicitly_degraded_while_players_continue(self):

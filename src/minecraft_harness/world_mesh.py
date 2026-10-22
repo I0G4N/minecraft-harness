@@ -662,7 +662,7 @@ def _render_mesh(faces, *, x0: int, z0: int, width: int, depth: int,
         depth_tests += tests
         writes += written
     zbuffer_stats = {"tests": depth_tests, "writes": writes}
-    return _upscale(pixels, internal_w, internal_h, pixel_w, pixel_h), drawable, texture_blocks, zbuffer_stats
+    return _upscale(pixels, internal_w, internal_h, pixel_w, pixel_h), drawable, texture_blocks, zbuffer_stats, camera
 
 
 # ---------------------------------------------------------------------------
@@ -1012,7 +1012,7 @@ def _render_diorama_metadata(*, world, identity, output_path, center_x, center_z
                            y_lo=y_lo, y_hi=y_hi)
     if not faces:
         raise WorldRenderError("mesh produced no visible faces")
-    pixels, drawable, texture_blocks, zbuffer_stats = _render_mesh(
+    pixels, drawable, texture_blocks, zbuffer_stats, camera = _render_mesh(
         faces, x0=x0, z0=z0, width=mesh_w, depth=mesh_d, y_lo=y_lo, y_hi=y_hi,
         pixel_w=pixel_w, pixel_h=pixel_h)
     png = _encode_png(pixels, pixel_w, pixel_h)
@@ -1073,6 +1073,18 @@ def _render_diorama_metadata(*, world, identity, output_path, center_x, center_z
             "sections_read": sections_read,
             "data_versions": dict(sorted(data_versions.items())),
             "internal_size": list(INTERNAL_SIZE),
+            "projection": {
+                "camera": {
+                    "position": list(camera.position), "right": list(camera.right),
+                    "up": list(camera.up), "forward": list(camera.forward),
+                    "focal": camera.focal, "center_x": camera.center_x, "center_y": camera.center_y,
+                },
+                "internal_size": list(INTERNAL_SIZE),
+                "output_size": [pixel_w, pixel_h],
+                "world_bounds": {"x0": x0, "x1": x0 + mesh_w, "z0": z0, "z1": z0 + mesh_d,
+                                 "y0": y_lo, "y1": y_hi},
+                "eye_height": 1.62,
+            },
         })
 
 
