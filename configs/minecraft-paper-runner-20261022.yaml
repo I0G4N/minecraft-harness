@@ -126,7 +126,7 @@ web:
   - minecraft.fandom.com
 storage:
   max_artifact_bytes: 34359738368
-  max_run_bytes: 51539607552
+  max_run_bytes: 107374182400
   min_free_disk_bytes: 2147483648
   # Pi session JSONL is pruned/rotated at runner start and again at runner
   # shutdown (oldest first); the active session guard stops the runner if it

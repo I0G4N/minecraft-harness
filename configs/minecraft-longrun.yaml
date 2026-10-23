@@ -76,7 +76,7 @@ storage:
   # headroom for logs, workspaces and world/checkpoint files.
   min_free_disk_bytes: 2147483648
   max_artifact_bytes: 34359738368
-  max_run_bytes: 51539607552
+  max_run_bytes: 107374182400
   max_event_bytes: 4194304
 budgets:
   wall_time_minutes: 1440

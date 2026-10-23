@@ -59,18 +59,25 @@ processes; it killed the runtime three times and paused twice.
 
 ### 1. Storage headroom is the first hard limit
 
-The current run cap is `storage.max_run_bytes=24 GiB` (default). A real
+At check time the default run cap was `storage.max_run_bytes=24 GiB`. A real
 8-agent 5-minute run produced **~85 MiB** of run-dir data. If that rate were
 sustained linearly, 24 GiB would be reached in roughly **24 hours**, before a
 54h run completes. Artifact retention/session pruning may cap this, but no
 real 8-agent or 4-agent multi-hour storage curve exists yet.
 
+**Update after this check:** `max_run_bytes` has been raised to
+**100 GiB (107,374,182,400 bytes, ~107 GB)** in the default config, all
+`configs/*.yaml` templates and the Pi-budget fallback. At the same linear
+8-agent rate this gives roughly 100 hours of headroom, so a 54h run fits the
+current cap in the crude estimate — but the real multi-hour storage curve is
+still required before treating that as proof.
+
 Actions:
 
 - Measure `du run_dir` every minute for a 1–2 hour real run.
 - Set an operator alert threshold at 50%/75%/90% of `max_run_bytes`.
-- Decide formal 4-agent small-run `max_run_bytes` (likely 48 GiB) and
-  `pi_session_max_bytes`/`pi_artifact_max_bytes` from measured growth.
+- Keep the 100 GiB `max_run_bytes` and set `pi_session_max_bytes`/
+  `pi_artifact_max_bytes` from measured growth.
 - Do not extrapolate from the 300 s fake soak; it has much higher call rate and
   different artifact sizes.
 
@@ -125,7 +132,7 @@ container Pi path and bridge are verified by smoke, not by a red-team run.
 2. 1h real Pi session with retention/rotation intentionally triggered.
 3. Provider failure injection (401/429/5xx) proving `model_failed` fail-fast and bounded billing.
 4. Real container Pi smoke on the exact final image/mounts; record image IDs.
-5. Set storage alert thresholds and a 48 GiB run cap based on measurements.
+5. Set storage alert thresholds against the 100 GiB run cap based on measurements.
 6. Freeze the tree/source/Pi runtime hashes and run from the frozen checkout.
 7. Start 54h only with a human monitor for `agent_degraded`, `observer_degraded`, storage and model errors.
 
@@ -148,4 +155,4 @@ uv run python scripts/longrun_soak.py --duration-s 300 --trace-memory \
 uv run python scripts/gateway_fd_check.py --output validation/gateway-fd-20261023.json
 ```
 
-Source commit at check time: `43f3b1c` (plus local evidence only; no code edits made by this check).
+Source commit at check time: `43f3b1c`; after the check the cap was raised to 100 GiB. See the storage-risk note above.

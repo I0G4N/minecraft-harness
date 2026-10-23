@@ -19,9 +19,12 @@ class LongRunConfigurationTests(unittest.TestCase):
         self.assertEqual(config['supervision']['recovery_attempts'], 3)
         self.assertEqual(config['runtime']['lease_timeout_s'], 30)
         self.assertEqual(config['storage']['max_event_bytes'], 4 * 1024 ** 2)
+        self.assertEqual(config['storage']['max_run_bytes'], 100 * 1024 ** 3)
         self.assertEqual(config['agents']['model_request_timeout_s'], 95)
         template = Path(__file__).resolve().parents[1] / 'configs/minecraft-longrun.yaml'
-        self.assertEqual(load_config(template)['budgets']['wall_time_minutes'], 1440)
+        loaded = load_config(template)
+        self.assertEqual(loaded['budgets']['wall_time_minutes'], 1440)
+        self.assertEqual(loaded['storage']['max_run_bytes'], 100 * 1024 ** 3)
 
     def test_pi_alignment_defaults_and_paper_runner_template(self):
         config = validate_config({})
@@ -76,7 +79,7 @@ class LongRunConfigurationTests(unittest.TestCase):
             {'observer': {'context_chars':3999}},
             {'storage': {'max_event_bytes':0}},
             {'storage': {'min_free_disk_bytes':-1}},
-            {'storage': {'max_artifact_bytes':30*1024**3}},
+            {'storage': {'max_artifact_bytes':110*1024**3}},
             {'supervision': {'recovery_base_s':3,'recovery_max_s':1}},
             {'supervision': {'recovery_attempts':-1}},
             {'runtime': {'request_timeout_s':False}},

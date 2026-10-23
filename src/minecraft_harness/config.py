@@ -60,7 +60,7 @@ DEFAULTS = {
                "control_timeout_s": 90, "startup_timeout_s": 120, "log_interval_s": 1,
                "properties_path": None, "require_fresh_world": False, "log_timezone": "UTC"},
     "storage": {"min_free_disk_bytes": 256 * 1024 ** 2, "max_artifact_bytes": 16 * 1024 ** 3,
-                "max_run_bytes": 24 * 1024 ** 3, "max_event_bytes": 4 * 1024 ** 2,
+                "max_run_bytes": 100 * 1024 ** 3, "max_event_bytes": 4 * 1024 ** 2,
                 # Pi session JSONL and model/tool artifact retention. Sessions
                 # older than the prune point are removed on runner start; new
                 # artifacts above the cap become metadata-only summaries.

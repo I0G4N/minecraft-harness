@@ -195,15 +195,12 @@
 - 全量 Python：**757 passed, 3 skipped, 734 subtests**。
 
 
-## 2026-10-23 长程稳定性检查
+## 2026-10-23 max_run_bytes 调整
 
-- 300 秒离线 4-agent Supervisor soak（真实 Node、fake model、3 次 SIGKILL、2 次
-  pause/resume）：16/16 检查通过，4,447 次 model call 全部结算、pending 空，
-  3 次恢复均在 <0.7s；Python RSS 峰值 88.8 MiB、tracemalloc 净增长 0.59 MiB。
-- 长程定向测试 87 passed / 73 subtests；Node 51 passed；FD 12 轮 start/close
-  回到 7 FD；全量 Python 757 passed / 3 skipped。
-- 结论：离线编排/恢复/预算/暂停/进程生命周期 PASS；**不能替代 54h 真实 Minecraft**。
-- 主要残余风险：真实 run 存储增长（8-agent 5min 约 85 MiB，24GiB run cap 需实测）、
-  active Pi session cap 只停止不自动轮转/告警、真实 server crash/长时 provider 故障未注入、
-  8-agent Supervisor RSS 峰值约 310 MiB 无硬上限。
-- 报告：[LONGRUN_STABILITY_CHECK_2026-10-23.md](LONGRUN_STABILITY_CHECK_2026-10-23.md)
+- `storage.max_run_bytes` 默认从 24 GiB 提升到 **100 GiB**
+  (`107374182400` bytes，约 107 GB)。
+- 同步更新所有 `configs/*.yaml`、`Recorder.storage_status` fallback 和
+  `runners._PI_BUDGET_DEFAULT_GLOBAL_BYTES`。
+- `max_artifact_bytes`/`pi_artifact_max_bytes` 仍为 16 GiB/4 GB，低于新 run cap。
+- 长程检查报告已注明：100 GiB 下按 8-agent 5min 粗估约 100h 余量，但真实长时
+  storage 曲线仍是 54h 前的必测项。

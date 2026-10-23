@@ -375,7 +375,7 @@ class Recorder:
                     except FileNotFoundError:
                         continue
         free=shutil.disk_usage(self.run_dir).free
-        return {'measured_run_bytes':total,'artifact_bytes':self.artifact_bytes,'free_disk_bytes':free,'limit_exceeded':total>self.limits.get('max_run_bytes',24*1024**3) or free<self.limits.get('min_free_disk_bytes',256*1024**2)}
+        return {'measured_run_bytes':total,'artifact_bytes':self.artifact_bytes,'free_disk_bytes':free,'limit_exceeded':total>self.limits.get('max_run_bytes',107374182400) or free<self.limits.get('min_free_disk_bytes',256*1024**2)}
 
     def export_jsonl(self):
         target=self.run_dir/'events.jsonl'
