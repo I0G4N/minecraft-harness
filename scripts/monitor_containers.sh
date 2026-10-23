@@ -6,7 +6,7 @@ PROJECT=${1:?project}
 OUT=${2:?output csv}
 INTERVAL=${3:-30}
 mkdir -p "$(dirname "$OUT")"
-printf 'timestamp,container,cpu_percent,mem_usage,mem_percent,pids\n' > "$OUT"
+if [ ! -s "$OUT" ]; then printf 'timestamp,container,cpu_percent,mem_usage,mem_percent,pids\n' > "$OUT"; fi
 SUP="${PROJECT}-supervisor"
 for _ in $(seq 1 260); do
   state=$(docker inspect -f '{{.State.Status}}' "$SUP" 2>/dev/null || echo missing)
@@ -18,6 +18,6 @@ for _ in $(seq 1 260); do
   docker stats --no-stream --format '{{.Name}},{{.CPUPerc}},{{.MemUsage}},{{.MemPerc}},{{.PIDs}}' $ids 2>/dev/null |
     while IFS=, read -r name cpu mem mempct pids; do
       printf '%s,%s,%s,%s,%s,%s\n' "$ts" "$name" "$cpu" "$mem" "$mempct" "$pids"
-    done >> "$OUT"
+    done >> "$OUT" || true
   sleep "$INTERVAL"
 done
