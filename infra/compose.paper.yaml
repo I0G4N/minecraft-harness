@@ -7,7 +7,7 @@ services:
     security_opt: &id002
     - no-new-privileges:true
     pids_limit: 128
-    mem_limit: 4g
+    mem_limit: 8g
     cpus: 2
     init: true
     restart: 'no'
@@ -22,6 +22,8 @@ services:
     environment:
       ACCEPT_EULA: ${ACCEPT_EULA:-false}
       MC_SEED: ${MC_SEED:-42}
+      JAVA_XMS: 1G
+      JAVA_XMX: 3G
     volumes:
     - ${SERVER_DATA_DIR:-./server-data}:/data
     networks:
@@ -35,7 +37,7 @@ services:
     cap_drop: *id001
     security_opt: *id002
     pids_limit: 64
-    mem_limit: 256m
+    mem_limit: 512m
     cpus: 1
     init: true
     restart: unless-stopped
@@ -65,7 +67,7 @@ services:
     cap_drop: *id001
     security_opt: *id002
     pids_limit: 64
-    mem_limit: 256m
+    mem_limit: 512m
     cpus: 1
     init: true
     restart: unless-stopped
@@ -88,7 +90,7 @@ services:
       WORKER_PORT: '3901'
       WORKER_IDENTITY_PROXY: 'true'
       WORKER_VIEWER_PORT: '3105'
-      WORKER_MAX_MEMORY: 1g
+      WORKER_MAX_MEMORY: 4g
       WORKER_IP: 172.24.0.2
     networks:
     - control
@@ -99,7 +101,7 @@ services:
     cap_drop: *id001
     security_opt: *id002
     pids_limit: 64
-    mem_limit: 256m
+    mem_limit: 512m
     cpus: 1
     init: true
     restart: unless-stopped
@@ -126,6 +128,7 @@ services:
       MAX_PROGRAM_LOG_BYTES: '67108864'
       MAX_RESULT_BYTES: '67108864'
       MAX_RESPONSE_BYTES: '268435456'
+      MAX_WORKER_RSS_BYTES: '2147483648'
       PAPER_SINGLE_PROGRAM: 'true'
     ports:
     - 127.0.0.1:3101:3001
@@ -138,7 +141,7 @@ services:
     cap_drop: *id001
     security_opt: *id002
     pids_limit: 64
-    mem_limit: 256m
+    mem_limit: 512m
     cpus: 1
     init: true
     restart: unless-stopped
@@ -168,7 +171,7 @@ services:
     cap_drop: *id001
     security_opt: *id002
     pids_limit: 64
-    mem_limit: 256m
+    mem_limit: 512m
     cpus: 1
     init: true
     restart: unless-stopped
@@ -191,7 +194,7 @@ services:
       WORKER_PORT: '3901'
       WORKER_IDENTITY_PROXY: 'true'
       WORKER_VIEWER_PORT: '3106'
-      WORKER_MAX_MEMORY: 1g
+      WORKER_MAX_MEMORY: 4g
       WORKER_IP: 172.25.0.2
     networks:
     - control
@@ -202,7 +205,7 @@ services:
     cap_drop: *id001
     security_opt: *id002
     pids_limit: 64
-    mem_limit: 256m
+    mem_limit: 512m
     cpus: 1
     init: true
     restart: unless-stopped
@@ -229,6 +232,7 @@ services:
       MAX_PROGRAM_LOG_BYTES: '67108864'
       MAX_RESULT_BYTES: '67108864'
       MAX_RESPONSE_BYTES: '268435456'
+      MAX_WORKER_RSS_BYTES: '2147483648'
       PAPER_SINGLE_PROGRAM: 'true'
     ports:
     - 127.0.0.1:3102:3001
@@ -241,7 +245,7 @@ services:
     cap_drop: *id001
     security_opt: *id002
     pids_limit: 64
-    mem_limit: 256m
+    mem_limit: 512m
     cpus: 1
     init: true
     restart: unless-stopped
@@ -271,7 +275,7 @@ services:
     cap_drop: *id001
     security_opt: *id002
     pids_limit: 64
-    mem_limit: 256m
+    mem_limit: 512m
     cpus: 1
     init: true
     restart: unless-stopped
@@ -294,7 +298,7 @@ services:
       WORKER_PORT: '3901'
       WORKER_IDENTITY_PROXY: 'true'
       WORKER_VIEWER_PORT: '3107'
-      WORKER_MAX_MEMORY: 1g
+      WORKER_MAX_MEMORY: 4g
       WORKER_IP: 172.26.0.2
     networks:
     - control
@@ -305,7 +309,7 @@ services:
     cap_drop: *id001
     security_opt: *id002
     pids_limit: 64
-    mem_limit: 256m
+    mem_limit: 512m
     cpus: 1
     init: true
     restart: unless-stopped
@@ -332,6 +336,7 @@ services:
       MAX_PROGRAM_LOG_BYTES: '67108864'
       MAX_RESULT_BYTES: '67108864'
       MAX_RESPONSE_BYTES: '268435456'
+      MAX_WORKER_RSS_BYTES: '2147483648'
       PAPER_SINGLE_PROGRAM: 'true'
     ports:
     - 127.0.0.1:3103:3001
@@ -344,7 +349,7 @@ services:
     cap_drop: *id001
     security_opt: *id002
     pids_limit: 64
-    mem_limit: 256m
+    mem_limit: 512m
     cpus: 1
     init: true
     restart: unless-stopped
@@ -374,7 +379,7 @@ services:
     cap_drop: *id001
     security_opt: *id002
     pids_limit: 64
-    mem_limit: 256m
+    mem_limit: 512m
     cpus: 1
     init: true
     restart: unless-stopped
@@ -397,7 +402,7 @@ services:
       WORKER_PORT: '3901'
       WORKER_IDENTITY_PROXY: 'true'
       WORKER_VIEWER_PORT: '3108'
-      WORKER_MAX_MEMORY: 1g
+      WORKER_MAX_MEMORY: 4g
       WORKER_IP: 172.29.0.2
     networks:
     - control
@@ -408,7 +413,7 @@ services:
     cap_drop: *id001
     security_opt: *id002
     pids_limit: 64
-    mem_limit: 256m
+    mem_limit: 512m
     cpus: 1
     init: true
     restart: unless-stopped
@@ -435,6 +440,7 @@ services:
       MAX_PROGRAM_LOG_BYTES: '67108864'
       MAX_RESULT_BYTES: '67108864'
       MAX_RESPONSE_BYTES: '268435456'
+      MAX_WORKER_RSS_BYTES: '2147483648'
       PAPER_SINGLE_PROGRAM: 'true'
     ports:
     - 127.0.0.1:3104:3001

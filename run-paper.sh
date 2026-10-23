@@ -553,7 +553,7 @@ start_container_supervisor() {
     mounts+=(-v /usr/libexec/docker/cli-plugins:/usr/libexec/docker/cli-plugins:ro)
   fi
   echo "SUPERVISOR_CONTAINER starting name=$name image=$image"
-  if ! docker run -d --name "$name" --network host --init       --user "$(id -u):$(id -g)" --group-add "${PAPER_DOCKER_GID:-999}"       "${mounts[@]}" "${env_args[@]}"       -e "PYTHONUNBUFFERED=1"       --entrypoint /bin/bash "$image"       "$H/scripts/container_supervisor.sh"       "$CONFIG" "$RUN_DIR" "$COMPOSE_FILE" "$STACK_PROJECT"       "${ENV_FILE:-}" "$LOG" "$DEST" "$H" /usr/bin/python3; then
+  if ! docker run -d --name "$name" --network host --init       --memory "${PAPER_SUPERVISOR_MEMORY:-8g}"       --user "$(id -u):$(id -g)" --group-add "${PAPER_DOCKER_GID:-999}"       "${mounts[@]}" "${env_args[@]}"       -e "PYTHONUNBUFFERED=1"       --entrypoint /bin/bash "$image"       "$H/scripts/container_supervisor.sh"       "$CONFIG" "$RUN_DIR" "$COMPOSE_FILE" "$STACK_PROJECT"       "${ENV_FILE:-}" "$LOG" "$DEST" "$H" /usr/bin/python3; then
     # Do not leave a running stack without a Supervisor when the detached
     # launch itself fails (image/daemon/name race).
     cleanup_worker_containers

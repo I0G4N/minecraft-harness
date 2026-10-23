@@ -479,7 +479,13 @@ class Supervisor:
             now = time.monotonic()
             if now >= next_sample:
                 budget = self.budget.state if self.budget else {}
-                sample = {**resources, 'storage': status,
+                worker_rss = {}
+                if self.gateway:
+                    for agent, session in self.gateway.sessions.items():
+                        value = session.get('worker_rss_bytes')
+                        if isinstance(value, int) and value >= 0:
+                            worker_rss[agent] = value
+                sample = {**resources, 'storage': status, 'worker_rss_bytes': worker_rss,
                     'budget': {key: budget.get(key) for key in ('calls', 'input_tokens', 'output_tokens', 'cost_usd', 'unknown_usage_calls')},
                     'source': 'supervisor', 'measurement': 'supervisor_python_rss_not_worker_or_server_memory'}
                 await self._copy_safely(self.recorder.append, 'resource_sample', sample,

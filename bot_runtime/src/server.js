@@ -311,7 +311,7 @@ class Session {
       if (this.lifecycle === 'paper_aligned') { this.runtimeEpoch += 1; this.reservedRuntimeEpoch = true; }
       for (const job of this.jobs.values()) if (!TERMINAL.has(job.status)) this.finishJob(job.job_id, 'interrupted', { reset_reason: child.fenceReason ?? 'worker_exit' });
       console.error('WORKER_EXIT', code, signal, Boolean(child.expectedExit), stderr.slice(-2000));
-      this.event('runtime_exit', { code, signal, expected: Boolean(child.expectedExit) });
+      this.event('runtime_exit', { code, signal, expected: Boolean(child.expectedExit), stderr_tail: stderr.slice(-2000) });
       if (!child.expectedExit && this.current?.child === child) {
         this.finish(this.current, 'interrupted', { error: { message: `Worker exited (${code ?? signal})` }, reset_reason: child.fenceReason ?? 'worker_exit' }, false).catch(() => {});
       }
