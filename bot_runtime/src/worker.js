@@ -185,6 +185,20 @@ function instrumentEmitter(target) {
   }
 }
 
+function entitySnapshot(entity) {
+  if (!entity || typeof entity !== 'object') return entity;
+  const clone = Object.create(Object.getPrototypeOf(entity));
+  Object.assign(clone, entity);
+  for (const key of ['position', 'velocity']) {
+    const vector = entity[key];
+    if (vector && typeof vector === 'object') {
+      try { clone[key] = new vector.constructor(vector.x, vector.y, vector.z); }
+      catch { clone[key] = { x: vector.x, y: vector.y, z: vector.z }; }
+    }
+  }
+  return clone;
+}
+
 function makeAgentFacingBot(real) {
   // `bot._client` exposes the raw protocol object.  Model-generated programs
   // have used it to monkey-patch sock.write/splitter.push and to change the
@@ -197,6 +211,7 @@ function makeAgentFacingBot(real) {
   const proxy = new Proxy(real, {
     get(target, prop) {
       if (hidden.has(prop)) return undefined;
+      if (prop === 'entity') return entitySnapshot(target.entity);
       if (prop === 'pathfinder' && target.pathfinder) {
         if (!pathfinderProxy) pathfinderProxy = new Proxy(target.pathfinder, {
           get(pt, p) { if (p === 'bot') return proxy; return bound(pt, Reflect.get(pt, p, pt)); },
@@ -206,7 +221,7 @@ function makeAgentFacingBot(real) {
       }
       return bound(target, Reflect.get(target, prop, target));
     },
-    set(target, prop, value) { if (hidden.has(prop)) return false; target[prop] = value; return true; },
+    set(target, prop, value) { if (hidden.has(prop) || prop === 'entity') return false; target[prop] = value; return true; },
     has(target, prop) { return hidden.has(prop) ? false : Reflect.has(target, prop); },
   });
   return proxy;
