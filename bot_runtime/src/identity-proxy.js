@@ -79,7 +79,7 @@ export async function startIdentityProxy({ host = '127.0.0.1', port = 0, targetH
   targetPort = 25565, username, gameChat = true, connectTimeoutMs = 5000, idleTimeoutMs = 90000 } = {}) {
   if (!/^[A-Za-z0-9_]{1,16}$/.test(username ?? '') || !targetHost || !Number.isInteger(targetPort) || targetPort < 1 || targetPort > 65535) throw new Error('Fixed target and username required');
   const connections = new Set(); let active = null;
-  const stats = { accepted: 0, rejected: 0, filtered: 0, invalid_movement: 0 };
+  const stats = { accepted: 0, rejected: 0, filtered: 0, invalid_movement: 0, rate_limited: 0 };
   const server = net.createServer(client => {
     client.setNoDelay(true);
     // Even pre-login sockets are bounded; an idle connection cannot allocate
@@ -88,6 +88,7 @@ export async function startIdentityProxy({ host = '127.0.0.1', port = 0, targetH
     connections.add(client);
     let upstream = null, state = 'handshaking', compression = false, pending = [], queuedBytes = 0;
     let closed = false; let connectTimer;
+    const chatTimes = [];
     const close = () => {
       if (closed) return; closed = true;
       clearTimeout(connectTimer); client.destroy(); upstream?.destroy();
@@ -157,6 +158,12 @@ export async function startIdentityProxy({ host = '127.0.0.1', port = 0, targetH
         upstream.on('data', chunk => { try { outgoing.push(chunk); } catch { reject(); } });
       }
       if (!gameChat && state === 'play' && ['chat_message', 'chat_command', 'tab_complete'].includes(name)) { stats.filtered++; return; }
+      if (state === 'play' && ['chat_message', 'chat_command', 'chat_command_signed'].includes(name)) {
+        const now = Date.now();
+        while (chatTimes.length && now - chatTimes[0] > 1000) chatTimes.shift();
+        chatTimes.push(now);
+        if (chatTimes.length > 4) { stats.rate_limited++; return; }
+      }
       if (state === 'play' && MOVEMENT_PACKET_NAMES.has(name)) {
         const invalid = inspectMovement(body, id.end, name);
         if (invalid) {
