@@ -781,7 +781,8 @@ class SupervisorModelForwarderTests(unittest.IsolatedAsyncioTestCase):
             self.assertIsNotNone(forwarder)
             socket_path = Path(captured["model_forwarder_socket"])
             self.assertTrue(socket_path.exists())
-            self.assertEqual(socket_path.parent, self.run_dir / "model-forwarder")
+            self.assertEqual(socket_path.parent.parent, (self.root / "shared").resolve())
+            self.assertTrue(socket_path.parent.name.startswith(".mc-model-forwarder-"))
             self.assertEqual(len(captured["model_forwarder_token"]), 43)
             manifest = json.loads((self.run_dir / "manifest.json").read_text())
             self.assertEqual(manifest["runner_egress"], "model_only")
@@ -807,9 +808,8 @@ class SupervisorModelForwarderTests(unittest.IsolatedAsyncioTestCase):
                     ["player1"], {"agent_interfaces": {}},
                     self.run_dir / "manifest.json", {}, None)
         self.assertIsNone(supervisor._model_forwarder)
-        model_forwarder_dir = self.run_dir / "model-forwarder"
-        socket_path = model_forwarder_dir / "socket"
-        self.assertFalse(socket_path.exists())
+        self.assertFalse(any(path.exists() for path in
+                             (self.root / "shared").rglob("socket")))
 
     def test_manifest_exposes_runner_egress(self):
         python = Supervisor(validate_config({"runtime": {"mode": "fake"}}),

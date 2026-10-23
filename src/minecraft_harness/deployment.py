@@ -71,8 +71,8 @@ async def _docker_projection(kind, identity, *, timeout_s=10):
             raise DeploymentInspectionError(f'Cannot inspect declared {kind} provenance')
         if kind == 'project':
             identities = raw.decode('ascii').split()
-            if len(identities) > 20 or len(identities) != len(set(identities)) or any(not re.fullmatch(r'[0-9a-f]{64}', value) for value in identities):
-                raise DeploymentInspectionError('Owned Compose project inventory exceeds 20 safe identities')
+            if len(identities) > 64 or len(identities) != len(set(identities)) or any(not re.fullmatch(r'[0-9a-f]{64}', value) for value in identities):
+                raise DeploymentInspectionError('Owned Compose project inventory exceeds 64 safe identities')
             return {'container_ids': identities}
         document = json.loads(raw)
         if not isinstance(document, dict):
@@ -198,7 +198,7 @@ async def capture_deployment(config, sessions, coding_containers, *, run_id):
             captured['owned_project'] = project
             inventory = await _docker_projection('project', project)
             identities = inventory.get('container_ids')
-            if not isinstance(identities, list) or len(identities) > 20 or captured['server']['container_id'] not in identities:
+            if not isinstance(identities, list) or len(identities) > 64 or captured['server']['container_id'] not in identities:
                 raise DeploymentInspectionError('Owned project inventory is missing the managed server')
             for identity in identities:
                 member = container_cache.get(identity) or await container(identity)

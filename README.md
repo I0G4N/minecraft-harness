@@ -4,7 +4,7 @@
 
 已实现 `strict` 与 `paper_aligned` 两种模式、受监管后台任务、独立 LLM Observer、编程容器、身份代理及证据/费用报告。逐节、逐图的实现追踪与差异见 [PAPER_ALIGNMENT.md](PAPER_ALIGNMENT.md)。真实 Docker worker 和 Mineflayer 隔离协议联调通过；宿主代理遗漏新 Docker 网段的原因已确认，验证时只临时豁免自建 peer 地址并全部撤销。正式部署仍需正确配置宿主代理。真实 Vanilla 和模型能力实验另行验收。
 
-paper 模式的下一次运行另见 [PI_METHOD_ALIGNMENT.md](PI_METHOD_ALIGNMENT.md)：模型可见的 prompt/工具/环境说明按论文 §2.1–2.3 的公开类别收敛（`paper-framework-v4`），内部 context/记忆/恢复借鉴 Pi 的 context projection、compaction、effect sandwich 与记忆检索；`final11` 已停止并归档；6-agent 全栈 smoke 见 SIX_AGENT_SMOKE_2026-10-23.md。
+paper 模式的下一次运行另见 [PI_METHOD_ALIGNMENT.md](PI_METHOD_ALIGNMENT.md)：模型可见的 prompt/工具/环境说明按论文 §2.1–2.3 的公开类别收敛（`paper-framework-v4`），内部 context/记忆/恢复借鉴 Pi 的 context projection、compaction、effect sandwich 与记忆检索；`final11` 已停止并归档；6-agent 全栈 smoke 见 SIX_AGENT_SMOKE_2026-10-23.md；8-agent paper-scale 性能烟测见 EIGHT_AGENT_PAPER_PERF_2026-10-23.md。
 
 ## 快速运行离线实验
 
@@ -347,7 +347,7 @@ Mineflayer bot + DeepSeek `deepseek-flash` 完成 1 Agent + LLM Observer 验证�
 费用为已知值；证据与启动要点见 `validation/2026-10-21-real-minecraft/`。4 Agent paper_aligned 与
 日尺度运行仍未验证。本机容器间游戏网络受宿主代理限制，验证时使用 host 网络、未改宿主全局策略。
 
-**2026-10-23 当前回归（宿主，无 Docker）**：全量 Python **753 passed / 3 skipped / 734
+**2026-10-23 当前回归（宿主，无 Docker）**：全量 Python **754 passed / 3 skipped / 734
 subtests**；Pi/Observer 定向 **196 passed / 119 subtests**；Node **51 passed**。3 个 skipped
 为 Docker-gated 完整 compose 测试；本窗口已用真实 DeepSeek 跑 host + container Pi
 credential smoke（synthetic Minecraft runtime；见 REAL_SMOKE_2026-10-23.md），但未跑完整

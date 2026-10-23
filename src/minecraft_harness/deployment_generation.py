@@ -63,16 +63,18 @@ def validate_project(project: str) -> str:
     return project
 
 
-def resolve_mode(agents: int, mode: str = "auto") -> str:
+def resolve_mode(agents: int, mode: str = "auto", *,
+                 allow_paper_scale: bool = False) -> str:
     validate_agent_count(agents)
     if mode not in {"auto", "paper", "strict"}:
         raise DeploymentGenerationError("mode must be auto, paper or strict")
     if mode == "auto":
         return "paper" if agents == 4 else "strict"
-    if mode == "paper" and agents != 4:
+    if mode == "paper" and agents != 4 and not allow_paper_scale:
         raise DeploymentGenerationError(
-            "paper-aligned mode is a four-player protocol; use --mode strict or "
-            "--mode auto for another agent count")
+            "paper-aligned mode is a four-player protocol; pass "
+            "--allow-paper-scale for a capacity/performance test, or use "
+            "--mode strict/auto")
     return mode
 
 
@@ -164,7 +166,8 @@ def _bot_mode_environment(environment: dict[str, str], mode: str) -> None:
 
 
 def render_compose(template: dict[str, Any] | str | Path, agents: int,
-                   project: str = "minecraft-paper", mode: str = "auto") -> dict[str, Any]:
+                   project: str = "minecraft-paper", mode: str = "auto",
+                   *, allow_paper_scale: bool = False) -> dict[str, Any]:
     """Return a Compose document with exactly ``agents`` identity/launcher/bot triples.
 
     Player-facing services inherit ``restart: unless-stopped`` so a transient
@@ -174,7 +177,7 @@ def render_compose(template: dict[str, Any] | str | Path, agents: int,
     """
     validate_agent_count(agents)
     validate_project(project)
-    mode = resolve_mode(agents, mode)
+    mode = resolve_mode(agents, mode, allow_paper_scale=allow_paper_scale)
     source = _load_yaml(template)
     services = source.get("services")
     if not isinstance(services, dict):
@@ -262,7 +265,7 @@ def render_compose(template: dict[str, Any] | str | Path, agents: int,
 
 def render_config(template: dict[str, Any] | str | Path, agents: int,
                   project: str = "minecraft-paper", mode: str = "auto",
-                  *, runner_mode: str = "container",
+                  *, runner_mode: str = "container", allow_paper_scale: bool = False,
                   server_data_dir: str | Path | None = None,
                   config_path: str | Path | None = None,
                   seed: int | None = None,
@@ -272,7 +275,7 @@ def render_config(template: dict[str, Any] | str | Path, agents: int,
     """Return a validated config for the same exact-N deployment."""
     validate_agent_count(agents)
     validate_project(project)
-    mode = resolve_mode(agents, mode)
+    mode = resolve_mode(agents, mode, allow_paper_scale=allow_paper_scale)
     if runner_mode not in {"container", "process", "inprocess"}:
         raise DeploymentGenerationError(
             "runner_mode must be container, process or inprocess")
@@ -280,6 +283,7 @@ def render_config(template: dict[str, Any] | str | Path, agents: int,
     identifiers = agent_ids(agents)
     data.setdefault("experiment", {})["name"] = project
     data["experiment"]["profile"] = "paper_aligned" if mode == "paper" else "strict"
+    data["experiment"]["paper_scale_override"] = bool(mode == "paper" and agents != 4)
     if seed is not None:
         data["experiment"]["seed"] = seed
     data.setdefault("agents", {}).update(count=agents, ids=identifiers)

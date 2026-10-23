@@ -2785,6 +2785,8 @@ class RunnerManager:
         try:
             while not self.closing:
                 await asyncio.sleep(self.poll_interval)
+                if state.get("finished_event").is_set() or state.get("result") is not None:
+                    return
                 process = state.get("process")
                 if process is None:
                     continue
@@ -2801,7 +2803,9 @@ class RunnerManager:
                         os.kill(process.pid, signal.SIGKILL)
                     except ProcessLookupError:
                         pass
-                await asyncio.sleep(0)
+                # The monitor task handles the process exit/restart. Do not
+                # emit a timeout event every poll interval for the same PID.
+                return
         except asyncio.CancelledError:
             raise
 

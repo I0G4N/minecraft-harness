@@ -362,9 +362,17 @@ def validate_config(raw: dict) -> dict:
         raise ValueError('workspace.docs_dir is not supported; locked reference documents are prepared automatically')
     if type(server['require_fresh_world']) is not bool:
         raise ValueError('server.require_fresh_world must be boolean')
+    if type(experiment.get("paper_scale_override", False)) is not bool:
+        raise ValueError("experiment.paper_scale_override must be boolean")
     if experiment["profile"] == "paper_aligned":
-        if count != 4 or rt["lifecycle"] != "paper_aligned":
-            raise ValueError("paper_aligned requires four players and runtime.lifecycle=paper_aligned")
+        # The paper protocol is four players.  An explicit scale override keeps
+        # the paper prompt/tool/lifecycle semantics for capacity and performance
+        # tests; it is not a paper replication claim.
+        if ((count != 4 and not experiment.get("paper_scale_override", False))
+                or rt["lifecycle"] != "paper_aligned"):
+            raise ValueError(
+                "paper_aligned requires four players (or experiment.paper_scale_override=true) "
+                "and runtime.lifecycle=paper_aligned")
         if server["save_interval_s"] != 300:
             raise ValueError("paper_aligned requires server.save_interval_s=300")
         if rt["mode"] == "minecraft":

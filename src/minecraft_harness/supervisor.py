@@ -1035,7 +1035,20 @@ class Supervisor:
             from .pi_model_proxy import (MODEL_FORWARDER_SOCKET_NAME,
                                          PiModelForwarder)
             forwarder_token = secrets.token_urlsafe(32)
-            forwarder_socket = self.run_dir / "model-forwarder" / MODEL_FORWARDER_SOCKET_NAME
+            runtime_settings = self.config.get("runtime") or {}
+            shared_dir = runtime_settings.get("runner_container_shared_dir")
+            if isinstance(shared_dir, str) and shared_dir.strip():
+                forwarder_dir = (Path(shared_dir).expanduser().resolve() /
+                                 (".mc-model-forwarder-" +
+                                  hashlib.sha256((self.run_dir.name + ":model").encode()).hexdigest()[:12]))
+                forwarder_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+            else:
+                forwarder_dir = self.run_dir / "model-forwarder"
+            forwarder_socket = forwarder_dir / MODEL_FORWARDER_SOCKET_NAME
+            if len(str(forwarder_socket).encode()) >= 108:
+                raise RuntimeError(
+                    "model forwarder socket path is too long; set "
+                    "runtime.runner_container_shared_dir to a short path")
             try:
                 run_stat = self.run_dir.stat()
                 owner_uid, owner_gid = run_stat.st_uid, run_stat.st_gid

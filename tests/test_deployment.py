@@ -7,7 +7,7 @@ from unittest.mock import AsyncMock, patch
 import yaml
 
 from minecraft_harness.deployment import capture_deployment, DeploymentInspectionError, _docker_projection, _CONTAINER
-from minecraft_harness.deployment_generation import render_compose
+from minecraft_harness.deployment_generation import (DeploymentGenerationError, render_compose, render_config, resolve_mode)
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -216,3 +216,24 @@ class GeneratedComposeRestartPolicyTests(unittest.TestCase):
         self.assertTrue(any(
             service["restart"] == "unless-stopped" for name, service in services.items()
             if name.startswith(("identity", "launcher", "bot"))))
+
+
+class PaperScaleOverrideTests(unittest.TestCase):
+    def test_paper_scale_override_allows_eight_agents_explicitly(self):
+        with self.assertRaises(DeploymentGenerationError):
+            resolve_mode(8, "paper")
+        self.assertEqual(resolve_mode(8, "paper", allow_paper_scale=True), "paper")
+        import tempfile
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = render_config(
+                ROOT / "configs" / "minecraft-paper-runner-20261022.yaml",
+                8, "paper8-test", mode="paper", allow_paper_scale=True,
+                server_data_dir=root / "data",
+                config_path=root / "config.yaml",
+                wall_time_minutes=5, total_model_calls=200)
+            self.assertEqual(config["experiment"]["profile"], "paper_aligned")
+            self.assertTrue(config["experiment"]["paper_scale_override"])
+            self.assertEqual(config["agents"]["count"], 8)
+            self.assertEqual(config["runtime"]["lifecycle"], "paper_aligned")
+            self.assertTrue(config["agents"]["paper_single_program"])

@@ -53,6 +53,8 @@ def _parser() -> argparse.ArgumentParser:
                         help="Docker Compose project name (default: minecraft-paper-<agents>)")
     parser.add_argument("--mode", choices=("auto", "paper", "strict"), default="auto",
                         help="auto uses paper-aligned for exactly four players, strict otherwise")
+    parser.add_argument("--allow-paper-scale", action="store_true",
+                        help="allow --mode paper for non-four player counts (capacity/perf test only)")
     parser.add_argument("--runner-mode", choices=("container", "process", "inprocess"),
                         default="container",
                         help="runtime.runner_mode written into the config (default: container)")
@@ -91,9 +93,8 @@ def main(argv=None) -> int:
     try:
         agents = validate_agent_count(args.agents)
         project = validate_project(args.project or _default_project(agents))
-        mode = resolve_mode(agents, args.mode)
-        if mode == "paper" and agents != 4:
-            raise DeploymentGenerationError("paper mode requires exactly four agents")
+        mode = resolve_mode(agents, args.mode,
+                            allow_paper_scale=args.allow_paper_scale)
         config_template = Path(args.template_config)
         compose_template = Path(args.template_compose)
         for label, path in (("compose template", compose_template),
@@ -113,10 +114,13 @@ def main(argv=None) -> int:
         server_data = Path(args.server_data).resolve()
         config_data = render_config(
             config_template, agents, project, mode,
-            runner_mode=args.runner_mode, server_data_dir=server_data,
+            runner_mode=args.runner_mode,
+            allow_paper_scale=args.allow_paper_scale,
+            server_data_dir=server_data,
             config_path=config_path, wall_time_minutes=args.wall_minutes,
             total_model_calls=args.max_calls, max_cost_usd=args.max_cost)
-        compose_data = render_compose(compose_template, agents, project, mode)
+        compose_data = render_compose(compose_template, agents, project, mode,
+                                      allow_paper_scale=args.allow_paper_scale)
         environment_text = render_env(
             agents, project, server_data_dir=server_data, seed=args.seed,
             api_key=args.api_key or os.environ.get("DEEPSEEK_API_KEY"),
