@@ -546,14 +546,12 @@ class PiE2ERuntimeTests(_PiE2EBase):
         # the child env; harness control-plane secrets are not.
         self.assertIn("PI_CODING_AGENT_DIR", child_environment_text)
 
-        # 7. Loopback-only wiring: the Pi models.json points at the loopback proxy.
+        # 7. Loopback-only wiring: Pi's local credential file was removed after
+        #    the first authenticated request, and the redaction is ledgered.
         models_path = self.state / "home" / ".pi" / "agent" / "models.json"
-        self.assertTrue(models_path.is_file())
-        models = json.loads(models_path.read_text(encoding="utf-8"))
-        provider = models["providers"]["mcproxy"]
-        self.assertEqual(provider.get("api"), "openai-completions")
-        self.assertTrue(str(provider.get("baseUrl", "")).startswith("http://127.0.0.1:"))
-        self.assertNotIn(MODEL_API_KEY, models_path.read_text(encoding="utf-8"))
+        self.assertFalse(models_path.exists())
+        self.assertIn("pi_cli_auth_redacted",
+                      [event["kind"] for event in hub.events])
         system_prompt = (self.state / "system-prompt.txt").read_text(encoding="utf-8")
         self.assertEqual(hub.ready.get("prompt_sha256"),
                          hashlib.sha256(system_prompt.encode()).hexdigest())

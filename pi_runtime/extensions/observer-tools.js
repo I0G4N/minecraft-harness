@@ -8,15 +8,40 @@
  * evidence, publish an advisory report and request repair of an environment
  * failure. It has no game client, shell, memory or web tools. Each call is
  * forwarded to the loopback bridge that the Pi Observer runner started
- * (HARNESS_PI_BRIDGE_URL/HARNESS_PI_BRIDGE_TOKEN); the bridge owns
+ * (HARNESS_PI_BRIDGE_URL + a one-shot token FD); the bridge owns
  * authentication, argument validation, permissions and the durable RPC writes,
  * so no runner token or harness path is exposed to the model.
  */
 
+import fs from "node:fs";
+
 import { Type } from "@earendil-works/pi-ai";
 
 const BRIDGE_URL = process.env.HARNESS_PI_BRIDGE_URL || "";
-const BRIDGE_TOKEN = process.env.HARNESS_PI_BRIDGE_TOKEN || "";
+// The bridge token arrives through an inherited one-shot pipe FD (never the
+// environment). Read it once during extension load and close the FD so later
+// model-directed shell commands cannot recover it from this process.
+function readBridgeToken() {
+	const fdValue = process.env.HARNESS_PI_BRIDGE_TOKEN_FD;
+	if (!fdValue) {
+		return "";
+	}
+	const fd = Number(fdValue);
+	try {
+		return fs.readFileSync(fd, "utf8").trim();
+	} catch (_error) {
+		return "";
+	} finally {
+		try {
+			fs.closeSync(fd);
+		} catch (_error) {
+			// already closed
+		}
+		delete process.env.HARNESS_PI_BRIDGE_TOKEN_FD;
+	}
+}
+
+const BRIDGE_TOKEN = readBridgeToken();
 const string = Type.String();
 const number = Type.Number();
 

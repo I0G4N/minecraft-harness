@@ -29,6 +29,7 @@ import hashlib
 import json
 import os
 import re
+import secrets
 import shutil
 import signal
 import stat
@@ -61,6 +62,15 @@ ENV_RUNNER_RPC_TIMEOUT_S = "HARNESS_RUNNER_RPC_TIMEOUT_S"
 ENV_PI_CLI = "HARNESS_PI_CLI"
 ENV_PI_CONTEXT_WINDOW = "HARNESS_PI_CONTEXT_WINDOW"
 ENV_NODE = "HARNESS_NODE"
+# The bridge token is passed through an inherited one-shot FD; only the FD
+# number (not a secret) is in the Pi environment.
+ENV_PI_BRIDGE_TOKEN_FD = "HARNESS_PI_BRIDGE_TOKEN_FD"
+# Provider apiKeys under these command-line environment entries are secrets and
+# stay out of the Pi environment: the mc wrapper sources them from a 0600 file.
+_SENSITIVE_CLI_ENV_NAMES = frozenset({"MC_AGENT_TOKEN", "MC_SUBMISSION_AUTHORITY"})
+_SENSITIVE_CLI_ENV_MARKERS = ("TOKEN", "SECRET", "PASSWORD", "API_KEY", "AUTHORITY")
+_PI_CLI_AUTH_FILE_NAMES = ("models.json", "models-store.json", "auth.json",
+                           "auth-store.json")
 
 SPEC_SCHEMA_VERSION = 1
 MAX_SPEC_BYTES = 8 * 1024 * 1024
@@ -453,7 +463,8 @@ def _system_prompt(spec: PiSpec) -> str:
     return base.rstrip() + "\n\n" + _pi_environment_appendix(spec)
 
 
-def _models_document(spec: PiSpec, proxy_base_url: str) -> dict[str, Any]:
+def _models_document(spec: PiSpec, proxy_base_url: str,
+                     api_key: str = "mcproxy-local") -> dict[str, Any]:
     prices = spec.pi_model.get("prices_per_million")
     prices = prices if isinstance(prices, dict) else {}
 
@@ -493,20 +504,75 @@ def _models_document(spec: PiSpec, proxy_base_url: str) -> dict[str, Any]:
     return {"providers": {"mcproxy": {
         "baseUrl": proxy_base_url,
         "api": "openai-completions",
-        # Literal placeholder only: the real upstream credential stays inside
-        # pi_runner/pi_model_proxy and is never written to a Pi-readable file.
-        "apiKey": "mcproxy-local",
+        # Random per-run loopback credential validated by PiModelProxy. It is
+        # not an upstream secret: the file is deleted after the first
+        # authenticated request so a model-directed shell cannot reuse it.
+        "apiKey": api_key,
         "models": [model],
     }}}
 
 
-def _mc_wrapper_text(python_executable: str) -> str:
+def _shell_quote(value: Any) -> str:
+    return "'" + str(value).replace("'", "'\\''") + "'"
+
+
+def _write_mc_env_file(path: Path, values: Mapping[str, str]) -> None:
+    """Write the CLI credential environment as a mode-0600 shell fragment."""
+    lines = [f"{name}={_shell_quote(value)}"
+             for name, value in sorted(values.items())]
+    _write_private(path, "\n".join(lines) + "\n", mode=0o600)
+
+
+def _mc_wrapper_text(python_executable: str, env_path: Path) -> str:
     quoted = python_executable.replace('"', '\\"')
     return (
         "#!/bin/sh\n"
         "# Player-scoped Mineflayer CLI provided by the Minecraft harness runner.\n"
-        f'exec "{quoted}" -m minecraft_harness.program_cli "$@"\n'
+        f"MC_ENV={_shell_quote(str(env_path))}\n"
+        'if [ -r "$MC_ENV" ]; then\n'
+        "  set -a\n"
+        '  . "$MC_ENV"\n'
+        "  set +a\n"
+        "fi\n"
+        # program_cli has no ``__main__`` guard of its own, so invoke its
+        # main() explicitly from a -c entry point.
+        f'exec "{quoted}" -c "import sys; from minecraft_harness.program_cli import main; sys.exit(main(sys.argv[1:]))" "$@"\n'
     )
+
+
+def _create_bridge_token_fd(token: str) -> int:
+    """Pipe the bridge token to the Pi child as an inheritable read FD."""
+    read_fd, write_fd = os.pipe()
+    try:
+        os.write(write_fd, (str(token) + "\n").encode("utf-8"))
+    finally:
+        os.close(write_fd)
+    os.set_inheritable(read_fd, True)
+    return read_fd
+
+
+def _scrub_pi_cli_auth_files(agent_dir: Path) -> None:
+    """Remove Pi config files that may carry the loopback apiKey.
+
+    Called once the proxy accepted the first authenticated request and again at
+    shutdown, so a model-directed shell cannot read the credential later.
+    """
+    for name in _PI_CLI_AUTH_FILE_NAMES:
+        try:
+            (agent_dir / name).unlink()
+        except FileNotFoundError:
+            continue
+        except OSError:
+            continue
+
+
+def _cli_environment_secrets(cli_environment: Mapping[str, str]) -> dict[str, str]:
+    secrets_map: dict[str, str] = {}
+    for key, value in cli_environment.items():
+        upper = key.upper()
+        if key in _SENSITIVE_CLI_ENV_NAMES or any(marker in upper for marker in _SENSITIVE_CLI_ENV_MARKERS):
+            secrets_map[key] = value
+    return secrets_map
 
 
 def _session_exists(session_dir: Path) -> bool:
@@ -709,6 +775,7 @@ def _apply_shutdown_retention(prepared: PreparedPiRunner) -> None:
         prepared.artifact_budget.flush()
     except Exception:
         pass
+    _scrub_pi_cli_auth_files(prepared.paths.agent_dir)
 
 
 def _session_guard_interval() -> float:
@@ -765,8 +832,7 @@ def _write_private(path: Path, text: str, mode: int = 0o600) -> None:
 
 
 def _child_environment(spec: PiSpec, *, home: Path, bin_dir: Path,
-                       tmp_dir: Path, bridge_url: str,
-                       bridge_token: str) -> dict[str, str]:
+                       tmp_dir: Path, bridge_url: str) -> dict[str, str]:
     parent = os.environ
     environment: dict[str, str] = {}
     for key in _FORWARDED_CHILD_ENV_KEYS:
@@ -789,15 +855,18 @@ def _child_environment(spec: PiSpec, *, home: Path, bin_dir: Path,
             entries.append(host)
     environment["NO_PROXY"] = ",".join(entries)
     environment["no_proxy"] = environment["NO_PROXY"]
-    # Player-scoped game CLI environment; the harness RPC token and upstream
-    # model credentials are deliberately absent.
+    # Player-scoped game CLI environment. Credentials among these entries stay
+    # out of the Pi environment entirely; the mc wrapper sources them from a
+    # 0600 file just for the program_cli child.
+    secret_cli_keys = set(_cli_environment_secrets(spec.cli_environment))
     for key, value in spec.cli_environment.items():
+        if key in secret_cli_keys:
+            continue
         environment[key] = value
     if spec.broker_socket and "MC_RUNTIME_SOCKET" not in environment:
         environment["MC_RUNTIME_SOCKET"] = spec.broker_socket
     environment.update({
         "HARNESS_PI_BRIDGE_URL": bridge_url,
-        "HARNESS_PI_BRIDGE_TOKEN": bridge_token,
         "PI_CODING_AGENT_DIR": str(home / ".pi" / "agent"),
         "PI_OFFLINE": "1",
         "PI_SKIP_VERSION_CHECK": "1",
@@ -868,6 +937,7 @@ class PiPaths:
     models_path: Path
     system_prompt_path: Path
     mc_wrapper_path: Path
+    mc_env_path: Path
     log_path: Path
 
 
@@ -925,6 +995,7 @@ def prepare_runner(environment: PiEnvironment, spec: PiSpec) -> PreparedPiRunner
         models_path=spec.state_root / "home" / ".pi" / "agent" / "models.json",
         system_prompt_path=spec.state_root / "system-prompt.txt",
         mc_wrapper_path=spec.state_root / "bin" / "mc",
+        mc_env_path=spec.state_root / "bin" / "mc-env",
         log_path=spec.state_root / "pi.log",
     )
     for directory in (spec.state_root, spec.workspace_root, paths.home,
@@ -968,9 +1039,23 @@ def prepare_runner(environment: PiEnvironment, spec: PiSpec) -> PreparedPiRunner
         spec.pi_artifact_max_bytes, event=_record_budget_event,
         state_path=spec.state_root / "pi-artifact-budget.json",
         rpc_client=client, agent_id=spec.agent_id)
+    # Random per-run credential for the loopback model proxy. It only protects
+    # the local endpoint from a model-directed shell; the upstream provider key
+    # stays host-side in the runner environment.
+    pi_cli_api_key = secrets.token_urlsafe(32)
+
+    def _on_first_authenticated_request() -> None:
+        _scrub_pi_cli_auth_files(paths.agent_dir)
+        _append_runner_event(client, spec.agent_id, "pi_cli_auth_redacted", {
+            "runtime": "pi", "reason": "local_proxy_key_retired",
+            "models_json_removed": True,
+        })
+
     proxy = PiModelProxy(spec.pi_model, client, agent_id=spec.agent_id,
                          role="player", purpose="agent_decision",
-                         artifact_budget=artifact_budget)
+                         artifact_budget=artifact_budget,
+                         client_api_key=pi_cli_api_key,
+                         on_client_authenticated=_on_first_authenticated_request)
     bridge: PiToolBridge | None = None
     try:
         proxy_base_url = proxy.start()
@@ -978,11 +1063,17 @@ def prepare_runner(environment: PiEnvironment, spec: PiSpec) -> PreparedPiRunner
         bridge_url = bridge.start()
         extension_path = _pi_extension_path(spec)
         system_prompt = _system_prompt(spec)
+        _scrub_pi_cli_auth_files(paths.agent_dir)
         _write_private(paths.models_path,
-                       json.dumps(_models_document(spec, proxy_base_url),
+                       json.dumps(_models_document(spec, proxy_base_url,
+                                                   pi_cli_api_key),
                                   ensure_ascii=False, indent=2) + "\n")
         _write_private(paths.system_prompt_path, system_prompt)
-        _write_private(paths.mc_wrapper_path, _mc_wrapper_text(sys.executable), mode=0o700)
+        _write_mc_env_file(paths.mc_env_path,
+                           _cli_environment_secrets(spec.cli_environment))
+        os.chmod(paths.mc_env_path, 0o600)
+        _write_private(paths.mc_wrapper_path,
+                       _mc_wrapper_text(sys.executable, paths.mc_env_path), mode=0o700)
         os.chmod(paths.mc_wrapper_path, 0o700)
         prompt_sha256 = hashlib.sha256(system_prompt.encode("utf-8")).hexdigest()
         tools_sha256 = hashlib.sha256(
@@ -995,8 +1086,7 @@ def prepare_runner(environment: PiEnvironment, spec: PiSpec) -> PreparedPiRunner
                               extension_path=extension_path)
         child_env = _child_environment(spec, home=paths.home,
                                        bin_dir=paths.bin_dir, tmp_dir=paths.tmp_dir,
-                                       bridge_url=bridge_url,
-                                       bridge_token=bridge.token)
+                                       bridge_url=bridge_url)
     except BaseException:
         if bridge is not None:
             bridge.stop()
@@ -1555,15 +1645,24 @@ async def _run_prepared(prepared: PreparedPiRunner, early_stop: threading.Event,
     stop_wait: asyncio.Task | None = None
     pump_task: asyncio.Task | None = None
     try:
+        bridge_fd = _create_bridge_token_fd(prepared.bridge.token)
+        spawn_env = dict(prepared.child_env)
+        spawn_env[ENV_PI_BRIDGE_TOKEN_FD] = str(bridge_fd)
         try:
             process = await asyncio.create_subprocess_exec(
                 *prepared.command, cwd=str(prepared.spec.workspace_root),
-                env=prepared.child_env, stdin=asyncio.subprocess.PIPE,
+                env=spawn_env, stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE, stderr=log_handle,
-                limit=PI_STREAM_LIMIT, start_new_session=True)
+                limit=PI_STREAM_LIMIT, start_new_session=True,
+                pass_fds=(bridge_fd,))
         except OSError as exc:
             raise PiRunnerError(
                 f"Could not start the Pi CLI: {exc.strerror or type(exc).__name__}") from None
+        finally:
+            try:
+                os.close(bridge_fd)
+            except OSError:
+                pass
         queue: asyncio.Queue = asyncio.Queue()
         pump_task = asyncio.create_task(_pump_stdout(process.stdout, queue),
                                         name="pi-stdout")
@@ -1666,6 +1765,10 @@ def main(argv: list[str] | None = None) -> int:
                 pass
             try:
                 prepared.proxy.stop()
+            except Exception:
+                pass
+            try:
+                _scrub_pi_cli_auth_files(prepared.paths.agent_dir)
             except Exception:
                 pass
 

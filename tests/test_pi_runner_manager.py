@@ -466,11 +466,15 @@ class PiObserverSpecTests(_ManagerFixture):
 
 class PiRunnerEgressTests(_ManagerFixture):
     def _forwarder(self):
+        import socket
+
         directory = self.root / "model-forwarder"
         directory.mkdir(parents=True, exist_ok=True)
         socket_path = directory / "socket"
         if not socket_path.exists():
-            socket_path.write_text("unix socket placeholder")
+            server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            server.bind(str(socket_path))
+            self.addCleanup(server.close)
         return socket_path
 
     def test_egress_resolution_defaults_and_overrides(self):

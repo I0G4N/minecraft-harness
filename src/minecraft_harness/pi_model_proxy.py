@@ -27,6 +27,7 @@ import json
 import os
 import select
 import socket
+import sys
 import socketserver
 import stat
 import threading
@@ -49,6 +50,10 @@ ZERO_USAGE = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
 # keeps a disconnected Pi request alive and can spend a model call after resume;
 # bound the wait and abort the attempt instead.
 ADMISSION_WAIT_TIMEOUT_S = 30.0
+# Random per-run credential Pi must present on every loopback model request.
+# Pi's models.json provider apiKey carries it; the file is removed after the
+# first authenticated request so a model-directed shell cannot read it.
+LOCAL_AUTH_SCHEME = "Bearer"
 
 MAX_REQUEST_BODY_BYTES = 16 * 1024 * 1024
 MAX_REQUEST_ARTIFACT_BYTES = 2 * 1024 * 1024
@@ -601,7 +606,9 @@ class PiModelProxy:
                  purpose: str = "agent_decision",
                  host: str = "127.0.0.1",
                  transport: httpx.BaseTransport | None = None,
-                 artifact_budget: ArtifactBudget | None = None) -> None:
+                 artifact_budget: ArtifactBudget | None = None,
+                 client_api_key: str | None = None,
+                 on_client_authenticated: Any = None) -> None:
         if not isinstance(model, dict):
             raise ValueError("Pi model config must be an object")
         self.model = model
@@ -639,6 +646,10 @@ class PiModelProxy:
         except (TypeError, ValueError):
             self.timeout_s = DEFAULT_TIMEOUT_S
         self.api_key_env = model.get("api_key_env")
+        self.client_api_key = (str(client_api_key) if client_api_key else None)
+        self._on_client_authenticated = on_client_authenticated
+        self._client_authenticated = False
+        self._auth_lock = threading.Lock()
         self.artifact_budget = (artifact_budget if artifact_budget is not None
                                 else ArtifactBudget())
         self._lock = threading.Lock()
@@ -660,8 +671,7 @@ class PiModelProxy:
         if self._server is not None:
             return self.base_url
         handler_class = type("BoundProxyHandler", (_ProxyHandler,), {"proxy": self})
-        server = ThreadingHTTPServer((self.host, 0), handler_class)
-        server.daemon_threads = True
+        server = _ProxyHTTPServer((self.host, 0), handler_class)
         port = int(server.server_address[1])
         self._server = server
         self.base_url = f"http://{self.host}:{port}/v1"
@@ -761,8 +771,38 @@ class PiModelProxy:
             self.ledger_errors += 1
 
     # -- HTTP handling --------------------------------------------------
+    def _authenticate_client(self, handler: "_ProxyHandler") -> bool:
+        """Validate the per-run Pi CLI credential on local model requests.
+
+        This is not an operator secret: it only stops a model-directed shell from
+        using the runner's loopback model proxy directly. A missing/wrong key is
+        rejected before any budget spend or upstream call.
+        """
+        if self.client_api_key is None:
+            return True
+        header = handler.headers.get("authorization", "")
+        expected = LOCAL_AUTH_SCHEME + " " + self.client_api_key
+        if not isinstance(header, str) or not hmac.compare_digest(header, expected):
+            handler._send_json(401, {"error": {
+                "message": "invalid local model proxy credential",
+                "type": "invalid_request_error"}})
+            return False
+        callback = None
+        with self._auth_lock:
+            if not self._client_authenticated:
+                self._client_authenticated = True
+                callback = self._on_client_authenticated
+        if callback is not None:
+            try:
+                callback()
+            except Exception:
+                pass
+        return True
+
     def _handle_get(self, handler: "_ProxyHandler") -> None:
         path = urlsplit(handler.path).path.rstrip("/")
+        if not self._authenticate_client(handler):
+            return
         if path == "/v1/models":
             handler._send_json(200, {"object": "list", "data": [{
                 "id": self.model_id, "object": "model", "owned_by": "mcproxy",
@@ -775,6 +815,8 @@ class PiModelProxy:
         if path != "/v1/chat/completions":
             handler._send_json(404, {"error": {"message": "not found",
                                                "type": "invalid_request_error"}})
+            return
+        if not self._authenticate_client(handler):
             return
         try:
             length = int(handler.headers.get("content-length", "0"))
@@ -1101,6 +1143,18 @@ class _ProxyHandler(BaseHTTPRequestHandler):
 # ---------------------------------------------------------------------------
 # Host-side model forwarder (restricted-egress runner containers)
 # ---------------------------------------------------------------------------
+
+class _ProxyHTTPServer(ThreadingHTTPServer):
+    """Proxy HTTP server that treats client disconnects as normal."""
+
+    daemon_threads = True
+
+    def handle_error(self, request, client_address):
+        exc = sys.exc_info()[1]
+        if isinstance(exc, (BrokenPipeError, ConnectionResetError, TimeoutError)):
+            return
+        super().handle_error(request, client_address)
+
 
 class _ForwarderHandler(BaseHTTPRequestHandler):
     """One HTTP request relayed to the configured provider by the host."""

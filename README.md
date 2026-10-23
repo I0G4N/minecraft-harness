@@ -347,12 +347,13 @@ Mineflayer bot + DeepSeek `deepseek-flash` 完成 1 Agent + LLM Observer 验证�
 费用为已知值；证据与启动要点见 `validation/2026-10-21-real-minecraft/`。4 Agent paper_aligned 与
 日尺度运行仍未验证。本机容器间游戏网络受宿主代理限制，验证时使用 host 网络、未改宿主全局策略。
 
-**2026-10-23 当前回归（宿主，无 Docker）**：全量 Python **738 passed / 3 skipped / 731
-subtests**；Pi/Observer 定向 **130 passed / 108 subtests**；Node **51 passed**。3 个 skipped
-为 Docker-gated 测试；本窗口未启动 Docker，**未做新的完整 container Pi/Compose smoke**
-（只有先前窗口一次性 smoke，不能作为本窗口证据），付费长 run 前必须用专用 Docker 窗口
-补做并记录实际 image IDs。`run-paper.sh --prepare` 的无启动镜像 probe 只覆盖
-image/Node/Pi CLI/两个 extension/Python imports，不替代真实 container Pi 短 smoke。
+**2026-10-23 当前回归（宿主，无 Docker）**：全量 Python **745 passed / 3 skipped / 734
+subtests**；Pi/Observer 定向 **189 passed / 119 subtests**；Node **51 passed**。3 个 skipped
+为 Docker-gated 完整 compose 测试；本窗口已用真实 DeepSeek 跑 host + container Pi
+credential smoke（synthetic Minecraft runtime；见 REAL_SMOKE_2026-10-23.md），但未跑完整
+4-agent compose 长测；付费长 run 前仍需专用 Docker 窗口补做完整 smoke 并记录 image IDs。
+`run-paper.sh --prepare` 的无启动镜像 probe 只覆盖 image/Node/Pi CLI/两个 extension/Python
+imports，不替代真实 container 全栈短 smoke。
 
 ```bash
 uv run python -m unittest discover -s tests -v

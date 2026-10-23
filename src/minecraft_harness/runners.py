@@ -1575,10 +1575,20 @@ class RunnerManager:
         if self.runner_egress != _RUNNER_EGRESS_MODEL_ONLY:
             return
         socket_path = self.model_forwarder_socket
-        if socket_path is None or not socket_path.is_file():
+        if socket_path is None:
+            raise RunnerControlError(
+                "restricted runner egress requires the host model forwarder socket: "
+                "unset")
+        try:
+            socket_stat = socket_path.lstat()
+        except OSError as exc:
             raise RunnerControlError(
                 "restricted runner egress requires the host model forwarder socket: " +
-                str(socket_path))
+                str(socket_path) + " (" + (exc.strerror or type(exc).__name__) + ")") from None
+        if not stat.S_ISSOCK(socket_stat.st_mode):
+            raise RunnerControlError(
+                "restricted runner egress requires the host model forwarder socket: " +
+                str(socket_path) + " is not a Unix socket")
         if not (isinstance(self.model_forwarder_token, str)
                 and len(self.model_forwarder_token) >= 16):
             raise RunnerControlError(

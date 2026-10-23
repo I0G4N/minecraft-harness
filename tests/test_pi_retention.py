@@ -58,7 +58,8 @@ def _fake_prepared(root: Path, *, session_max: int):
     append_event = lambda kind, payload: _fake_prepared.events.append((kind, payload))  # noqa: E731
     _fake_prepared.events = []
     prepared = SimpleNamespace(
-        paths=SimpleNamespace(session_dir=session_dir),
+        paths=SimpleNamespace(session_dir=session_dir,
+                              agent_dir=root / "state" / "home" / ".pi" / "agent"),
         spec=SimpleNamespace(pi_session_max_bytes=session_max,
                              agent_id="player1"),
         append_event=append_event,

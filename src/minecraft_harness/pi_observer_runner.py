@@ -30,6 +30,7 @@ import hashlib
 import json
 import os
 import re
+import secrets
 import signal
 import stat
 import sys
@@ -344,7 +345,7 @@ def _observer_command(spec: PiObserverSpec, *, prompt_path: Path, session_dir: P
 
 
 def _child_environment(*, home: Path, bin_dir: Path, tmp_dir: Path,
-                       bridge_url: str, bridge_token: str) -> dict[str, str]:
+                       bridge_url: str) -> dict[str, str]:
     parent = os.environ
     environment: dict[str, str] = {}
     for key in _FORWARDED_CHILD_ENV_KEYS:
@@ -368,7 +369,6 @@ def _child_environment(*, home: Path, bin_dir: Path, tmp_dir: Path,
     environment["no_proxy"] = environment["NO_PROXY"]
     environment.update({
         "HARNESS_PI_BRIDGE_URL": bridge_url,
-        "HARNESS_PI_BRIDGE_TOKEN": bridge_token,
         "PI_CODING_AGENT_DIR": str(home / ".pi" / "agent"),
         "PI_OFFLINE": "1",
         "PI_SKIP_VERSION_CHECK": "1",
@@ -477,9 +477,20 @@ def prepare_observer(environment: _pi.PiEnvironment,
         spec.pi_artifact_max_bytes, event=_record_artifact_retention,
         state_path=spec.state_root / "pi-artifact-budget.json",
         rpc_client=client, agent_id=spec.agent_id)
+    pi_cli_api_key = secrets.token_urlsafe(32)
+
+    def _on_first_authenticated_request() -> None:
+        _pi._scrub_pi_cli_auth_files(paths.agent_dir)
+        _pi._append_runner_event(client, spec.agent_id, "pi_cli_auth_redacted", {
+            "runtime": "pi-observer", "reason": "local_proxy_key_retired",
+            "models_json_removed": True,
+        })
+
     proxy = PiModelProxy(spec.pi_model, client, agent_id=spec.agent_id,
                          role="observer", purpose="observer_review",
-                         artifact_budget=artifact_budget)
+                         artifact_budget=artifact_budget,
+                         client_api_key=pi_cli_api_key,
+                         on_client_authenticated=_on_first_authenticated_request)
     bridge: PiObserverBridge | None = None
     try:
         proxy_base_url = proxy.start()
@@ -488,8 +499,10 @@ def prepare_observer(environment: _pi.PiEnvironment,
         bridge_url = bridge.start()
         extension_path = _extension_path(spec)
         system_prompt = _system_prompt(spec)
+        _pi._scrub_pi_cli_auth_files(paths.agent_dir)
         _pi._write_private(paths.models_path,
-                           json.dumps(_pi._models_document(spec, proxy_base_url),
+                           json.dumps(_pi._models_document(spec, proxy_base_url,
+                                                           pi_cli_api_key),
                                       ensure_ascii=False, indent=2) + "\n")
         _pi._write_private(paths.system_prompt_path, system_prompt)
         prompt_sha256 = hashlib.sha256(system_prompt.encode("utf-8")).hexdigest()
@@ -504,8 +517,7 @@ def prepare_observer(environment: _pi.PiEnvironment,
                                     extension_path=extension_path)
         child_env = _child_environment(home=paths.home, bin_dir=paths.bin_dir,
                                        tmp_dir=paths.tmp_dir,
-                                       bridge_url=bridge_url,
-                                       bridge_token=bridge.token)
+                                       bridge_url=bridge_url)
     except BaseException:
         if bridge is not None:
             bridge.stop()
@@ -959,15 +971,24 @@ async def _run_prepared(prepared: PreparedPiObserver,
     stop_wait: asyncio.Task | None = None
     pump_task: asyncio.Task | None = None
     try:
+        bridge_fd = _pi._create_bridge_token_fd(prepared.bridge.token)
+        spawn_env = dict(prepared.child_env)
+        spawn_env[_pi.ENV_PI_BRIDGE_TOKEN_FD] = str(bridge_fd)
         try:
             process = await asyncio.create_subprocess_exec(
                 *prepared.command, cwd=str(prepared.spec.workspace_root),
-                env=prepared.child_env, stdin=asyncio.subprocess.PIPE,
+                env=spawn_env, stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE, stderr=log_handle,
-                limit=PI_OBSERVER_STREAM_LIMIT, start_new_session=True)
+                limit=PI_OBSERVER_STREAM_LIMIT, start_new_session=True,
+                pass_fds=(bridge_fd,))
         except OSError as exc:
             raise PiObserverError(
                 f"Could not start the Pi CLI: {exc.strerror or type(exc).__name__}") from None
+        finally:
+            try:
+                os.close(bridge_fd)
+            except OSError:
+                pass
         queue: asyncio.Queue = asyncio.Queue()
         pump_task = asyncio.create_task(_pi._pump_stdout(process.stdout, queue),
                                         name="pi-observer-stdout")
@@ -1022,6 +1043,10 @@ async def _run_prepared(prepared: PreparedPiObserver,
         except Exception:
             pass
         try:
+            _pi._scrub_pi_cli_auth_files(prepared.paths.agent_dir)
+        except Exception:
+            pass
+        try:
             log_handle.close()
         except OSError:
             pass
@@ -1071,6 +1096,10 @@ def main(argv: list[str] | None = None) -> int:
                 pass
             try:
                 prepared.proxy.stop()
+            except Exception:
+                pass
+            try:
+                _pi._scrub_pi_cli_auth_files(prepared.paths.agent_dir)
             except Exception:
                 pass
 

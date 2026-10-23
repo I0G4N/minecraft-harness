@@ -948,5 +948,77 @@ class CentralArtifactBudgetTests(unittest.TestCase):
 
 
 
+
+class LocalProxyAuthTests(unittest.TestCase):
+    """The loopback proxy must reject shells that lack the per-run Pi credential."""
+
+    def setUp(self):
+        self.rpc = FakeRpc()
+        self.upstream = FakeUpstream()
+        self.upstream.start()
+        self.addCleanup(self.upstream.stop)
+        self.authenticated: list[int] = []
+
+    def proxy(self, key: str = "local-pi-key") -> PiModelProxy:
+        proxy = PiModelProxy(
+            {"base_url": self.upstream.base_url, "model": "upstream-model",
+             "timeout_s": 10}, self.rpc, agent_id="player1",
+            client_api_key=key,
+            on_client_authenticated=lambda: self.authenticated.append(1))
+        proxy.start()
+        self.addCleanup(proxy.stop)
+        return proxy
+
+    def post(self, proxy, headers=None):
+        client = httpx.Client(trust_env=False, timeout=10)
+        try:
+            return client.post(proxy.base_url + "/chat/completions",
+                               json=request_body(stream=False), headers=headers or {})
+        finally:
+            client.close()
+
+    def test_missing_or_wrong_credential_returns_401_without_spend(self):
+        proxy = self.proxy()
+        for headers in ({}, {"authorization": "Bearer wrong-key"},
+                        {"authorization": "local-pi-key"}):
+            with self.subTest(headers=headers):
+                response = self.post(proxy, headers)
+                self.assertEqual(response.status_code, 401)
+                self.assertEqual(json.loads(response.content)["error"]["type"],
+                                 "invalid_request_error")
+        self.assertEqual(self.upstream.requests, [])
+        self.assertEqual(self.rpc.calls_for("budget.reserve"), [])
+        self.assertEqual(self.rpc.settlements, [])
+        self.assertEqual(self.authenticated, [])
+
+    def test_models_endpoint_requires_the_credential(self):
+        proxy = self.proxy()
+        client = httpx.Client(trust_env=False, timeout=10)
+        self.addCleanup(client.close)
+        self.assertEqual(client.get(proxy.base_url + "/models").status_code, 401)
+        response = client.get(proxy.base_url + "/models", headers={
+            "authorization": "Bearer local-pi-key"})
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["data"][0]["id"], "upstream-model")
+
+    def test_correct_credential_authenticates_once_and_sets_upstream_call(self):
+        self.upstream.script = [{"kind": "sse", "chunks": sse_chunks(
+            "hello", usage=openai_usage(3, 2))}]
+        proxy = self.proxy()
+        response = self.post(proxy, {"authorization": "Bearer local-pi-key"})
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(self.rpc.settle_event.wait(5))
+        self.assertEqual(len(self.authenticated), 1)
+        # A second authenticated request does not re-trigger credential cleanup.
+        self.upstream.script = [{"kind": "sse", "chunks": sse_chunks(
+            "again", usage=openai_usage(3, 2))}]
+        self.rpc.settle_event.clear()
+        self.assertEqual(self.post(proxy, {"authorization": "Bearer local-pi-key"}).status_code,
+                         200)
+        self.assertTrue(self.rpc.settle_event.wait(5))
+        self.assertEqual(len(self.authenticated), 1)
+        self.assertEqual(len(self.upstream.requests), 2)
+
+
 if __name__ == "__main__":
     unittest.main()

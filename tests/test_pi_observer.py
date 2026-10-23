@@ -871,9 +871,11 @@ class PiObserverRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("records_read", prompt_text)
         self.assertIn("observer_report", prompt_text)
         self.assertTrue(list((state / "pi-sessions").rglob("*.jsonl")))
-        models_json = (state / "home" / ".pi" / "agent" / "models.json").read_text()
-        self.assertIn("mcproxy", models_json)
-        self.assertNotIn(TOKEN, models_json)
+        # The local proxy credential file is removed after the first
+        # authenticated request; only the redaction marker remains in the ledger.
+        self.assertFalse((state / "home" / ".pi" / "agent" / "models.json").exists())
+        self.assertIn("pi_cli_auth_redacted",
+                      [event["kind"] for event in self.hub.events])
 
     async def test_observer_artifact_budget_is_trusted_control_plane_state(self):
         spec_path = self.make_spec()
@@ -1092,14 +1094,15 @@ class PiObserverRuntimeTests(unittest.IsolatedAsyncioTestCase):
         with mock.patch.dict(os.environ, parent, clear=True):
             environment = _child_environment(
                 home=self.root / "home", bin_dir=self.root / "bin",
-                tmp_dir=self.root / "tmp", bridge_url="http://127.0.0.1:1",
-                bridge_token="bridge-token")
+                tmp_dir=self.root / "tmp", bridge_url="http://127.0.0.1:1")
         encoded = json.dumps(environment)
         for secret in ("runner-token", "sk-upstream", "sk-upstream-2",
                        "player-token", "HARNESS_RUNNER_TOKEN",
                        "MC_MODEL_API_KEY", "DEEPSEEK_API_KEY"):
             self.assertNotIn(secret, encoded)
-        self.assertEqual(environment["HARNESS_PI_BRIDGE_TOKEN"], "bridge-token")
+        self.assertNotIn("HARNESS_PI_BRIDGE_TOKEN", environment)
+        self.assertNotIn("HARNESS_PI_BRIDGE_TOKEN_FD", environment)
+        self.assertEqual(environment["HARNESS_PI_BRIDGE_URL"], "http://127.0.0.1:1")
         self.assertIn("NO_PROXY", environment)
 
 

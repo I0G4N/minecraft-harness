@@ -25,6 +25,7 @@ import json
 import os
 import shutil
 import signal
+import subprocess
 import sys
 import tempfile
 import threading
@@ -336,7 +337,10 @@ class PiRunnerRuntimeTests(unittest.IsolatedAsyncioTestCase):
             self.upstream.set_script(
                 sse_response(tool_call_delta(
                     "bash", json.dumps({"command":
-                                        "printf proof > proof.txt; env > envdump.txt; echo done"})),
+                                        "printf proof > proof.txt; env > envdump.txt; "
+                                        "cat /proc/$PPID/environ > procenv.txt 2>/dev/null || true; "
+                                        "mc --help > mc_help.txt 2>&1; echo $? > mc_exit.txt; "
+                                        "echo done"})),
                     finish_reason="tool_calls", usage=openai_usage()),
                 sse_response({"role": "assistant", "content": "the proof file exists"},
                              usage=openai_usage()),
@@ -387,16 +391,38 @@ class PiRunnerRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(model_request["purpose"], "agent_decision")
         self.assertEqual(model_request["role"], "player")
         self.assertEqual(model_request["reservation_id"], self.hub.reservations[0])
-        # The Pi child saw its player CLI environment but no harness/upstream
-        # credentials.
+        # The Pi child/bash environment carries no tokens or upstream secrets.
         envdump = (workspace / "envdump.txt").read_text()
-        self.assertIn("MC_AGENT_TOKEN=player-token", envdump)
-        self.assertNotIn("HARNESS_RUNNER_TOKEN", envdump)
-        self.assertNotIn("sk-test-secret", envdump)
-        models_json = (self.root / "state" / "home" / ".pi" / "agent" /
-                       "models.json").read_text()
-        self.assertNotIn("sk-test-secret", models_json)
-        self.assertIn("mcproxy", models_json)
+        for secret_marker in ("MC_AGENT_TOKEN", "HARNESS_RUNNER_TOKEN",
+                              "HARNESS_PI_BRIDGE_TOKEN", "sk-test-secret",
+                              "player-token"):
+            self.assertNotIn(secret_marker, envdump, secret_marker)
+        self.assertIn("MC_RUNTIME_URL", envdump)  # non-secret CLI routing remains
+        # The bridge token arrived via a one-shot FD and was closed by the
+        # extension, so neither the env nor /proc exposes it.
+        self.assertNotIn("HARNESS_PI_BRIDGE_TOKEN_FD", envdump)
+        procenv = (workspace / "procenv.txt").read_text(errors="replace")
+        # /proc/<Pi>/environ still exposes the exec-time environment, but all
+        # credential values are absent (only the now-closed FD number remains).
+        for secret_marker in ("HARNESS_RUNNER_TOKEN", "HARNESS_PI_BRIDGE_TOKEN=",
+                              "sk-test-secret", "player-token"):
+            self.assertNotIn(secret_marker, procenv, secret_marker)
+        # The mc wrapper still works: it sourced the 0600 credential file only
+        # for the program_cli child and printed its usage.
+        self.assertEqual((workspace / "mc_exit.txt").read_text().strip(), "0")
+        self.assertIn("usage", (workspace / "mc_help.txt").read_text().lower())
+        self.assertEqual((self.root / "state" / "bin" / "mc-env").stat().st_mode & 0o777,
+                         0o600)
+        # The local proxy credential file is removed after the first
+        # authenticated request, so later bash calls cannot read it.
+        agent_dir = self.root / "state" / "home" / ".pi" / "agent"
+        self.assertFalse((agent_dir / "models.json").exists())
+        self.assertIn("pi_cli_auth_redacted", kinds)
+        state_text = "\n".join(
+            path.read_text(errors="replace")
+            for path in (self.root / "state").rglob("*")
+            if path.is_file() and path.suffix in {".json", ".jsonl", ".txt", ".log"})
+        self.assertNotIn("sk-test-secret", state_text)
         # Pi session state is durable for resume.
         self.assertTrue(list((self.root / "state" / "pi-sessions").rglob("*.jsonl")))
 
@@ -545,6 +571,82 @@ class PiRunnerRuntimeTests(unittest.IsolatedAsyncioTestCase):
         document = json.loads(stderr.decode("utf-8").strip().splitlines()[-1])
         self.assertIn("__runner_error__", document)
 
+
+
+
+class McWrapperCredentialTests(unittest.TestCase):
+    """The mc wrapper sources the player token only for the program_cli child."""
+
+    def test_env_file_is_mode_0600_and_exported_only_to_the_cli_child(self):
+        from minecraft_harness import pi_runner
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            env_path = root / "mc-env"
+            pi_runner._write_mc_env_file(env_path, {
+                "MC_AGENT_TOKEN": "tok'en with space",
+                "MC_RUNTIME_URL": "http://127.0.0.1:9",
+            })
+            self.assertEqual(env_path.stat().st_mode & 0o777, 0o600)
+            fake_python = root / "fake-python"
+            fake_python.write_text(
+                "#!/bin/sh\n"
+                "printf 'TOKEN=%s\\nURL=%s\\n' \"$MC_AGENT_TOKEN\" \"$MC_RUNTIME_URL\"\n")
+            fake_python.chmod(0o700)
+            wrapper = root / "mc"
+            wrapper.write_text(pi_runner._mc_wrapper_text(str(fake_python), env_path))
+            wrapper.chmod(0o700)
+            environment = {"PATH": "/usr/bin:/bin", "HOME": str(root)}
+            completed = subprocess.run([str(wrapper)], env=environment,
+                                       capture_output=True, text=True, timeout=10)
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            self.assertIn("TOKEN=tok'en with space", completed.stdout)
+            self.assertIn("URL=http://127.0.0.1:9", completed.stdout)
+            # The wrapper itself never leaks the credential into a bare shell:
+            # only the exec'd program_cli child sees it.
+            probe = subprocess.run(
+                ["/bin/sh", "-c",
+                 "set -a; . '{}'; set +a; env".format(env_path)],
+                env=environment, capture_output=True, text=True)
+            self.assertIn("MC_AGENT_TOKEN=tok'en with space", probe.stdout)
+
+    def test_sensitive_cli_environment_is_classified_and_filtered(self):
+        from minecraft_harness import pi_runner
+
+        values = {"MC_AGENT_TOKEN": "t", "MC_SUBMISSION_AUTHORITY": "a",
+                  "MC_RUNTIME_URL": "http://x", "MC_AGENT_ID": "player1",
+                  "SOME_API_KEY": "k"}
+        secrets_map = pi_runner._cli_environment_secrets(values)
+        self.assertEqual(set(secrets_map), {"MC_AGENT_TOKEN",
+                                            "MC_SUBMISSION_AUTHORITY",
+                                            "SOME_API_KEY"})
+        self.assertNotIn("MC_RUNTIME_URL", secrets_map)
+        self.assertNotIn("MC_AGENT_ID", secrets_map)
+
+    def test_bridge_token_fd_is_an_inheritable_pipe(self):
+        from minecraft_harness import pi_runner
+
+        fd = pi_runner._create_bridge_token_fd("bridge-token-value")
+        try:
+            self.assertTrue(os.get_inheritable(fd))
+            self.assertEqual(os.read(fd, 128).decode("utf-8"),
+                             "bridge-token-value\n")
+        finally:
+            os.close(fd)
+
+    def test_scrub_removes_pi_cli_auth_files(self):
+        from minecraft_harness import pi_runner
+
+        with tempfile.TemporaryDirectory() as directory:
+            agent_dir = Path(directory)
+            for name in ("models.json", "models-store.json", "auth.json"):
+                (agent_dir / name).write_text("{}")
+            (agent_dir / "session.jsonl").write_text("{}")
+            pi_runner._scrub_pi_cli_auth_files(agent_dir)
+            self.assertFalse((agent_dir / "models.json").exists())
+            self.assertFalse((agent_dir / "models-store.json").exists())
+            self.assertFalse((agent_dir / "auth.json").exists())
+            self.assertTrue((agent_dir / "session.jsonl").exists())
 
 
 if __name__ == "__main__":
