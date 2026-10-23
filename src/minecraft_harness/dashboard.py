@@ -91,7 +91,13 @@ def artifact_page(run_dir, digest, offset=0, limit=32000):
 
 def world_image(run_dir: Path, style: str = "mesh", *, center=None, width=None, depth=None,
                 focus: str | None = None) -> tuple[bytes, dict]:
-    """Render/cache a read-only block map from the run's configured server save."""
+    """Render/cache a read-only block map from the run's configured server save.
+
+    Cache under ``run_dir/renders`` rather than ``run_dir/reports``: the
+    dashboard runs as a different UID than the Supervisor, so writing into the
+    report directory first can make the Supervisor's final report write fail
+    with EACCES (observed 2026-10-23 live test).
+    """
     manifest_path = Path(run_dir) / "manifest.json"
     manifest = json.loads(manifest_path.read_text()) if manifest_path.is_file() else {}
     config = manifest.get("config", {}) if isinstance(manifest, dict) else {}
@@ -103,10 +109,10 @@ def world_image(run_dir: Path, style: str = "mesh", *, center=None, width=None, 
     if not path.is_absolute():
         candidates = [Path(__file__).resolve().parents[2] / path, Path.cwd() / path, Path(run_dir) / path]
         path = next((candidate for candidate in candidates if candidate.exists()), candidates[0])
-    reports = Path(run_dir) / "reports"
-    if reports.is_symlink():
-        raise ValueError("report cache must not be a symlink")
-    reports.mkdir(parents=True, exist_ok=True)
+    renders = Path(run_dir) / "renders"
+    if renders.is_symlink():
+        raise ValueError("render cache must not be a symlink")
+    renders.mkdir(parents=True, exist_ok=True)
     base = 160 if style == "mesh" else 64
     view_w = int(width or base)
     view_d = int(depth or base)
@@ -117,7 +123,7 @@ def world_image(run_dir: Path, style: str = "mesh", *, center=None, width=None, 
     else:
         digest = hashlib.sha256(json.dumps([style, center, view_w, view_d], sort_keys=True).encode()).hexdigest()[:12]
         suffix = f"_{view_w}x{view_d}_{digest}"
-    png, meta_path = reports / f"world_render_{style}{suffix}.png", reports / f"world_render_{style}{suffix}.json"
+    png, meta_path = renders / f"world_render_{style}{suffix}.png", renders / f"world_render_{style}{suffix}.json"
     with _WORLD_IMAGE_LOCK:
         lock = _WORLD_IMAGE_LOCKS.setdefault((str(Path(run_dir).resolve()), style, suffix), threading.Lock())
     with lock:

@@ -175,3 +175,10 @@ ssh -N -L 8896:127.0.0.1:8896 -L 3105:127.0.0.1:3105 <user>@<server>
 本地 API：`GET /api/figures?run=<run>`（仅本机操作者访问）。测试：`tests/test_figures.py`。
 
 
+
+## 2026-10-23 世界渲染缓存位置
+
+Dashboard 的 `/api/world-image` 与 `/api/world-meta` 把 PNG/JSON 缓存写到
+`<run_dir>/renders/`，不再写入 `<run_dir>/reports/`。报告目录由 Supervisor
+独占，避免 Dashboard 容器用户与 Supervisor 用户不同导致最终报告
+`PermissionError`。旧 run 的渲染缓存可保留在 `reports/`，不影响读取。

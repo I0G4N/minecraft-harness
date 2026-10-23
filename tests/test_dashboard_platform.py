@@ -8,9 +8,10 @@ import sqlite3
 import tempfile
 import threading
 import unittest
+from unittest.mock import patch
 from urllib.parse import urlencode
 
-from minecraft_harness.dashboard import artifact_page, create_dashboard
+from minecraft_harness.dashboard import artifact_page, create_dashboard, world_image
 from minecraft_harness.dashboard_catalog import RunCatalog
 from minecraft_harness.cli import run_status
 from minecraft_harness.recorder import Recorder, atomic_json
@@ -182,3 +183,30 @@ class DashboardPlatformHTTPTests(unittest.TestCase):
         (reports / 'report.json').unlink()
         (reports / 'report.json').symlink_to(self.two / 'manifest.json')
         self.assertEqual(self.request('/download/report.json?run=one')[0], 400)
+
+
+class WorldImageCacheTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+
+    def test_world_image_cache_never_writes_into_reports(self):
+        # The dashboard runs as a different UID than the Supervisor. Its world
+        # render cache must not live in run_dir/reports, or final report
+        # creation can fail with EACCES.
+        run = make_run(self.root, 'image')
+        world = run / 'world'
+        world.mkdir()
+        manifest = json.loads((run / 'manifest.json').read_text())
+        manifest['config']['server'] = {'world_dir': str(world)}
+        (run / 'manifest.json').write_text(json.dumps(manifest))
+        with patch('minecraft_harness.dashboard.world_fingerprint',
+                   return_value={'sha256': 'fingerprint'}), \
+             patch('minecraft_harness.dashboard.render_world',
+                   side_effect=lambda path, png, **kwargs: (png.write_bytes(b'PNG'), {})[1]):
+            png, metadata = world_image(run)
+        self.assertEqual(png, b'PNG')
+        self.assertTrue((run / 'renders' / 'world_render_mesh_160.png').is_file())
+        self.assertTrue((run / 'renders' / 'world_render_mesh_160.json').is_file())
+        self.assertFalse((run / 'reports').exists())

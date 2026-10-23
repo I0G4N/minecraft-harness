@@ -160,6 +160,34 @@ class StreamingObserverTests(unittest.TestCase):
         self.assertEqual(report['failure_count'], 1005)
         self.assertEqual(report['failures_omitted'], 5)
 
+    def test_report_recovers_from_foreign_reports_directory(self):
+        # The operator dashboard may render the world map before finalization
+        # and, because it runs under a different UID, create run_dir/reports
+        # first. Reproduce EACCES on the Supervisor's temp file: the writer
+        # must preserve the foreign cache and still publish the report.
+        from unittest.mock import patch
+        reports = self.run / 'reports'
+        reports.mkdir()
+        (reports / 'world_render_mesh_160.png').write_bytes(b'cached-render')
+        real_mkstemp = tempfile.mkstemp
+        calls = {'count': 0}
+
+        def first_write_denied(*args, **kwargs):
+            calls['count'] += 1
+            if calls['count'] == 1:
+                raise PermissionError(13, 'Permission denied')
+            return real_mkstemp(*args, **kwargs)
+
+        with patch('minecraft_harness.observer.report.tempfile.mkstemp', side_effect=first_write_denied):
+            result = write_report(self.run)
+        self.assertTrue(Path(result['json']).is_file())
+        self.assertTrue(Path(result['markdown']).is_file())
+        backups = list(self.run.glob('.reports-foreign-*'))
+        self.assertEqual(len(backups), 1)
+        self.assertEqual((backups[0] / 'world_render_mesh_160.png').read_bytes(), b'cached-render')
+        self.assertFalse((self.run / 'reports' / 'world_render_mesh_160.png').exists())
+        self.assertEqual(json.loads(Path(result['json']).read_text())['event_count'], 0)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -258,3 +258,27 @@
 - 全量 Python（带 pi_runtime node_modules 与绝对 PYTHONPATH）：**759 passed, 3 skipped,
   734 subtests**；仅 `test_cli_longrun.py` 的 doctor 子进程测试在相对
   `PYTHONPATH=src` 下会环境失败，绝对路径下 1 passed。
+
+
+## 2026-10-23 live test 收尾 report 权限故障
+
+- 现象：5 分钟 live test `live-test-1` 跑满 wall，`run_finished` 为
+  `budget_exhausted`，但随后 `finalization_failed`：
+  `PermissionError: .../reports/.report.json-...`，最终 run 被覆盖为
+  `infra_failed`、`reports: {}`、supervisor rc=1。
+- 根因：Dashboard 的 `/api/world-image` 把世界渲染缓存写进
+  `<run_dir>/reports/`。Dashboard 容器创建该目录时映射为 `nobody:nogroup`，
+  Supervisor 以宿主 uid 运行，无法在目录内 `mkstemp` 写最终报告。
+- 修复：
+  - Dashboard 世界渲染缓存改到 `<run_dir>/renders/`，不再触碰 Supervisor 的
+    `reports/`；
+  - `write_report` 捕获 `PermissionError`：将 foreign `reports/` 重命名为
+    `.reports-foreign-<uuid>` 保留现场，重建 `reports/` 后重写报告；
+  - 新增回归测试：foreign reports 恢复、Dashboard 缓存不写入 reports。
+- 验证：2 分钟 `verify-dash-1` 在运行中通过 Dashboard 请求世界图，产生
+  `renders/`；结束时 `report.json`/`report.md` 正常写入，
+  `run_status=budget_exhausted`，`rc=0`，无 `finalization_failed`，栈/worker
+  全部清理；98 calls / `$0.451`。
+- 旧 `live-test-1` 已用新 fallback 手工补齐报告（原 ledger 状态保持
+  `infra_failed` 作为故障记录）。
+- 全量 Python：**761 passed, 3 skipped, 734 subtests**。

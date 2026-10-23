@@ -12,6 +12,7 @@ import sqlite3
 import re
 import os
 import tempfile
+import uuid
 from typing import Iterable
 
 from ..evaluation import evaluate
@@ -542,26 +543,47 @@ def write_report(
     if not output.is_relative_to(reports):
         raise ValueError("Observer can write only inside run_dir/reports")
     report = build_report(run_dir, evaluation_result, events, task_config)
-    output.mkdir(parents=True, exist_ok=True)
-    result = {}
-    for name, data in (("json", json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True) + "\n"), ("markdown", _markdown(report))):
-        path = output / ("report.json" if name == "json" else "report.md")
-        if path.is_symlink():
-            raise ValueError("Report destination must not be a symlink")
-        descriptor, temporary_name = tempfile.mkstemp(prefix="." + path.name + "-", dir=output)
-        temporary = Path(temporary_name)
-        try:
-            with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
-                stream.write(data)
-                stream.flush()
-                os.fsync(stream.fileno())
-            temporary.replace(path)
-            directory_fd = os.open(output, os.O_RDONLY | os.O_DIRECTORY)
+
+    def write(destination: Path) -> dict:
+        destination.mkdir(parents=True, exist_ok=True)
+        written = {}
+        for name, data in (("json", json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True) + "\n"), ("markdown", _markdown(report))):
+            path = destination / ("report.json" if name == "json" else "report.md")
+            if path.is_symlink():
+                raise ValueError("Report destination must not be a symlink")
+            descriptor, temporary_name = tempfile.mkstemp(prefix="." + path.name + "-", dir=destination)
+            temporary = Path(temporary_name)
             try:
-                os.fsync(directory_fd)
+                with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+                    stream.write(data)
+                    stream.flush()
+                    os.fsync(stream.fileno())
+                temporary.replace(path)
+                directory_fd = os.open(destination, os.O_RDONLY | os.O_DIRECTORY)
+                try:
+                    os.fsync(directory_fd)
+                finally:
+                    os.close(directory_fd)
             finally:
-                os.close(directory_fd)
-        finally:
-            temporary.unlink(missing_ok=True)
-        result[name] = str(path)
-    return result
+                temporary.unlink(missing_ok=True)
+            written[name] = str(path)
+        return written
+
+    try:
+        return write(output)
+    except PermissionError:
+        # The dashboard may have created run_dir/reports first under a
+        # different UID (the 2026-10-23 live test wrote its world-render cache
+        # there as nobody:nogroup).  The Supervisor owns the run directory, so
+        # preserve the foreign cache under a hidden name, recreate the report
+        # directory, and write the final report.  A completed experiment must
+        # not be turned into infra_failed by a cache-ownership collision.
+        backup = run_dir / (".reports-foreign-" + uuid.uuid4().hex[:12])
+        try:
+            if reports.exists():
+                reports.rename(backup)
+            reports.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            raise
+        relative = output.relative_to(reports)
+        return write(reports / relative)
