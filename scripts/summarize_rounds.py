@@ -30,10 +30,14 @@ def main() -> int:
         flags = data.get("flags") or {}
         resources = data.get("resource_samples") or {}
         server = data.get("server_log") or {}
+        budget = data.get("budget") or {}
+        cost = metrics.get("estimated_cost_usd")
+        if cost is None:
+            cost = budget.get("cost_usd")
         rows.append({"round": index, "run": str(run), "data": data,
                      "status": data.get("status"), "wall": data.get("active_wall_seconds"),
                      "calls": metrics.get("model_call_count") or flags.get("model_request"),
-                     "cost": metrics.get("estimated_cost_usd"),
+                     "cost": cost,
                      "kicks": flags.get("bot_kicked"), "sigabrt": flags.get("sigabrt"),
                      "worker_fatal": flags.get("worker_fatal"),
                      "failures": report.get("failures"),
@@ -58,7 +62,7 @@ def main() -> int:
         s = r["server"] or {}
         data = r["data"]
         lines += [f"### Round {r['round']}: `{r['run']}`", "",
-                  f"- status: `{r['status']}`; wall: {fmt(r['wall'])} s; calls: {fmt(r['calls'])}; cost: {fmt(r['cost'])} USD",
+                  f"- status: `{r['status']}`; wall: {fmt(r['wall'])} s; calls: {fmt(r['calls'])}; cost (budget subtotal if usage was unknown): {fmt(r['cost'])} USD",
                   f"- kicks: {fmt(r['kicks'])}; SIGABRT: {fmt(r['sigabrt'])}; worker_fatal: {fmt(r['worker_fatal'])}; report failures: `{r['failures']}`",
                   f"- cleanup_failed: {fmt(r['cleanup'])}; finalization_failed: {fmt(r['finalization'])}; storage: {fmt(r['storage'])} bytes; supervisor RSS max: {fmt(r['rss'])} bytes",
                   f"- runtime exit signals: `{data.get('runtime_exit_signals')}`; reset reasons: `{data.get('runtime_reset_reasons')}`; execution: `{data.get('execution_status_counts')}`; model latency p95: `{(data.get('model_latency_ms') or {}).get('p95')}` ms",
