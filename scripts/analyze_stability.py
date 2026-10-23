@@ -81,10 +81,17 @@ def main() -> int:
     server = {"available": False}
     if a.server_log and a.server_log.is_file():
         text = a.server_log.read_text(errors="replace")
+        import re
+        behind = [int(m) for m in re.findall(r"Running (\d+)ms behind", text)]
         server = {"available": True,
                   "invalid_move": text.count("Invalid move player packet"),
                   "decoder_exception": text.count("DecoderException"),
                   "moved_too_quickly": text.count("moved too quickly"),
+                  "cant_keep_up": text.count("Can't keep up!"),
+                  "max_ms_behind": max(behind) if behind else None,
+                  "lost_connection": text.count("lost connection:"),
+                  "joined_game": text.count("joined the game"),
+                  "left_game": text.count("left the game"),
                   "bytes": len(text)}
     result = {
         "run_dir": str(run),
