@@ -36,6 +36,7 @@ const send = (message) => {
   process.send(message, error => { pendingSends--; if (error) process.exit(73); });
 };
 let bot;
+let agentBot;
 let currentScope;
 const jobs = new Map();
 const controlOwners = new Map();
@@ -184,6 +185,33 @@ function instrumentEmitter(target) {
   }
 }
 
+function makeAgentFacingBot(real) {
+  // `bot._client` exposes the raw protocol object.  Model-generated programs
+  // have used it to monkey-patch sock.write/splitter.push and to change the
+  // compression threshold, which corrupts the Minecraft stream for the whole
+  // server (DecoderException/kicks).  Keep the real bot for the worker and hand
+  // the program a proxied view without raw protocol internals.
+  let pathfinderProxy;
+  const hidden = new Set(['_client', 'client', '_events', '_socket']);
+  const bound = (target, value) => typeof value === 'function' ? value.bind(target) : value;
+  const proxy = new Proxy(real, {
+    get(target, prop) {
+      if (hidden.has(prop)) return undefined;
+      if (prop === 'pathfinder' && target.pathfinder) {
+        if (!pathfinderProxy) pathfinderProxy = new Proxy(target.pathfinder, {
+          get(pt, p) { if (p === 'bot') return proxy; return bound(pt, Reflect.get(pt, p, pt)); },
+          set(pt, p, value) { if (p === 'bot') return false; pt[p] = value; return true; },
+        });
+        return pathfinderProxy;
+      }
+      return bound(target, Reflect.get(target, prop, target));
+    },
+    set(target, prop, value) { if (hidden.has(prop)) return false; target[prop] = value; return true; },
+    has(target, prop) { return hidden.has(prop) ? false : Reflect.has(target, prop); },
+  });
+  return proxy;
+}
+
 function makeFakeBot() {
   const fake = new EventEmitter();
   fake.username = config.username;
@@ -288,7 +316,7 @@ async function execute(message) {
     // still falls back to the supervisor's abort grace.
     const syncBudget = Math.max(10, Math.min(Number(message.timeout_ms) || 60000,
       (Number(message.timeout_ms) || 60000) - 100));
-    context.__paperInvoke = () => fn(bot, requireAllowed, logger, context,
+    context.__paperInvoke = () => fn(agentBot ?? bot, requireAllowed, logger, context,
       () => Boolean(scopes.getStore()?.cancelled || scopes.getStore()?.closed), config.paperSingleProgram === true ? undefined : jobAPI);
     try {
       result = await scopes.run(scope, () => {
@@ -565,6 +593,7 @@ for (const event of ['chat', 'whisper', 'death', 'respawn', 'kicked', 'end', 'er
 }
 bot.on('end', () => process.exit(1));
 instrumentEmitter(bot);
+agentBot = makeAgentFacingBot(bot);
 if (config.chatDelivery === 'program_output') {
   bot.on('chat', (username, message) => {
     pendingChat.push({ username: String(username ?? '').slice(0, 64), message: String(message ?? '').slice(0, 4096), received_at: new Date().toISOString() });

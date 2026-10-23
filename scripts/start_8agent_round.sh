@@ -13,6 +13,9 @@ DEPLOY=$(cd "${1:?deployment dir}" && pwd)
 RUN=${2:?run dir}
 LOG=${3:?log file}
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
+abspath() { python3 -c 'import os,sys; print(os.path.abspath(sys.argv[1]))' "$1"; }
+RUN=$(abspath "$RUN")
+LOG=$(abspath "$LOG")
 COMPOSE="$DEPLOY/compose.yaml"
 CONFIG="$DEPLOY/config.yaml"
 ENV_FILE="$DEPLOY/env"

@@ -94,8 +94,19 @@ export async function startIdentityProxy({ host = '127.0.0.1', port = 0, targetH
       connections.delete(client); if (active === client) active = null;
     };
     const reject = () => { stats.rejected++; close(); };
+    const draining = new WeakSet();
     const write = (destination, raw, source) => {
-      if (!destination.write(raw)) { source.pause(); destination.once('drain', () => { if (!closed) source.resume(); }); }
+      if (destination.write(raw)) return;
+      // Only one drain listener per destination.  Multiple frames can be
+      // processed from a single transport chunk; adding one listener per frame
+      // leaked drain listeners on long runs.
+      if (draining.has(destination)) return;
+      draining.add(destination);
+      source.pause();
+      destination.once('drain', () => {
+        draining.delete(destination);
+        if (!closed) source.resume();
+      });
     };
     const sendUpstream = raw => {
       if (!upstream || upstream.connecting) {
