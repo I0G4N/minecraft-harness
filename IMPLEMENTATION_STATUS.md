@@ -220,3 +220,15 @@
 - Observer 目前仍是 2GB hard-stop + alerts，不含 in-run rotation。
 - 新增 e2e：真实 Pi CLI + fake upstream，强制小 cap 触发 rotation，验证
   `pi_session_rotation_started`/`pi_session_rotated`、旧 session 归档和继续执行。
+
+
+## 2026-10-23 Supervisor 持久化修复
+
+- 18:57 run 提前结束根因：DSH 子进程 scope 收到客户端 SIGTERM，连带杀掉 wrapper/Supervisor；
+  不是模型/预算/wall/server 崩溃。
+- `run-paper.sh` 新增 `PAPER_SUPERVISOR_CONTAINER=1`：在 detached Docker 容器中运行
+  Supervisor，Docker daemon 托管，不再受 DSH/SSH 客户端断开影响。
+- 新增 `scripts/container_supervisor.sh`：容器内运行 CLI，结束后 save/stop server 并
+  `docker compose down`，记录 `SUPERVISOR_CONTAINER_EXIT`。
+- 2 分钟验证：wrapper 退出后容器继续运行，4/4 ready，运行结束 cleanup rc=0，栈已清理。
+- 说明文档：[PERSISTENT_SUPERVISOR.md](PERSISTENT_SUPERVISOR.md)

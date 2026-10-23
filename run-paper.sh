@@ -473,6 +473,36 @@ wait_server_ready() {
   fail "timed out after ${STACK_START_TIMEOUT_S}s waiting for Minecraft server readiness"
 }
 
+start_container_supervisor() {
+  # Run the long-lived Supervisor in a detached Docker container, not in the
+  # DSH/SSH client process group.  A client disconnect can SIGTERM the latter
+  # (observed 2026-10-23: systemd killed the dsh-subprocess scope at 18:57), but
+  # the Docker daemon owns this container independently.
+  local name="${PAPER_SUPERVISOR_CONTAINER_NAME:-${STACK_PROJECT}-supervisor}"
+  [ -S /var/run/docker.sock ] || fail "docker socket unavailable for container supervisor"
+  [ -f "$H/scripts/container_supervisor.sh" ] || fail "missing $H/scripts/container_supervisor.sh"
+  if docker inspect "$name" >/dev/null 2>&1; then
+    fail "supervisor container already exists: $name (stop/remove it first)"
+  fi
+  local image="$RUNNER_IMAGE"
+  local env_args=()
+  if [ -n "${ENV_FILE:-}" ] && [ -f "$ENV_FILE" ]; then
+    env_args+=(--env-file "$ENV_FILE")
+  fi
+  local mounts=(-v "$H:$H" -v "$DEST:$DEST"
+                -v /var/run/docker.sock:/var/run/docker.sock
+                -v /usr/bin/docker:/usr/bin/docker:ro)
+  if [ -d /usr/libexec/docker/cli-plugins ]; then
+    mounts+=(-v /usr/libexec/docker/cli-plugins:/usr/libexec/docker/cli-plugins:ro)
+  fi
+  echo "SUPERVISOR_CONTAINER starting name=$name image=$image"
+  if ! docker run -d --name "$name" --network host --init       --user "$(id -u):$(id -g)" --group-add "${PAPER_DOCKER_GID:-999}"       "${mounts[@]}" "${env_args[@]}"       -e "PYTHONUNBUFFERED=1"       --entrypoint /bin/bash "$image"       "$H/scripts/container_supervisor.sh"       "$CONFIG" "$RUN_DIR" "$COMPOSE_FILE" "$STACK_PROJECT"       "${ENV_FILE:-}" "$LOG" "$DEST" "$H" /usr/bin/python3; then
+    fail "could not start detached Supervisor container"
+  fi
+  echo "SUPERVISOR_CONTAINER $(docker inspect -f '{{.Id}}' "$name")"
+  echo "SUPERVISOR_LOGS docker logs -f $name"
+}
+
 bot_health_urls() {
   local parser out=""
   for parser in "$PYTHON_BIN" python3; do
@@ -573,6 +603,11 @@ wait_server_ready
 prepare_world_marker
 preflight_world
 wait_bot_health
+
+if [ "${PAPER_SUPERVISOR_CONTAINER:-0}" = "1" ]; then
+  start_container_supervisor
+  exit 0
+fi
 
 {
   echo "START $(date -u +%FT%TZ) run_dir=$RUN_DIR"
