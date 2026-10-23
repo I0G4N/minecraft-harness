@@ -297,3 +297,23 @@
   正常路径可启动/关闭。
 - 已知限制：收尾在途 model call 记为 unknown usage，report 的 token/cost 为 null；
   startup/resume 初始 fence 仍为单次请求超时。
+
+
+## 2026-10-23 长程稳定性补充修复
+
+- recovery/startup/operator checkpoint/freeze 此前仍直接调用单次 10s
+  `gateway.fence()`；长 run 中 runtime fault / server crash 后的 sandbox
+  teardown 仍可能超时。新增 `fence_with_cleanup()`，这些路径统一使用
+  bounded cleanup budget；owned/auto_spawn runtime 进程已消失时走短路径并
+  立即进入 `_fence_owned_processes`，避免离线恢复空等 60s。
+- `_resource_guard` 新增 `max_run_bytes` 50%/75%/90% 的 `storage_alert`。
+- `run-paper.sh` 新增 `$DEST/src` 与 `$H/src` source drift preflight；实测 H
+  落后会导致新 Supervisor 立即 `AttributeError`，已同步 H 并清理误拷文件。
+- 真实 server crash 恢复验证：3 分钟 run 中 kill -9 server，~23s 检测、
+  ~25s 重启并恢复 world_epoch=1、4/4 ready，最终 `budget_exhausted`、
+  reports 正常、`rc=0`、无 cleanup/finalization 失败（126 calls / $0.3517）。
+- 120 秒 offline soak：**16/16 checks passed**，3 次 runtime SIGKILL 全部恢复，
+  pause calls 稳定，pending 清空，无 live child，RSS/tracemalloc 达标。
+- 全量 Python：**763 passed, 3 skipped, 734 subtests**。
+- 仍建议正式长跑前做 1–2 小时真实 storage/RSS 曲线；在途 model call 的
+  unknown usage 会让 report token/cost 为 null（保守设计）。

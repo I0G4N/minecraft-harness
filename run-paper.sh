@@ -283,6 +283,18 @@ preflight() {
   # preflight checks and any --start would otherwise fail midway.
   docker info >/dev/null 2>&1 || fail "docker daemon is unavailable; preflight needs read-only container access (nothing was started)"
 
+  # The long-lived Supervisor imports $H/src, while this wrapper lives in
+  # $DEST.  A partial sync between the two has already caused a real run to
+  # fail immediately with AttributeError.  Refuse to start from a drifted tree
+  # unless the operator explicitly accepts the frozen deployment source.
+  if [ -z "${PAPER_ALLOW_SOURCE_DRIFT:-}" ] && [ -d "$DEST/src/minecraft_harness" ] && [ -d "$H/src/minecraft_harness" ]; then
+    local drift
+    drift="$(diff -qr --exclude='__pycache__' "$DEST/src/minecraft_harness" "$H/src/minecraft_harness" 2>/dev/null | head -5)"
+    if [ -n "$drift" ]; then
+      fail "runtime harness source drift between $DEST/src and $H/src: $drift (sync $DEST/src -> $H/src or set PAPER_ALLOW_SOURCE_DRIFT=1)"
+    fi
+  fi
+
   # A new run must use an empty run directory. This prevents silently appending
   # to another run's ledger/checkpoints.
   if [ -d "$RUN_DIR" ] && [ -n "$(find "$RUN_DIR" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null)" ]; then

@@ -157,3 +157,56 @@ uv run python scripts/gateway_fd_check.py --output validation/gateway-fd-2026102
 ```
 
 Source commit at check time: `43f3b1c`; after the check the cap was raised to 100 GiB. See the storage-risk note above.
+
+## Follow-up 2026-10-23 21:xx：真实 server 崩溃恢复 + 收尾重试
+
+本轮针对 90 分钟/更长 run 的稳定性再检查，发现并修复：
+
+1. **recovery/startup 的 session fence 仍是单次 10s**
+   - 正常 `close()` 已带 bounded retry，但 `_recover_runtime`、startup 初始 fence、
+     operator checkpoint/freeze 和 `gateway.recover/reset_world` 仍直接调用
+     `fence()`；长 run 中一次 runtime fault / server crash 后的 sandbox teardown
+     仍可能超过 10s。
+   - 修复：新增 `ExecutionGateway.fence_with_cleanup()`，上述路径统一使用同一
+     bounded cleanup budget（`close_request_timeout_s` / `close_timeout_s`）。
+   - 关键修正：对 **owned/auto_spawn** runtime，检测到 runtime 进程已消失或短
+     超时后立即让 `_fence_owned_processes` 兜底，避免把外部 runtime 的 60s
+     teardown 预算用在已死亡的进程上（离线 soak 曾因此 60s 超时）。
+
+2. **长 run 存储压力没有分级告警**
+   - `_resource_guard` 现在在 `max_run_bytes` 的 50%/75%/90% 发一次
+     `storage_alert`（含 measured/limit/free bytes），在硬上限前给 operator
+     归档/扩 cap 的时间。
+
+3. **部署源漂移会在付费 run 启动后立即失败**
+   - 真实测试时发现 DEST `src` 已更新而 H `src` 仍是旧版，Supervisor 报
+     `AttributeError: 'ExecutionGateway' object has no attribute 'fence_with_cleanup'`。
+   - `run-paper.sh` preflight 现在比较 `$DEST/src/minecraft_harness` 与
+     `$H/src/minecraft_harness`，漂移直接失败（可用
+     `PAPER_ALLOW_SOURCE_DRIFT=1` 显式接受）；H 已同步并移除了误拷到
+     `src/minecraft_harness/` 顶层的 `gateway.py`/`report.py`。
+
+### 验证
+
+- **真实 server 崩溃恢复**（`longrun-server-crash-2`）：
+  - 3 分钟 run，4/4 ready 后 `docker kill -9 paper4-smoke-server`；
+  - 21:32:02 检测到 `server readiness failed`，触发
+    `runtime_recovery_started`；
+  - 21:32:07 server 容器重新 Up，21:32:27 `runtime_recovery_completed`，
+    world_epoch=1，4/4 runtime 重新 ready，status 回到 `running`；
+  - wall 到点后 `run_status=budget_exhausted`，reports 正常写入，
+    `SUPERVISOR_CONTAINER_EXIT ... rc=0`，无 cleanup/finalization 失败；
+  - 126 calls / `$0.3517`。
+- **120 秒 offline soak**（4 agents，真实 Node，fake model）：
+  - **16/16 checks passed**，3 次 SIGKILL runtime 均恢复，pause 期间 calls 稳定，
+    pending 清空，无 live child，RSS/tracemalloc 均在阈值内；
+  - 输出：`validation/supervisor-soak-20261023-213511-b.json`。
+- 修复前的同 soak 曾因 auto_spawn runtime 已死仍在跑 60s cleanup retry 而
+  TimeoutError；修复后通过。
+
+### 仍建议
+
+- 正式 90 分钟后、更长 run 前，仍应做 1–2 小时真实 server/storage/RSS 曲线；
+- `live-test-1` 的 2 个在途 model call / 2 个 unknown usage 仍会让 report 的
+  token/cost 为 null（保守设计）；
+- `/proc` credential exposure（P1-7）仍是安全偏差，不是本轮的稳定性阻断。

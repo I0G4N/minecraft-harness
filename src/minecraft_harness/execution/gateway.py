@@ -693,6 +693,32 @@ class ExecutionGateway:
             critical = next((exc for exc in normalized if isinstance(exc, RuntimeReliabilityError)), None)
             raise critical or RuntimeUnavailable("could not confirm all old bot sessions stopped: " + str(normalized[0]))
 
+    async def fence_with_cleanup(self):
+        """Fence sessions using the bounded teardown budget.
+
+        The same slow-sandbox case applies to crash recovery, startup cleanup
+        and operator checkpoint/freeze: session DELETE may legitimately take
+        longer than an ordinary control-plane request.  ``close()`` already
+        uses this policy; recovery paths must not fall back to the fragile
+        single-attempt 10 s request timeout.
+
+        Owned (``auto_spawn``) runtimes are different: when their process is
+        gone there is no remote session registry to drain, and the caller has
+        an independent ``_fence_owned_processes`` fallback.  Waiting the full
+        external-runtime cleanup budget there would make offline crash
+        recovery (and tests) stall for a minute on connect errors.
+        """
+        close_timeout = float(self.config.get("close_timeout_s", 60))
+        close_request_timeout = float(self.config.get("close_request_timeout_s", 30))
+        if self.auto_spawn:
+            if self.runtime_instance_id and not await asyncio.to_thread(
+                    _tagged_processes, self.runtime_instance_id):
+                raise RuntimeUnavailable("owned runtime process is absent; session tail cannot be read")
+            close_timeout = min(close_timeout, 15.0)
+            close_request_timeout = min(close_request_timeout, 5.0)
+        await self.fence(request_timeout=min(close_request_timeout, close_timeout),
+                         retry_deadline=time.monotonic() + close_timeout)
+
     async def _stop_maintenance(self):
         # Transport cleanup may consume an asyncio cancellation while unwinding
         # a shielded AnyIO operation. A cancellation request alone is therefore
@@ -753,7 +779,7 @@ class ExecutionGateway:
             self.admission.clear()
             await self._stop_maintenance()
             try:
-                await self.fence()
+                await self.fence_with_cleanup()
             except RuntimeReliabilityError as exc:
                 if not self.config.get("recover_session_loss"):
                     raise
@@ -773,7 +799,7 @@ class ExecutionGateway:
         self.admission.clear()
         if not already_fenced:
             try:
-                await self.fence()
+                await self.fence_with_cleanup()
             except RuntimeUnavailable:
                 if not self.auto_spawn:
                     raise
@@ -805,12 +831,8 @@ class ExecutionGateway:
                 # between "run ended normally, worker took 12 s to stop" and a
                 # false infra_failed verdict.  A genuine protocol contradiction
                 # (RuntimeReliabilityError) is never retried.
-                close_timeout = float(self.config.get("close_timeout_s", 60))
-                close_request_timeout = float(self.config.get("close_request_timeout_s", 30))
-                close_deadline = time.monotonic() + close_timeout
                 try:
-                    await self.fence(request_timeout=min(close_request_timeout, close_timeout),
-                                     retry_deadline=close_deadline)
+                    await self.fence_with_cleanup()
                 except Exception as exc:
                     shutdown_error = exc
                     if self.auto_spawn:

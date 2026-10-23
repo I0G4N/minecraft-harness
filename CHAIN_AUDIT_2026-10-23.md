@@ -82,3 +82,19 @@ report → Dashboard / Caddy / viewer → teardown / world save。
 - 预算上限与 wall 明确（建议 wall=90min、max_cost=$5）；
 - 启动后观察 `runtime_ready`、`bot_kicked`、`model_request/response`、`resource_sample`、
   `pi_session_sample` 和最终 `cleanup_failed/finalization_failed` 事件。
+
+## 2026-10-23 21:xx 长程稳定性补充
+
+- 修复 recovery/startup/operator fence 的单次 10s 缺口；统一使用
+  `fence_with_cleanup()`，owned runtime 走短路径 + `_fence_owned_processes`
+  兜底，避免已死 runtime 让恢复等待 60s。
+- `_resource_guard` 增加 50/75/90% `storage_alert`。
+- `run-paper.sh` 增加 DEST/H source drift preflight；实测发现 H `src` 落后会
+  立即导致新 Supervisor `AttributeError`，已同步 H 并移除误拷文件。
+- 真实 server crash 恢复：3 分钟 run 中 `docker kill -9` server，检测→重启→
+  world_epoch=1→4/4 ready→wall 正常结束，`rc=0`，报告正常。
+- 120s offline soak：16/16 checks passed，3 次 runtime SIGKILL 恢复，pause
+  稳定，RSS/tracemalloc 达标。
+- 输出证据：
+  - `mc-runs/longrun-server-crash-2/`
+  - `validation/supervisor-soak-20261023-213511-b.json`

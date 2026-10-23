@@ -457,6 +457,23 @@ class Supervisor:
                 if status["world_free_bytes"] < self.config.get("storage", {}).get("min_free_disk_bytes", 268435456):
                     status["limit_exceeded"] = True
             await self._copy_safely(self.recorder.set_state, "storage", status)
+            # Long runs must surface quota pressure before the hard stop, so an
+            # operator can archive or raise the cap while the experiment runs.
+            limit_bytes = int(self.config.get("storage", {}).get("max_run_bytes") or 107374182400)
+            measured = int(status.get("measured_run_bytes") or 0)
+            for fraction in (0.5, 0.75, 0.9):
+                if measured < limit_bytes * fraction:
+                    continue
+                alert_key = f"storage_alert:{int(fraction * 100)}"
+                if await self._copy_safely(self.recorder.get_state, alert_key, False):
+                    continue
+                await self._copy_safely(self.recorder.append, 'storage_alert', {
+                    'fraction': fraction, 'measured_run_bytes': measured,
+                    'max_run_bytes': limit_bytes,
+                    'free_disk_bytes': status.get('free_disk_bytes'),
+                    'world_free_bytes': status.get('world_free_bytes')},
+                    world_epoch=self.gateway.world_epoch if self.gateway else 0)
+                await self._copy_safely(self.recorder.set_state, alert_key, True)
             if status["limit_exceeded"]:
                 raise StorageLimitError("run quota or filesystem free-space reserve exceeded")
             now = time.monotonic()
@@ -492,7 +509,7 @@ class Supervisor:
                 except Exception as exc:
                     self._record_error("pre_recovery_log_collection_failed", exc)
                 if server.container:
-                    await self.gateway.fence()
+                    await self.gateway.fence_with_cleanup()
                     await self._reconcile_world(server)
                     await server.start()
                     await self.gateway.reset_world(already_fenced=True, paused=True)
@@ -577,7 +594,7 @@ class Supervisor:
             manifest['effective_environment'] = environment
             atomic_json(manifest_path, manifest)
             if self.config["runtime"].get("url") or self.config["runtime"].get("urls"):
-                await self.gateway.fence()
+                await self.gateway.fence_with_cleanup()
             self.gateway.config['remaining_run_ms'] = max(1, int((self.budget.deadline - time.monotonic()) * 1000))
             workspaces = WorkspaceProvisioner(self.config['workspace'], self.run_dir, run_id=self.recorder.run_id)
             coding_containers = await workspaces.provision(agents + (['observer'] if self.config['observer']['mode'] == 'llm' else []))
@@ -1243,7 +1260,7 @@ class Supervisor:
             self.budget.admission.clear()
             self.gateway.admission.clear()
             self._pause_clock()
-            await self.gateway.fence()
+            await self.gateway.fence_with_cleanup()
             self.sessions_fenced = True
             if not self.frozen:
                 await self._collect(collector, server)
@@ -1290,7 +1307,7 @@ class Supervisor:
             self._pause_clock()
             await self.gateway.pause_sessions()
             if command == "freeze":
-                await self.gateway.fence()
+                await self.gateway.fence_with_cleanup()
                 self.sessions_fenced = True
                 await server.stop()
                 self.frozen = True
