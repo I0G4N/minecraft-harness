@@ -42,13 +42,16 @@ def main() -> int:
                      "rss": resources.get("supervisor_rss_bytes_max"),
                      "server": server})
     lines = ["# 8-agent paper-aligned 4-round stability report", ""]
-    lines.append("| round | status | wall s | calls | cost USD | kicks | SIGABRT | worker_fatal | report failures | cleanup | storage MiB | supervisor RSS MiB |")
-    lines.append("| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | --- | ---: | ---: | ---: |")
+    lines.append("| round | status | wall s | calls | cost USD | kicks | SIGABRT | worker_fatal | exec failed | p95 latency ms | report failures | cleanup | storage MiB | supervisor RSS MiB |")
+    lines.append("| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- | ---: | ---: | ---: |")
     for r in rows:
         storage = r["storage"] / 2**20 if isinstance(r["storage"], int) else None
         rss = r["rss"] / 2**20 if isinstance(r["rss"], int) else None
+        flags = r["data"].get("flags") or {}
+        latency = (r["data"].get("model_latency_ms") or {}).get("p95")
+        execs = r["data"].get("execution_status_counts") or {}
         lines.append(f"| {r['round']} | {r['status']} | {fmt(r['wall'])} | {fmt(r['calls'])} | {fmt(r['cost'])} | "
-                     f"{fmt(r['kicks'])} | {fmt(r['sigabrt'])} | {fmt(r['worker_fatal'])} | {r['failures']} | "
+                     f"{fmt(r['kicks'])} | {fmt(r['sigabrt'])} | {fmt(r['worker_fatal'])} | {fmt(execs.get('failed'))} | {fmt(latency)} | {r['failures']} | "
                      f"{fmt(r['cleanup'])} | {fmt(storage)} | {fmt(rss)} |")
     lines += ["", "## Per-round evidence", ""]
     for r in rows:
@@ -58,7 +61,7 @@ def main() -> int:
                   f"- status: `{r['status']}`; wall: {fmt(r['wall'])} s; calls: {fmt(r['calls'])}; cost: {fmt(r['cost'])} USD",
                   f"- kicks: {fmt(r['kicks'])}; SIGABRT: {fmt(r['sigabrt'])}; worker_fatal: {fmt(r['worker_fatal'])}; report failures: `{r['failures']}`",
                   f"- cleanup_failed: {fmt(r['cleanup'])}; finalization_failed: {fmt(r['finalization'])}; storage: {fmt(r['storage'])} bytes; supervisor RSS max: {fmt(r['rss'])} bytes",
-                  f"- runtime exit signals: `{data.get('runtime_exit_signals')}`; reset reasons: `{data.get('runtime_reset_reasons')}`",
+                  f"- runtime exit signals: `{data.get('runtime_exit_signals')}`; reset reasons: `{data.get('runtime_reset_reasons')}`; execution: `{data.get('execution_status_counts')}`; model latency p95: `{(data.get('model_latency_ms') or {}).get('p95')}` ms",
                   f"- server log: invalid_move={s.get('invalid_move')}, decoder_exception={s.get('decoder_exception')}, moved_too_quickly={s.get('moved_too_quickly')}",
                   ""]
         tails = data.get("runtime_exit_stderr_tails") or []

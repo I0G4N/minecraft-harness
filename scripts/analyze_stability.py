@@ -26,22 +26,38 @@ def main() -> int:
     signals = Counter()
     reset_reasons = Counter()
     stderr_tails = []
+    actor_events = Counter()
+    execution_status = Counter()
+    latencies = []
+    session_samples = []
     for row in con.execute("SELECT kind, payload_json FROM events"):
         kinds[row["kind"]] += 1
+        try:
+            raw = json.loads(row["payload_json"])
+        except ValueError:
+            raw = {}
+        body = raw.get("payload") if isinstance(raw.get("payload"), dict) else raw
+        actor = raw.get("actor_id") or body.get("agent_id") or body.get("actor_id")
+        if actor:
+            actor_events[str(actor)] += 1
+        if row["kind"] == "execution_finished":
+            status = body.get("status")
+            if status:
+                execution_status[str(status)] += 1
+        elif row["kind"] == "model_response":
+            latency = body.get("latency_ms")
+            if isinstance(latency, (int, float)):
+                latencies.append(float(latency))
+        elif row["kind"] == "pi_session_sample":
+            session_samples.append(body)
         if row["kind"] == "runtime_exit":
-            try:
-                payload = json.loads(row["payload_json"]).get("payload") or {}
-            except ValueError:
-                continue
+            payload = body
             if payload.get("signal"):
                 signals[str(payload["signal"])] += 1
             if payload.get("stderr_tail"):
                 stderr_tails.append({"signal": payload.get("signal"), "tail": str(payload["stderr_tail"])[:2000]})
         elif row["kind"] == "runtime_reset":
-            try:
-                reason = (json.loads(row["payload_json"]).get("payload") or {}).get("reason")
-            except ValueError:
-                reason = None
+            reason = body.get("reason")
             reset_reasons[str(reason)] += 1
     def state(key):
         row = con.execute("SELECT value_json FROM state WHERE key=?", (key,)).fetchone()
@@ -80,6 +96,15 @@ def main() -> int:
         "runtime_reset_reasons": dict(sorted(reset_reasons.items())),
         "runtime_exit_stderr_tails": stderr_tails[:20],
         "budget": budget.get("budget"),
+        "model_latency_ms": {
+            "count": len(latencies),
+            "p50": sorted(latencies)[len(latencies)//2] if latencies else None,
+            "p95": sorted(latencies)[max(0, int(len(latencies)*0.95)-1)] if latencies else None,
+            "max": max(latencies) if latencies else None,
+        },
+        "execution_status_counts": dict(sorted(execution_status.items())),
+        "actor_events": dict(sorted(actor_events.items())),
+        "pi_session_samples": session_samples[-3:],
         "report": {
             "run_status": report.get("run_status"),
             "failures": report.get("failures"),
@@ -93,7 +118,9 @@ def main() -> int:
             "supervisor_rss_bytes_min": min(rss) if rss else None,
             "supervisor_rss_bytes_max": max(rss) if rss else None,
             "worker_rss_bytes_max": max(worker_rss) if worker_rss else None,
+            "first_storage": storage[0] if storage else None,
             "last_storage": storage[-1] if storage else None,
+            "storage_growth_bytes": ((storage[-1].get("measured_run_bytes") or 0) - (storage[0].get("measured_run_bytes") or 0)) if len(storage) >= 2 else None,
         },
         "server_log": server,
         "flags": {
@@ -117,6 +144,7 @@ def main() -> int:
         },
     }
     out = a.output or (run / "reports" / "stability-analysis.json")
+    out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(json.dumps(result, ensure_ascii=False, indent=2) + "\n")
     print(json.dumps({"output": str(out), "status": result["status"], "flags": result["flags"]}, ensure_ascii=False))
     return 0
