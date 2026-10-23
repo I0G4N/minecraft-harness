@@ -15,7 +15,7 @@ for _ in $(seq 1 260); do
   ids=$(docker ps -q --filter "label=com.docker.compose.project=$PROJECT" 2>/dev/null || true)
   ids="$ids $(docker ps -q --filter "name=mc-worker-${PROJECT}-" 2>/dev/null || true)"
   # shellcheck disable=SC2086
-  docker stats --no-stream --format '{{.Name}},{{.CPUPerc}},{{.MemUsage}},{{.MemPercent}},{{.PIDs}}' $ids 2>/dev/null |
+  docker stats --no-stream --format '{{.Name}},{{.CPUPerc}},{{.MemUsage}},{{.MemPerc}},{{.PIDs}}' $ids 2>/dev/null |
     while IFS=, read -r name cpu mem mempct pids; do
       printf '%s,%s,%s,%s,%s,%s\n' "$ts" "$name" "$cpu" "$mem" "$mempct" "$pids"
     done >> "$OUT"
