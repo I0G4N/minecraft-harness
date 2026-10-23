@@ -7,7 +7,7 @@
 - 玩家和 Observer 都使用真实 Pi coding-agent CLI（`runtime.runner_runtime: pi`，RPC 模式）：Pi 负责 loop/session/context/compaction；玩家工具为 built-in read/write/edit/bash + memory/web extension，游戏只经 `mc exec --file`；Observer 使用只读 `records_read/evidence_read/observer_report/infra_issue`，无 bash/mc/team-memory/broker。Python 只保留 Supervisor、ledger、budget、Minecraft gateway 和 python-mode 回退。下一轮 `minecraft-paper-runner-20261022.yaml` 已切 `runner_runtime: pi` + container。`pi_runtime` 依赖 pin 到 1.4.0，首次部署需 `npm ci --prefix pi_runtime`。
 - 内部仍保留 Python runtime 的 Pi 风格 context projection / compaction / branch summary / effect sandwich：工具先写 `tool_intent`（仅参数 SHA256），崩溃后 `tool_effect_unknown` 且不重放；团队记忆 FTS5 ranked `memory_search`。这些只在 `runner_runtime=python` 或 Observer 路径使用。
 - 长程稳定性：单玩家 model/infra 失败按 `agent_failure_policy=isolate` 记录 `agent_degraded` 并继续；Observer 失败默认 `observer_degraded` 降级；pause 不再消耗 wall budget；web 调用受 `budgets.max_web_calls` 限制；runner RPC 有默认超时；Compose 的 identity/launcher/bot 使用 `unless-stopped`；runner 重启加载 `run_dir/source-snapshot` 冻结源码。runner-mode Observer 通过 ledger 重要事件在 ≤1 s 内唤醒 review。
-- 验证：Python **754 passed, 3 skipped, 734 subtests**；Pi/Observer 定向 **196 passed / 119 subtests**（含真实 Pi CLI host e2e、memory/web extension、fixture observer bridge/RPC、session/artifact retention）；Node **51 passed**。**本窗口已跑真实 DeepSeek 的 host + container Pi credential smoke**（synthetic Minecraft runtime；见 REAL_SMOKE_2026-10-23.md）：host 15/15 model/tool、container 13/13 model + 15/15 tool，均无 token/key 泄漏；3 个 Docker-gated 完整 compose 测试仍 skipped；已跑 6-agent 真实 Minecraft 全栈 smoke（6/6 runtime_ready，40/40 model，52/51 tools，0 infrastructure_error），详见 SIX_AGENT_SMOKE_2026-10-23.md。`run-paper.sh --prepare` 现在会在 compose up 之前检查**两个** Pi extension（`minecraft-tools.js` + `observer-tools.js`），并跑一次无启动容器镜像 probe（Node ≥ 22 / Pi CLI / 两扩展 / Python imports，`docker run --rm --network none`）；Docker 不可用时只报告并拒绝启动。`final11` 已停止并归档（旧 Supervisor 退出、compose down，run 目录保留）；6-agent smoke 已完成。`run-paper.sh` 默认只 prepare，`--start` 才启动。
+- 验证：Python **757 passed, 3 skipped, 734 subtests**；Pi/Observer 定向 **196 passed / 119 subtests**（含真实 Pi CLI host e2e、memory/web extension、fixture observer bridge/RPC、session/artifact retention）；Node **51 passed**。**本窗口已跑真实 DeepSeek 的 host + container Pi credential smoke**（synthetic Minecraft runtime；见 REAL_SMOKE_2026-10-23.md）：host 15/15 model/tool、container 13/13 model + 15/15 tool，均无 token/key 泄漏；3 个 Docker-gated 完整 compose 测试仍 skipped；已跑 6-agent 真实 Minecraft 全栈 smoke（6/6 runtime_ready，40/40 model，52/51 tools，0 infrastructure_error），详见 SIX_AGENT_SMOKE_2026-10-23.md。`run-paper.sh --prepare` 现在会在 compose up 之前检查**两个** Pi extension（`minecraft-tools.js` + `observer-tools.js`），并跑一次无启动容器镜像 probe（Node ≥ 22 / Pi CLI / 两扩展 / Python imports，`docker run --rm --network none`）；Docker 不可用时只报告并拒绝启动。`final11` 已停止并归档（旧 Supervisor 退出、compose down，run 目录保留）；6-agent smoke 已完成。`run-paper.sh` 默认只 prepare，`--start` 才启动。
 - 详细设计、偏差与验收命令见 [PI_METHOD_ALIGNMENT.md](PI_METHOD_ALIGNMENT.md) 第 9 节。
 
 ## 2026-10-21 真实模型复核与修复（独立运行）
@@ -125,7 +125,7 @@
 - Pi session/artifact retention：session 启动剪枝/活跃超限轮转，artifact 共享预算超限转 metadata-only；paper run 配置 1 GB/8 GB。
 - Observer：`runner_runtime=pi` 时改用 `pi_observer_runner.py` + observer 只读 tool bridge/ServiceHub RPC，Python ObserverAgent 仅作回退。
 - 安全审计 F1–F6 已修（PID1 env、artifact grant 所有权、viewed-event 证据、report key 注入、bridge 错误泄漏、infra issue id/kinds）。
-- 验证：754 passed / 3 skipped / 734 subtests；Pi/Observer 定向 196 passed / 119 subtests。本窗口真实 DeepSeek host+container Pi credential smoke 均通过（synthetic runtime；见 REAL_SMOKE_2026-10-23.md）；3 个 Docker-gated 完整 compose 测试仍 skipped；已跑 6-agent 真实 Minecraft 全栈 smoke（6/6 runtime_ready，40/40 model，52/51 tools，0 infrastructure_error），详见 SIX_AGENT_SMOKE_2026-10-23.md。`run-paper.sh --prepare` 新增无启动镜像 probe：要求两个 Pi extension，检查 Node ≥ 22 / Pi CLI / Python imports，Docker 不可用或 probe 失败即拒绝 `--start`。
+- 验证：757 passed / 3 skipped / 734 subtests；Pi/Observer 定向 196 passed / 119 subtests。本窗口真实 DeepSeek host+container Pi credential smoke 均通过（synthetic runtime；见 REAL_SMOKE_2026-10-23.md）；3 个 Docker-gated 完整 compose 测试仍 skipped；已跑 6-agent 真实 Minecraft 全栈 smoke（6/6 runtime_ready，40/40 model，52/51 tools，0 infrastructure_error），详见 SIX_AGENT_SMOKE_2026-10-23.md。`run-paper.sh --prepare` 新增无启动镜像 probe：要求两个 Pi extension，检查 Node ≥ 22 / Pi CLI / Python imports，Docker 不可用或 probe 失败即拒绝 `--start`。
 
 ### 已知残余与未验证（2026-10-23，accepted / 后续 task）
 
@@ -140,7 +140,7 @@
 - P1-2：mid-stream SSE 不再二次 HTTP 响应/终止符，只有 model_error + 一次 UNKNOWN settle。
 - P1-3：paper pi+container 默认 `runner_egress=model_only`：runner `--network none`，host UDS PiModelForwarder 只转发 `/v1/chat/completions`，provider key 不进入 runner env。
 - P1-4：ArtifactBudget 持久化（含 metadata）、玩家/Observer 关闭 retention、90% pressure、paper 5-agent 40GB < 51.5GB 上限。
-- P2：wrapper 双 extension + no-start image probe；docs 当前 754 passed / 3 skipped / 734 subtests；bridge/MC token、active-session 无自动轮转、完整 Docker 全栈 smoke 仍是 residual。
+- P2：wrapper 双 extension + no-start image probe；docs 当前 757 passed / 3 skipped / 734 subtests；bridge/MC token、active-session 无自动轮转、完整 Docker 全栈 smoke 仍是 residual。
 
 ## 2026-10-23 Pi 本地凭据隔离 + 真实烟测
 
@@ -158,7 +158,7 @@
   - recovery/server-health 期间的 pause/freeze control 会取消该 operation 并立即应用 control；
   - recovery 失败增加 backoff；达到 `max_recoveries` 后停止自动 recovery，等待 operator pause/stop/resume；
   - resume 清除 paused/recovery-exhausted gate。
-- 测试：新增 pause/resume control unit test；全量 **754 passed / 3 skipped / 734 subtests**。
+- 测试：新增 pause/resume control unit test；全量 **757 passed / 3 skipped / 734 subtests**。
 - `final11` 已停止并归档；新代码只影响未来启动的 Supervisor。
 
 
@@ -176,3 +176,18 @@
 - 链路发现：provider latency 是模型链主因；tool 长尾来自 Minecraft program；运行中
   player1 停止后 heartbeat watcher 仍反复记录 timeout（已修复为 finished 后退出）。
 - 报告：[EIGHT_AGENT_PAPER_PERF_2026-10-23.md](EIGHT_AGENT_PAPER_PERF_2026-10-23.md)
+
+
+## 2026-10-23 8-agent fixes / optimization
+
+- 修复 runner 停止后 `_heartbeat_watch` 仍反复记录 `runner_heartbeat_timeout`
+  的问题（finished 后直接退出）；新增回归测试。
+- 修复 shutdown 时 Observer 等在途 `budget.pending` 永不结算：新增
+  `Budget.recover_all_pending()`，按 unknown usage 保守计费并清空，新增测试。
+- Pi model proxy 复用每个 runner 的 `httpx.Client`/连接池（含 UDS forwarder），
+  减少每轮模型调用的连接握手开销。
+- server 增加 `spigot.yml`（`moved-too-quickly-multiplier=100`），降低 8-agent
+  并发下 Mineflayer 移动被 `invalid_player_movement` kick 的概率；镜像已重建。
+- 8-agent 2 分钟复测：8/8 ready、9 runners、157/153 model、181/176 tools、
+  **0 bot kick、0 heartbeat timeout、pending {}**、0 infrastructure_error。
+- 全量 Python：**757 passed, 3 skipped, 734 subtests**。

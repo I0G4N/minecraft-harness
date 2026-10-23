@@ -432,6 +432,13 @@ class ModelProxyTests(unittest.TestCase):
         }, ensure_ascii=False)
         self.assertNotIn(secret, visible)
 
+    def test_upstream_http_client_is_reused_and_closed_on_stop(self):
+        proxy = self.proxy()
+        first = proxy._upstream_client()
+        second = proxy._upstream_client()
+        self.assertIs(first, second)
+        proxy.stop()
+        self.assertIsNone(proxy._http_client)
 
 
 class _BoomStream(httpx.SyncByteStream):

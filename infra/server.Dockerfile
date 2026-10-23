@@ -5,6 +5,7 @@ RUN groupadd --gid 1000 minecraft && useradd --uid 1000 --gid 1000 --no-create-h
 RUN command -v timeout && command -v flock && command -v stat
 COPY .cache/server-1.20.4.jar /opt/minecraft/server.jar
 COPY server.properties /opt/minecraft/server.properties
+COPY spigot.yml /opt/minecraft/spigot.yml
 COPY server-entrypoint.sh /opt/minecraft/entrypoint.sh
 COPY harness-control /usr/local/bin/harness-control
 RUN chmod 0755 /usr/local/bin/harness-control

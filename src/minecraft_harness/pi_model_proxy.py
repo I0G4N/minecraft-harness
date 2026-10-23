@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import contextlib
 import json
 import os
 import select
@@ -673,6 +674,8 @@ class PiModelProxy:
         self.closed = False
         self._server: ThreadingHTTPServer | None = None
         self._thread: threading.Thread | None = None
+        self._http_client: httpx.Client | None = None
+        self._http_client_lock = threading.Lock()
         self.base_url = ""
 
     # -- lifecycle ------------------------------------------------------
@@ -692,8 +695,30 @@ class PiModelProxy:
         thread.start()
         return self.base_url
 
+    def _upstream_client(self) -> httpx.Client:
+        """Reuse the provider connection pool across Pi turns.
+
+        Pi issues one model call after another for an agent. Creating and
+        tearing down an httpx client (and a Unix-socket connection for the
+        forwarder path) on every turn adds avoidable handshake latency to the
+        model chain. The client is thread-safe for this proxy's request rate.
+        """
+        with self._http_client_lock:
+            if self._http_client is None:
+                self._http_client = httpx.Client(
+                    timeout=self.timeout_s, transport=self._transport,
+                    trust_env=(self.forwarder_socket is None
+                               and not _is_loopback_url(self.upstream_url)))
+            return self._http_client
+
     def stop(self) -> None:
         self.closed = True
+        client, self._http_client = self._http_client, None
+        if client is not None:
+            try:
+                client.close()
+            except Exception:
+                pass
         server, self._server = self._server, None
         if server is not None:
             try:
@@ -991,12 +1016,10 @@ class PiModelProxy:
                 if api_key:
                     headers["authorization"] = "Bearer " + api_key
             try:
-                with httpx.Client(
-                        timeout=self.timeout_s, transport=self._transport,
-                        # A Unix-socket forwarder is not a network URL: never let
-                        # ambient proxy env vars (or NO_PROXY parsing) affect it.
-                        trust_env=(self.forwarder_socket is None
-                                   and not _is_loopback_url(self.upstream_url))) as client:
+                # Reuse one client per proxy; close it in stop(). Do not use a
+                # context manager here, as that would tear down the pool after
+                # every turn.
+                with contextlib.nullcontext(self._upstream_client()) as client:
                     with client.stream("POST", self.upstream_url, content=encoded,
                                        headers=headers) as response:
                         sent = True

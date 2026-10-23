@@ -165,14 +165,14 @@ mtime 与 18:33 一致，`runner_*` 事件为 0。
 | 长程稳定性 | `supervisor.py`、`budget.py`、`runner_rpc.py`、`agents/web.py`、`deployment_generation.py`、`infra/compose*.yaml`、`tests/test_stability.py` | 62 passed（定向）；RPC 3.12 回归 23 passed |
 | source snapshot + runner 预算接线 | `runners.py`、`runner.py`、`tests/test_source_snapshot.py`、`tests/test_runner_entry.py` | 77 passed（-k not container）；3 个 Docker gate 跳过 |
 | **Pi RPC 玩家/Observer runtime** | `pi_runner.py`、`pi_observer_runner.py`、`pi_model_proxy.py`、`pi_tool_bridge.py`、`pi_observer_bridge.py`、`pi_security.py`、`runners.py`、`config.py`、`supervisor.py`、`pi_runtime/extensions/*.js`、`tests/test_pi_*.py`、`test_observer_rpc.py` | Pi/Observer 定向 **196 passed / 119 subtests**（memory/web、retention、Observer bridge/RPC、host e2e）；paper-runner config 已切 `runner_runtime: pi` + container |
-| 全量回归（Pi 接线后） | 宿主 `.test-venv`（3.12） | **754 passed, 3 skipped, 734 subtests**；Pi/Observer 定向 196 passed / 119 subtests |
+| 全量回归（Pi 接线后） | 宿主 `.test-venv`（3.12） | **757 passed, 3 skipped, 734 subtests**；Pi/Observer 定向 196 passed / 119 subtests |
 
 验收命令（宿主，不启动实验 / 不启动 Docker）：
 
 ```bash
 cd /ssd_data/caizihao/minecraft/zkdx/experiments/minecraft_harness
 PYTHONPATH=$PWD/src:$PWD/.venv/lib/python3.11/site-packages \
-  .test-venv/bin/python -m pytest -q          # 754 passed, 3 skipped, 734 subtests
+  .test-venv/bin/python -m pytest -q          # 757 passed, 3 skipped, 734 subtests
 PYTHONPATH=$PWD/src:$PWD/.venv/lib/python3.11/site-packages \
   .test-venv/bin/python -m pytest -q \
   tests/test_pi_model_proxy.py tests/test_pi_runner_manager.py \
@@ -183,7 +183,7 @@ npm test --prefix bot_runtime                 # 51 passed（上一窗口）
 已知剩余边界（下一轮正式 run 前应记录为 deviation）：
 
 - 全量 suite 已恢复绿色：`test_pi_runner_manager.py` 的旧断言已更新为
-  paper-runner=pi / whole-session=python；当前 754 passed, 3 skipped, 734 subtests。
+  paper-runner=pi / whole-session=python；当前 757 passed, 3 skipped, 734 subtests。
 - 模型/主机仍是 DeepSeek `deepseek-flash` + 同机容器，不是 Gemini 4 Argon + 5 台 cloud machine。
 - Docker-gated runner 容器测试（3 个）本窗口仍未执行（skipped，未启动 Docker）；source snapshot
   的容器挂载由单元测试覆盖，正式 run 前应在专用窗口跑 gated 测试。
@@ -401,7 +401,7 @@ reserve/settle 恰好一次、ready/heartbeat/finished、SIGTERM 干净收尾、
   advisory-only），active 轮询 ledger important event 或 interval。
 - **安全审计**：[AUDIT_2026-10-23_OBSERVER_SECURITY.md](AUDIT_2026-10-23_OBSERVER_SECURITY.md)
   的 F1–F6 全部修复：容器 PID1 env、artifact grant 所有权、viewed-event 证据绑定、报告
-  key 注入、bridge 错误泄漏、infra_issue issue_id/kind。全量 **754 passed, 3 skipped,
+  key 注入、bridge 错误泄漏、infra_issue issue_id/kind。全量 **757 passed, 3 skipped,
   734 subtests**；Pi/Observer 定向 **196 passed / 119 subtests**。完整 4-agent compose
   长测仍待专用 Docker 窗口。
 
@@ -428,7 +428,7 @@ reserve/settle 恰好一次、ready/heartbeat/finished、SIGTERM 干净收尾、
   90% artifact/session pressure 事件；paper 配置每 agent 6 GB artifacts + 1 GB session +
   1 GB archive，5 agents session/archive 共 10 GB + artifacts global cap < 51.5 GB run cap。
 - **P2**：wrapper preflight 要求两个 Pi extension 并在 compose 前做 no-start image probe；
-  docs 统一到当前 full suite **754 passed, 3 skipped, 734 subtests**（3 个 Docker-gated
+  docs 统一到当前 full suite **757 passed, 3 skipped, 734 subtests**（3 个 Docker-gated
   skip）；bridge/MC token、active-session 无自动轮转、完整容器 smoke 未执行均明确记录为
   residual。
 
@@ -486,3 +486,11 @@ reserve/settle 恰好一次、ready/heartbeat/finished、SIGTERM 干净收尾、
 - 链路：model p50 1.64s / p95 5.83s；tool p50 207ms / p95 30.67s；bot health
   p50 1.60ms；supervisor RSS ~310MiB；容器 CPU peak ~193%；run dir +68.7MB/5min。
   详见 [EIGHT_AGENT_PAPER_PERF_2026-10-23.md](EIGHT_AGENT_PAPER_PERF_2026-10-23.md)。
+
+
+## 16. 2026-10-23 修复与性能优化
+
+- heartbeat watcher 在 agent finished 后退出；budget shutdown 清空在途 pending。
+- Pi model proxy 复用 httpx.Client/连接池；server 增加 spigot 移动容忍配置。
+- 8-agent 2 分钟复测 0 heartbeat timeout / 0 bot kick / pending 空；全量
+  Python 757 passed / 3 skipped。

@@ -22,6 +22,9 @@ if [ ! -f /data/server.properties ]; then
         fi
     fi
 fi
+if [ ! -f /data/spigot.yml ] && [ -f /opt/minecraft/spigot.yml ]; then
+    cp /opt/minecraft/spigot.yml /data/spigot.yml
+fi
 printf 'eula=true\n' > /data/eula.txt
 control=${HARNESS_CONTROL_DIR:-/tmp/harness-control}
 mkdir -p "$control"

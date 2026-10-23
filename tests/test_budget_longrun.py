@@ -99,3 +99,15 @@ class BudgetLongRunTests(unittest.IsolatedAsyncioTestCase):
         persisted = self.recorder.get_state("budget", {})
         self.assertEqual(persisted.get("calls", 0), 0)
         self.assertEqual(self.recorder.latest_event_seq(), 0)
+
+    async def test_recover_all_pending_charges_each_agent_once(self):
+        budget = Budget(self.config, self.recorder)
+        await budget.reserve("alice")
+        await budget.reserve("observer", purpose="observer_review", role="observer")
+        self.assertEqual(len(budget.state["pending"]), 2)
+        self.assertEqual(await budget.recover_all_pending(), 2)
+        self.assertFalse(budget.state["pending"])
+        self.assertEqual(budget.state["unknown_usage_calls"], 2)
+        # A second shutdown pass is idempotent.
+        self.assertEqual(await budget.recover_all_pending(), 0)
+        self.assertFalse(budget.state["pending"])

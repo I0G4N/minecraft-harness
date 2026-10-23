@@ -255,6 +255,23 @@ class Budget:
                     raise
                 self.state = updated
 
+    async def recover_all_pending(self):
+        """Settle every still-pending admission at shutdown.
+
+        An in-flight provider call can outlive the shutdown grace window (for
+        example the Observer's final review). Leaving its reservation pending
+        makes the terminal budget state look stuck and excludes the worst-case
+        call from cost accounting. Charge each as unknown usage once, then clear
+        it, matching crash recovery semantics.
+        """
+        agents = sorted({pending.get("agent_id") for pending in
+                         list(self.state.get("pending", {}).values())
+                         if isinstance(pending, dict) and pending.get("agent_id")})
+        recovered = 0
+        for agent in agents:
+            recovered += await self.recover_abandoned(agent)
+        return recovered
+
     async def recover_abandoned(self, agent_id):
         """Charge and release reservations left by a dead runner process.
 

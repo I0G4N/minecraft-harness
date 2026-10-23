@@ -868,6 +868,15 @@ class Supervisor:
                         self._record_error("resource_guard_failed", guard_error)
                     guard.cancel()
                     await asyncio.gather(guard, return_exceptions=True)
+                if self.budget:
+                    recover_pending = getattr(self.budget, "recover_all_pending", None)
+                    if recover_pending is not None:
+                        try:
+                            # Any in-flight model admission that outlived the
+                            # bounded shutdown grace must not remain pending.
+                            await recover_pending()
+                        except Exception as exc:
+                            self._record_error("budget_cleanup_failed", exc)
                 if self.gateway:
                     try:
                         await self.gateway.close(fence=owned)

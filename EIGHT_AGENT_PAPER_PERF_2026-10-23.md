@@ -78,14 +78,13 @@ Other samples:
 4. **Heartbeat-timeout noise after an agent stopped**: `player1` stopped at
    ~06:37:34, but the heartbeat watcher repeatedly logged
    `runner_heartbeat_timeout` for its old PID every 5 s from 06:40:29 onward
-   (9 events) even though the process had already finished. This was a bug in
-   `_heartbeat_watch`: it did not break when `finished_event`/result existed.
-   Fixed after this run (the watcher now exits); the 8-agent run was not re-run
-   after the fix.
+   (9 events) even though the process had already finished. Fixed in
+   `_heartbeat_watch` (returns once `finished_event`/result exists); validated
+   by the 2-minute 8-agent recheck below: **0 heartbeat timeouts**.
 5. **Observer call was still reserved at shutdown**: budget state had one
    pending observer reservation with reserved cost 3.0 when the run ended.
-   The observer was stopped by the wall budget; settlement/cleanup of that
-   in-flight call should be audited for long-run accounting.
+   Fixed by `Budget.recover_all_pending()` during Supervisor shutdown; validated
+   by the recheck: final budget `pending: {}`.
 6. **Tool/monitoring chain is not the bottleneck**: bot health RTT <5 ms and
    ledger/artifact append throughput handled 263 model calls in five minutes.
 
@@ -105,3 +104,28 @@ Other samples:
 - For 54h: monitor model p95, tool p95, run-dir growth (~14 MB/min at this load),
   supervisor RSS/CPU, and heartbeat timeout rate; set higher
   `runner_heartbeat_timeout_s` / backpressure if 8+ agents are used.
+
+
+## Fix validation: 2-minute 8-agent recheck (after fixes)
+
+A fresh 8-player paper-scale deployment (`paper8-recheck`, fresh
+`server-data-9`, ports 3401..3416) was run after the fixes:
+
+- 8/8 players `runtime_ready`, 9 runners ready.
+- **model_request / model_response: 157 / 153**
+- **tool_intent / tool_result: 181 / 176**
+- `bot_kicked`: **0**
+- `runner_heartbeat_timeout`: **0**
+- final budget `pending`: **{}**
+- `infrastructure_error`: **0**
+- status: `budget_exhausted` (2-minute wall configuration).
+
+The recheck also loaded the new `spigot.yml`
+(`moved-too-quickly-multiplier=100.0`), eliminating the
+`multiplayer.disconnect.invalid_player_movement` kicks seen in the earlier
+5-minute run. The 2-minute run did not produce an Observer report (expected
+for this short window); the 5-minute run produced two.
+
+The model path now reuses one `httpx.Client` per Pi proxy across turns instead
+of recreating a connection pool (and UDS connection for the forwarder path) on
+every model call.

@@ -821,5 +821,27 @@ class SupervisorModelForwarderTests(unittest.IsolatedAsyncioTestCase):
 
 
 
+class RunnerHeartbeatWatchTests(unittest.IsolatedAsyncioTestCase):
+    async def test_watcher_returns_without_timeout_noise_after_agent_finished(self):
+        manager = object.__new__(RunnerManager)
+        manager.closing = False
+        manager.poll_interval = 0.001
+        manager.heartbeat_timeout = 0.0
+        manager.runner_mode = "process"
+        manager.states = {
+            "player1": {
+                "process": types.SimpleNamespace(pid=987654),
+                "last_heartbeat": 0.0,
+                "finished_event": asyncio.Event(),
+                "result": {"status": "stopped"},
+            }
+        }
+        manager.states["player1"]["finished_event"].set()
+        records = []
+        manager._record = lambda kind, payload: records.append((kind, payload))
+        await manager._heartbeat_watch("player1")
+        self.assertEqual(records, [])
+
+
 if __name__ == "__main__":
     unittest.main()
