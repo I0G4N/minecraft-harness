@@ -193,3 +193,17 @@
   recheck model p50 1.31s / p95 4.17s / max 7.84s（此前 5min run 为 1.64/5.83/18.19，
   非受控对比）。
 - 全量 Python：**757 passed, 3 skipped, 734 subtests**。
+
+
+## 2026-10-23 长程稳定性检查
+
+- 300 秒离线 4-agent Supervisor soak（真实 Node、fake model、3 次 SIGKILL、2 次
+  pause/resume）：16/16 检查通过，4,447 次 model call 全部结算、pending 空，
+  3 次恢复均在 <0.7s；Python RSS 峰值 88.8 MiB、tracemalloc 净增长 0.59 MiB。
+- 长程定向测试 87 passed / 73 subtests；Node 51 passed；FD 12 轮 start/close
+  回到 7 FD；全量 Python 757 passed / 3 skipped。
+- 结论：离线编排/恢复/预算/暂停/进程生命周期 PASS；**不能替代 54h 真实 Minecraft**。
+- 主要残余风险：真实 run 存储增长（8-agent 5min 约 85 MiB，24GiB run cap 需实测）、
+  active Pi session cap 只停止不自动轮转/告警、真实 server crash/长时 provider 故障未注入、
+  8-agent Supervisor RSS 峰值约 310 MiB 无硬上限。
+- 报告：[LONGRUN_STABILITY_CHECK_2026-10-23.md](LONGRUN_STABILITY_CHECK_2026-10-23.md)
