@@ -492,5 +492,5 @@ reserve/settle 恰好一次、ready/heartbeat/finished、SIGTERM 干净收尾、
 
 - heartbeat watcher 在 agent finished 后退出；budget shutdown 清空在途 pending。
 - Pi model proxy 复用 httpx.Client/连接池；server 增加 spigot 移动容忍配置。
-- 8-agent 2 分钟复测 0 heartbeat timeout / 0 bot kick / pending 空；全量
-  Python 757 passed / 3 skipped。
+- 8-agent 2 分钟复测 0 heartbeat timeout / 0 bot kick / pending 空；recheck
+  model p50 1.31s / p95 4.17s；全量 Python 757 passed / 3 skipped。

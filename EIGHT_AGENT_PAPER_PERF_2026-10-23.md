@@ -128,4 +128,7 @@ for this short window); the 5-minute run produced two.
 
 The model path now reuses one `httpx.Client` per Pi proxy across turns instead
 of recreating a connection pool (and UDS connection for the forwarder path) on
-every model call.
+every model call. The recheck's 153 matched request/response pairs had
+p50 **1.31 s**, p95 **4.17 s**, max **7.84 s** (the earlier 5-minute run had
+p50 1.64 s / p95 5.83 s / max 18.19 s; different window and concurrency, so
+this is directional rather than a controlled benchmark).

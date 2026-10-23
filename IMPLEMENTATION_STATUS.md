@@ -189,5 +189,7 @@
 - server 增加 `spigot.yml`（`moved-too-quickly-multiplier=100`），降低 8-agent
   并发下 Mineflayer 移动被 `invalid_player_movement` kick 的概率；镜像已重建。
 - 8-agent 2 分钟复测：8/8 ready、9 runners、157/153 model、181/176 tools、
-  **0 bot kick、0 heartbeat timeout、pending {}**、0 infrastructure_error。
+  **0 bot kick、0 heartbeat timeout、pending {}**、0 infrastructure_error；
+  recheck model p50 1.31s / p95 4.17s / max 7.84s（此前 5min run 为 1.64/5.83/18.19，
+  非受控对比）。
 - 全量 Python：**757 passed, 3 skipped, 734 subtests**。
