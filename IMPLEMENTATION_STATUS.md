@@ -7,7 +7,7 @@
 - 玩家和 Observer 都使用真实 Pi coding-agent CLI（`runtime.runner_runtime: pi`，RPC 模式）：Pi 负责 loop/session/context/compaction；玩家工具为 built-in read/write/edit/bash + memory/web extension，游戏只经 `mc exec --file`；Observer 使用只读 `records_read/evidence_read/observer_report/infra_issue`，无 bash/mc/team-memory/broker。Python 只保留 Supervisor、ledger、budget、Minecraft gateway 和 python-mode 回退。下一轮 `minecraft-paper-runner-20261022.yaml` 已切 `runner_runtime: pi` + container。`pi_runtime` 依赖 pin 到 1.4.0，首次部署需 `npm ci --prefix pi_runtime`。
 - 内部仍保留 Python runtime 的 Pi 风格 context projection / compaction / branch summary / effect sandwich：工具先写 `tool_intent`（仅参数 SHA256），崩溃后 `tool_effect_unknown` 且不重放；团队记忆 FTS5 ranked `memory_search`。这些只在 `runner_runtime=python` 或 Observer 路径使用。
 - 长程稳定性：单玩家 model/infra 失败按 `agent_failure_policy=isolate` 记录 `agent_degraded` 并继续；Observer 失败默认 `observer_degraded` 降级；pause 不再消耗 wall budget；web 调用受 `budgets.max_web_calls` 限制；runner RPC 有默认超时；Compose 的 identity/launcher/bot 使用 `unless-stopped`；runner 重启加载 `run_dir/source-snapshot` 冻结源码。runner-mode Observer 通过 ledger 重要事件在 ≤1 s 内唤醒 review。
-- 验证：Python **753 passed, 3 skipped, 734 subtests**；Pi/Observer 定向 **196 passed / 119 subtests**（含真实 Pi CLI host e2e、memory/web extension、fixture observer bridge/RPC、session/artifact retention）；Node **51 passed**。**本窗口已跑真实 DeepSeek 的 host + container Pi credential smoke**（synthetic Minecraft runtime；见 REAL_SMOKE_2026-10-23.md）：host 15/15 model/tool、container 13/13 model + 15/15 tool，均无 token/key 泄漏；3 个 Docker-gated 完整 compose 测试仍 skipped，完整 4-agent compose 长测仍未执行。`run-paper.sh --prepare` 现在会在 compose up 之前检查**两个** Pi extension（`minecraft-tools.js` + `observer-tools.js`），并跑一次无启动容器镜像 probe（Node ≥ 22 / Pi CLI / 两扩展 / Python imports，`docker run --rm --network none`）；Docker 不可用时只报告并拒绝启动。`final11` 由旧 Supervisor 进程托管，当前观察为 `recovering`（原为 paused，manifest 未变、runner_* 为 0、无新 model/tool 调用）；新 pause/recovery 修复需重启 Supervisor 才生效。`run-paper.sh` 默认只 prepare，`--start` 才启动。
+- 验证：Python **753 passed, 3 skipped, 734 subtests**；Pi/Observer 定向 **196 passed / 119 subtests**（含真实 Pi CLI host e2e、memory/web extension、fixture observer bridge/RPC、session/artifact retention）；Node **51 passed**。**本窗口已跑真实 DeepSeek 的 host + container Pi credential smoke**（synthetic Minecraft runtime；见 REAL_SMOKE_2026-10-23.md）：host 15/15 model/tool、container 13/13 model + 15/15 tool，均无 token/key 泄漏；3 个 Docker-gated 完整 compose 测试仍 skipped；已跑 6-agent 真实 Minecraft 全栈 smoke（6/6 runtime_ready，40/40 model，52/51 tools，0 infrastructure_error），详见 SIX_AGENT_SMOKE_2026-10-23.md。`run-paper.sh --prepare` 现在会在 compose up 之前检查**两个** Pi extension（`minecraft-tools.js` + `observer-tools.js`），并跑一次无启动容器镜像 probe（Node ≥ 22 / Pi CLI / 两扩展 / Python imports，`docker run --rm --network none`）；Docker 不可用时只报告并拒绝启动。`final11` 已停止并归档（旧 Supervisor 退出、compose down，run 目录保留）；6-agent smoke 已完成。`run-paper.sh` 默认只 prepare，`--start` 才启动。
 - 详细设计、偏差与验收命令见 [PI_METHOD_ALIGNMENT.md](PI_METHOD_ALIGNMENT.md) 第 9 节。
 
 ## 2026-10-21 真实模型复核与修复（独立运行）
@@ -125,7 +125,7 @@
 - Pi session/artifact retention：session 启动剪枝/活跃超限轮转，artifact 共享预算超限转 metadata-only；paper run 配置 1 GB/8 GB。
 - Observer：`runner_runtime=pi` 时改用 `pi_observer_runner.py` + observer 只读 tool bridge/ServiceHub RPC，Python ObserverAgent 仅作回退。
 - 安全审计 F1–F6 已修（PID1 env、artifact grant 所有权、viewed-event 证据、report key 注入、bridge 错误泄漏、infra issue id/kinds）。
-- 验证：753 passed / 3 skipped / 734 subtests；Pi/Observer 定向 196 passed / 119 subtests。本窗口真实 DeepSeek host+container Pi credential smoke 均通过（synthetic runtime；见 REAL_SMOKE_2026-10-23.md）；3 个 Docker-gated 完整 compose 测试仍 skipped，完整 4-agent compose 长测仍未执行。`run-paper.sh --prepare` 新增无启动镜像 probe：要求两个 Pi extension，检查 Node ≥ 22 / Pi CLI / Python imports，Docker 不可用或 probe 失败即拒绝 `--start`。
+- 验证：753 passed / 3 skipped / 734 subtests；Pi/Observer 定向 196 passed / 119 subtests。本窗口真实 DeepSeek host+container Pi credential smoke 均通过（synthetic runtime；见 REAL_SMOKE_2026-10-23.md）；3 个 Docker-gated 完整 compose 测试仍 skipped；已跑 6-agent 真实 Minecraft 全栈 smoke（6/6 runtime_ready，40/40 model，52/51 tools，0 infrastructure_error），详见 SIX_AGENT_SMOKE_2026-10-23.md。`run-paper.sh --prepare` 新增无启动镜像 probe：要求两个 Pi extension，检查 Node ≥ 22 / Pi CLI / Python imports，Docker 不可用或 probe 失败即拒绝 `--start`。
 
 ### 已知残余与未验证（2026-10-23，accepted / 后续 task）
 
@@ -159,4 +159,4 @@
   - recovery 失败增加 backoff；达到 `max_recoveries` 后停止自动 recovery，等待 operator pause/stop/resume；
   - resume 清除 paused/recovery-exhausted gate。
 - 测试：新增 pause/resume control unit test；全量 **753 passed / 3 skipped / 734 subtests**。
-- 注意：`final11` 仍由**旧代码进程**托管，仍显示 `recovering`；新代码只影响未来启动/重启的 Supervisor。
+- `final11` 已停止并归档；新代码只影响未来启动的 Supervisor。
