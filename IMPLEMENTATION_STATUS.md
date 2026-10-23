@@ -317,3 +317,39 @@
 - 全量 Python：**763 passed, 3 skipped, 734 subtests**。
 - 仍建议正式长跑前做 1–2 小时真实 storage/RSS 曲线；在途 model call 的
   unknown usage 会让 report token/cost 为 null（保守设计）。
+
+
+## 2026-10-23 20 分钟真实 run
+
+- run `test20-1`（fresh world，4 players + Observer，detached Supervisor）跑满
+  wall：report `wall_time_s=1175.3s`，active wall `1203.4s`。
+- 最终 `run_status=budget_exhausted`，`failures=[]`；969 model calls，
+  budget `$1.2332`（1 个 unknown usage，因此 report token/cost 为 null）。
+- 907 executions：562 succeeded / 297 failed / 42 interrupted / 5 timed out /
+  1 cancelled；7 deaths、30 chat、64 bot kicks、64 context compactions。
+- `world_saved`/`server_world_snapshot` 正常；`reports/report.json/md` 已生成；
+  `SUPERVISOR_CONTAINER_EXIT ... rc=0`；无
+  `runtime_shutdown_retry`/`cleanup_failed`/`finalization_failed`。
+- 结束后栈、worker、network 全部清理；Dashboard 仍返回 200，viewer 因栈已停为 502。
+
+
+## 2026-10-23 研究与服务器协议稳定性调优
+
+- 20 分钟真实 run 暴露 bot 网络/移动稳定性问题：64 次 bot kick、6 次
+  `DecoderException`、58 次 `invalid_player_movement`、92 条 `moved too quickly`
+  警告，71 次 runtime restart。它不是 infra failure，但会严重消耗 turn 并让
+  paper 进度回滚。
+- 服务器调优（研究环境，非 paper 规则变更）：
+  - `server.properties`: `network-compression-threshold=-1`
+    （本地研究网络；避免 Mineflayer codec 异常）；
+  - `spigot.yml`: `moved-too-quickly-multiplier=1000.0`、
+    `moved-wrongly-threshold=1.0`，保留检查但给研究 bot 余量；
+  - 重建 `minecraft-harness-server:1.20.4-research`，新 image ID
+    `sha256:634b270f...`。
+- 5 分钟 fresh-world 对照：**3 次 kick、0 DecoderException、0 moved-too-quickly
+  警告**（按 20 分钟折算约 12 次，基线为 64 次）；run 最终
+  `budget_exhausted`、205 calls / $0.373、`rc=0`、无 cleanup/finalization 失败。
+- 仍保留 3 次 `invalid_player_movement`，说明高负载下仍有残余 Mineflayer
+  移动包问题；已显著降低但未完全消除，正式长跑建议再跑 20 分钟调优验证。
+- 构建注意：`infra/server.Dockerfile` 需要 `infra/.cache/server-1.20.4.jar`；
+  该文件可缺失，`infra/fetch_server.py` 可重新获取。本次从现有 image 恢复后重建。

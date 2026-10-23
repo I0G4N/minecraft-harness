@@ -98,3 +98,13 @@ report → Dashboard / Caddy / viewer → teardown / world save。
 - 输出证据：
   - `mc-runs/longrun-server-crash-2/`
   - `validation/supervisor-soak-20261023-213511-b.json`
+
+## 2026-10-23 22:xx 服务器协议稳定性
+
+- 20 分钟真实 run 的 64 次 kick / 6 次 DecoderException 推动服务器调优：
+  - 关闭本地研究网络压缩（`network-compression-threshold=-1`）；
+  - 提高 Spigot 移动检查余量（multiplier 1000、wrongly threshold 1.0）；
+  - 重建 server image（`sha256:634b270f...`）。
+- 5 分钟 fresh-world 对照：3 kicks / 0 DecoderException / 0 moved-too-quickly；
+  budget_exhausted、205 calls / $0.373、rc=0。
+- 残余 invalid_player_movement 3 次/5min；建议 90 分钟前再做 20 分钟调优验证。

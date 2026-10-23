@@ -1,13 +1,12 @@
 # Deliberate stability deviation for research bots.
 #
-# Mineflayer movement under concurrent load can exceed vanilla/Spigot's
-# "moved too quickly" anti-cheat threshold and produce
-# multiplayer.disconnect.invalid_player_movement kicks. The paper protocol
-# only specifies standard survival; it does not prescribe an anti-cheat
-# threshold. Keep the check enabled but give the research bots headroom.
+# Mineflayer movement under concurrent load can exceed Spigot's vanilla
+# movement checks. The paper protocol only specifies standard survival; it
+# does not prescribe an anti-cheat threshold. Give the local research bots
+# generous headroom while keeping the checks enabled.
 settings:
   bungeecord: false
 world-settings:
   default:
-    moved-too-quickly-multiplier: 100.0
-    moved-wrongly-threshold: 0.0625
+    moved-too-quickly-multiplier: 1000.0
+    moved-wrongly-threshold: 1.0

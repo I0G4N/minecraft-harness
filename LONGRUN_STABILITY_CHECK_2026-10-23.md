@@ -210,3 +210,15 @@ Source commit at check time: `43f3b1c`; after the check the cap was raised to 10
 - `live-test-1` 的 2 个在途 model call / 2 个 unknown usage 仍会让 report 的
   token/cost 为 null（保守设计）；
 - `/proc` credential exposure（P1-7）仍是安全偏差，不是本轮的稳定性阻断。
+
+## Follow-up 2026-10-23 22:xx：bot kick / protocol churn 调优
+
+- 20 分钟 run 基线：64 kicks / 6 DecoderException / 71 runtime restarts，
+  属于高负载下 Mineflayer 协议与移动检查的稳定性问题。
+- 服务器调优并重建 image：
+  - `network-compression-threshold=-1`
+  - `moved-too-quickly-multiplier=1000.0`
+  - `moved-wrongly-threshold=1.0`
+- 5 分钟 fresh-world 验证：3 kicks、0 DecoderException、0 moved-too-quickly
+  警告，按 20 分钟折算约 12 kicks（基线 64）；run `rc=0`、无 cleanup 失败。
+- 残余 3 次 invalid_player_movement；正式 run 前建议再跑一轮 20 分钟调优。
