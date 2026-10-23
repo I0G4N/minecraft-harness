@@ -24,6 +24,7 @@ def main() -> int:
     con.row_factory = sqlite3.Row
     kinds = Counter()
     signals = Counter()
+    reset_reasons = Counter()
     stderr_tails = []
     for row in con.execute("SELECT kind, payload_json FROM events"):
         kinds[row["kind"]] += 1
@@ -36,6 +37,12 @@ def main() -> int:
                 signals[str(payload["signal"])] += 1
             if payload.get("stderr_tail"):
                 stderr_tails.append({"signal": payload.get("signal"), "tail": str(payload["stderr_tail"])[:2000]})
+        elif row["kind"] == "runtime_reset":
+            try:
+                reason = (json.loads(row["payload_json"]).get("payload") or {}).get("reason")
+            except ValueError:
+                reason = None
+            reset_reasons[str(reason)] += 1
     def state(key):
         row = con.execute("SELECT value_json FROM state WHERE key=?", (key,)).fetchone()
         return json.loads(row[0]) if row else None
@@ -70,6 +77,7 @@ def main() -> int:
         "event_count": sum(kinds.values()),
         "events_by_kind": dict(sorted(kinds.items())),
         "runtime_exit_signals": dict(sorted(signals.items())),
+        "runtime_reset_reasons": dict(sorted(reset_reasons.items())),
         "runtime_exit_stderr_tails": stderr_tails[:20],
         "budget": budget.get("budget"),
         "report": {
@@ -91,6 +99,13 @@ def main() -> int:
         "flags": {
             "bot_kicked": kinds["bot_kicked"],
             "sigabrt": signals.get("SIGABRT", 0),
+            "worker_fatal": reset_reasons.get("worker_fatal", 0),
+            "bot_death": kinds["bot_death"],
+            "model_request": kinds["model_request"],
+            "model_response": kinds["model_response"],
+            "runtime_ready": kinds["runtime_ready"],
+            "execution_succeeded": kinds["execution_succeeded"],
+            "execution_failed": kinds["execution_failed"],
             "cleanup_failed": kinds["cleanup_failed"],
             "finalization_failed": kinds["finalization_failed"],
             "runtime_shutdown_retry": kinds["runtime_shutdown_retry"],
