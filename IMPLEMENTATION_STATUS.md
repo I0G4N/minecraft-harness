@@ -282,3 +282,18 @@
 - 旧 `live-test-1` 已用新 fallback 手工补齐报告（原 ledger 状态保持
   `infra_failed` 作为故障记录）。
 - 全量 Python：**761 passed, 3 skipped, 734 subtests**。
+
+
+## 2026-10-23 端到端链路审查
+
+- 详见 [CHAIN_AUDIT_2026-10-23.md](CHAIN_AUDIT_2026-10-23.md)。
+- 额外修复：run_dir 过长导致 broker Docker socket `AF_UNIX path too long`；
+  `run-paper.sh` preflight 与 `SubmissionBroker` 均提前拒绝 >107 字节的 socket 路径，
+  新增 `tests/test_broker_paths.py`。
+- 额外修复：preflight 提前拒绝 stale `<project>-supervisor` 容器和
+  `mc-worker-<project>-*` sandbox；detached Supervisor 启动失败时自动 teardown 栈，
+  避免留下无人监管的运行栈。
+- 验证：长路径 `--prepare` 被拒绝；stale supervisor/worker 均被启动前拒绝；
+  正常路径可启动/关闭。
+- 已知限制：收尾在途 model call 记为 unknown usage，report 的 token/cost 为 null；
+  startup/resume 初始 fence 仍为单次请求超时。

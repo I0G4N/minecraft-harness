@@ -29,6 +29,13 @@ class SubmissionBroker:
         configured_socket = self.gateway.config.get("cli_broker_socket")
         if configured_socket:
             path = Path(configured_socket)
+            # Linux sun_path is 108 bytes including the trailing NUL; keep one
+            # byte of headroom so bind() cannot fail late with
+            # "AF_UNIX path too long" after the whole stack is already up.
+            if len(os.fsencode(str(path))) > 107:
+                raise ValueError(
+                    f"broker Unix socket path is too long ({len(os.fsencode(str(path)))} bytes, max 107): "
+                    f"choose a shorter run directory: {path}")
             path.parent.mkdir(parents=True, exist_ok=True)
             try:
                 existing = path.lstat()

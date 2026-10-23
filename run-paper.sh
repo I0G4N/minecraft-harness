@@ -289,6 +289,17 @@ preflight() {
     fail "run_dir is not empty: $RUN_DIR (choose a new PAPER_RUN_DIR)"
   fi
 
+  # The Supervisor's submission broker uses a Unix-domain socket at
+  # RUN_DIR/broker/socket.  Linux sun_path is 108 bytes including the trailing
+  # NUL; fail before compose_up rather than after the whole stack is up with
+  # "AF_UNIX path too long".
+  local broker_socket broker_bytes
+  broker_socket="$(realpath -m "$RUN_DIR" 2>/dev/null || printf '%s' "$RUN_DIR")/broker/socket"
+  broker_bytes="$(printf '%s' "$broker_socket" | wc -c)"
+  if [ "$broker_bytes" -gt 107 ]; then
+    fail "run_dir path is too long for the broker Unix socket (${broker_bytes} bytes > 107): choose a shorter PAPER_RUN_DIR ($broker_socket)"
+  fi
+
   # Never fence a live run while preparing/starting another one. final11 is a
   # paused but RUNNING supervisor: starting a second supervisor against the same
   # bot URLs would DELETE its sessions before world admission fails.
@@ -303,6 +314,27 @@ preflight() {
   active="$(printf '%s\n' "$active" | tr ' ' '\n' | sed '/^$/d' | sort -u | tr '\n' ' ')"
   if [ -n "$active" ]; then
     fail "an experiment stack is still running: $active Archive/stop the paused run first (do not start a second supervisor)."
+  fi
+
+  # A stale detached supervisor container makes --start fail only after
+  # compose_up/readiness, which would leave the stack running without a
+  # Supervisor.  Reject it before any container is created.
+  if [ "${PAPER_SUPERVISOR_CONTAINER:-0}" = "1" ] && [ -n "${STACK_PROJECT:-}" ]; then
+    local supervisor_name="${PAPER_SUPERVISOR_CONTAINER_NAME:-${STACK_PROJECT}-supervisor}"
+    if docker inspect "$supervisor_name" >/dev/null 2>&1; then
+      fail "supervisor container already exists: $supervisor_name; remove it first: docker rm -f $supervisor_name"
+    fi
+  fi
+
+  # Launcher-created worker sandboxes are outside Compose and may survive a
+  # crashed run.  They are not removed by compose down, so reject them before
+  # starting another stack on the same project.
+  if [ -n "${STACK_PROJECT:-}" ]; then
+    local leftover_workers
+    leftover_workers="$(docker ps -aq --filter "name=mc-worker-${STACK_PROJECT}-" 2>/dev/null || true)"
+    if [ -n "$leftover_workers" ]; then
+      fail "leftover worker sandboxes for $STACK_PROJECT: $(printf '%s' "$leftover_workers" | tr '\n' ' '); remove them first: docker rm -f $(printf '%s' "$leftover_workers" | tr '\n' ' ')"
+    fi
   fi
 
   # Reusing compose networks is also unsafe even if containers are stopped.
@@ -510,7 +542,15 @@ start_container_supervisor() {
   fi
   echo "SUPERVISOR_CONTAINER starting name=$name image=$image"
   if ! docker run -d --name "$name" --network host --init       --user "$(id -u):$(id -g)" --group-add "${PAPER_DOCKER_GID:-999}"       "${mounts[@]}" "${env_args[@]}"       -e "PYTHONUNBUFFERED=1"       --entrypoint /bin/bash "$image"       "$H/scripts/container_supervisor.sh"       "$CONFIG" "$RUN_DIR" "$COMPOSE_FILE" "$STACK_PROJECT"       "${ENV_FILE:-}" "$LOG" "$DEST" "$H" /usr/bin/python3; then
-    fail "could not start detached Supervisor container"
+    # Do not leave a running stack without a Supervisor when the detached
+    # launch itself fails (image/daemon/name race).
+    cleanup_worker_containers
+    if [ -n "${ENV_FILE:-}" ] && [ -f "$ENV_FILE" ]; then
+      docker compose -p "$STACK_PROJECT" -f "$COMPOSE_FILE" --env-file "$ENV_FILE" down --remove-orphans >/dev/null 2>&1 || true
+    else
+      docker compose -p "$STACK_PROJECT" -f "$COMPOSE_FILE" down --remove-orphans >/dev/null 2>&1 || true
+    fi
+    fail "could not start detached Supervisor container (stack was torn down)"
   fi
   echo "SUPERVISOR_CONTAINER $(docker inspect -f '{{.Id}}' "$name")"
   echo "SUPERVISOR_LOGS docker logs -f $name"
