@@ -4,7 +4,7 @@ import net from 'node:net';
 import { once } from 'node:events';
 import { setTimeout as delay } from 'node:timers/promises';
 import { deflateSync } from 'node:zlib';
-import { PacketFrames, startIdentityProxy, varint } from '../src/identity-proxy.js';
+import { inspectMovement, PacketFrames, startIdentityProxy, varint } from '../src/identity-proxy.js';
 
 const text = value => Buffer.concat([varint(Buffer.byteLength(value)), Buffer.from(value)]);
 const packet = (id, body = Buffer.alloc(0), compressed = false) => {
@@ -71,4 +71,19 @@ test('wire chat ablation filters compressed packets in both directions', async t
   client.write(packet(5, text('hidden-outbound-message'), true));
   await delay(30);
   assert.equal(downstream.length, before); assert.equal(f.proxy.stats.rejected, 0); assert.equal(f.proxy.stats.filtered, 2); client.destroy();
+});
+
+test('movement sanitizer rejects non-finite and truncated position packets', () => {
+  const finite = Buffer.alloc(34);
+  finite[0] = 0x17;
+  finite.writeDoubleBE(1, 1); finite.writeDoubleBE(64, 9); finite.writeDoubleBE(2, 17); finite[25] = 1;
+  assert.equal(inspectMovement(finite, 1, 'position'), null);
+
+  const nan = Buffer.from(finite); nan.writeDoubleBE(NaN, 9);
+  assert.equal(inspectMovement(nan, 1, 'position').reason, 'nonfinite');
+
+  const far = Buffer.from(finite); far.writeDoubleBE(40_000_000, 1);
+  assert.equal(inspectMovement(far, 1, 'position').reason, 'out-of-range');
+
+  assert.equal(inspectMovement(Buffer.alloc(5), 1, 'position').reason, 'truncated');
 });

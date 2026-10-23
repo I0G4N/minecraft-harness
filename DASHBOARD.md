@@ -182,3 +182,10 @@ Dashboard 的 `/api/world-image` 与 `/api/world-meta` 把 PNG/JSON 缓存写到
 `<run_dir>/renders/`，不再写入 `<run_dir>/reports/`。报告目录由 Supervisor
 独占，避免 Dashboard 容器用户与 Supervisor 用户不同导致最终报告
 `PermissionError`。旧 run 的渲染缓存可保留在 `reports/`，不影响读取。
+
+## 2026-10-23 Viewer 断线重连页
+
+Caddy 的 `/viewer/playerN/` 现在：
+- `reverse_proxy` 带 `lb_try_duration 6s`，worker 短暂重启时先重试；
+- 后端仍不可用时返回 **503 HTML 自动刷新页**（每 2s reload），
+  不再直接显示 502。worker 恢复后浏览器自动回到直播页。

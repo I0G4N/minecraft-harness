@@ -353,3 +353,26 @@
   移动包问题；已显著降低但未完全消除，正式长跑建议再跑 20 分钟调优验证。
 - 构建注意：`infra/server.Dockerfile` 需要 `infra/.cache/server-1.20.4.jar`；
   该文件可缺失，`infra/fetch_server.py` 可重新获取。本次从现有 image 恢复后重建。
+
+
+## 2026-10-23 bot movement 包清洗 + viewer 断线恢复页
+
+- 残余 `invalid_player_movement` 根因已捕获：identity proxy 日志显示
+  `position_look` 中出现 **NaN**（如 `NaN,74,NaN,NaN,0`），服务器因此
+  `Invalid move player packet received` 直接 disconnect。
+- `bot_runtime/src/identity-proxy.js` 新增 movement 包检查：
+  - 识别 `position` / `position_look`；
+  - 非有限值、越界坐标、截断包直接丢弃并计入
+    `stats.invalid_movement`，最多打印 20 条 `INVALID_MOVEMENT` 诊断；
+  - 正常包原样透传。
+- 重建 control image `minecraft-harness-control:research`
+  （`sha256:4fdd0ddc...`）。
+- 5 分钟 fresh-world `movement-test-1`：
+  - **0 bot kick**（此前 20 分钟基线 64 次、5 分钟调优基线 3 次）；
+  - **0** `Invalid move player packet`、**0** `DecoderException`；
+  - identity 日志捕获 3 条 NaN `position_look`，全部被丢弃；
+  - run `budget_exhausted`、169 calls / `$0.317`、`rc=0`，无 cleanup/
+    finalization 失败。
+- Viewer 5xx：Caddy 对 `/viewer/playerN/` 增加 6s upstream retry，并配置
+  `handle_errors` 返回自动刷新页（503 + 2s reload），不再直接显示 502；
+  无后端时验证返回重连页，临时后端时验证 200。

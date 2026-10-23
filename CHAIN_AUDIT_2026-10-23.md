@@ -108,3 +108,14 @@ report → Dashboard / Caddy / viewer → teardown / world save。
 - 5 分钟 fresh-world 对照：3 kicks / 0 DecoderException / 0 moved-too-quickly；
   budget_exhausted、205 calls / $0.373、rc=0。
 - 残余 invalid_player_movement 3 次/5min；建议 90 分钟前再做 20 分钟调优验证。
+
+## 2026-10-23 22:xx bot movement NaN / viewer 断线
+
+- 残余 kick 根因：identity proxy 捕获到 `position_look` 包含 NaN
+  （`NaN,74,NaN,NaN,0`），服务端直接 `Invalid move player packet received`。
+- 修复：identity proxy 丢弃非有限/越界/截断 movement 包并计数；
+  重建 control image `sha256:4fdd0ddc...`。
+- 验证：5 分钟 `movement-test-1` **0 kick / 0 invalid move / 0 DecoderException**；
+  3 条 NaN 包被丢弃；run rc=0、169 calls/$0.317、无 cleanup/finalization 失败。
+- Viewer：Caddy 对 viewer route 增加 6s retry，错误时返回 503 自动刷新页；
+  无后端返回重连页，临时后端返回 200。
