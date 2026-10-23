@@ -227,6 +227,27 @@ function makeAgentFacingBot(real) {
   return proxy;
 }
 
+function startBotStateGuard() {
+  // Mineflayer physics can occasionally produce a permanent NaN/null position
+  // when chunk state is lost.  The resulting client packets either get dropped
+  // by the identity proxy or trip the server's invalid_player_movement check.
+  // Once the bot has had a finite state, recover the worker cleanly instead of
+  // letting it hammer the server with malformed movement.
+  if (config.mode !== 'minecraft') return;
+  let hadFinite = false;
+  const timer = setInterval(() => {
+    const entity = bot && bot.entity;
+    const position = entity && entity.position;
+    if (!position) return;
+    const values = [position.x, position.y, position.z, entity.yaw, entity.pitch];
+    if (values.every(Number.isFinite)) { hadFinite = true; return; }
+    if (!hadFinite) return;
+    process.stderr.write('NONFINITE_BOT_STATE restarting worker\n');
+    process.exit(1);
+  }, 500);
+  timer.unref?.();
+}
+
 function makeFakeBot() {
   const fake = new EventEmitter();
   fake.username = config.username;
@@ -609,6 +630,7 @@ for (const event of ['chat', 'whisper', 'death', 'respawn', 'kicked', 'end', 'er
 bot.on('end', () => process.exit(1));
 instrumentEmitter(bot);
 agentBot = makeAgentFacingBot(bot);
+startBotStateGuard();
 if (config.chatDelivery === 'program_output') {
   bot.on('chat', (username, message) => {
     pendingChat.push({ username: String(username ?? '').slice(0, 64), message: String(message ?? '').slice(0, 4096), received_at: new Date().toISOString() });
