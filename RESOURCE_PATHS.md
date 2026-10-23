@@ -28,3 +28,9 @@ from a run wrapper. Experiment data and logs do not use that path.
 
 Root filesystem is still close to full because of Docker image/build cache; keep
 several GiB free and prune dangling images/cache before long runs.
+
+## PIDs limits
+
+- server / bot / identity / launcher: **256 pids**
+- worker sandbox under runsc: `--pids-limit` is not supported; gVisor provides
+  process isolation and the launcher-level limits above were raised.

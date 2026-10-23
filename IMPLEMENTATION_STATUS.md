@@ -378,3 +378,20 @@
   无后端时验证返回重连页，临时后端时验证 200。
 - 重建 worker/launcher image 以保持 runtime source/provenance 一致：
   worker `sha256:a915d447...`、launcher `sha256:ae0b15cf...`。
+
+
+## 2026-10-24 资源上限与 SIGABRT 诊断
+
+- 20 分钟资源验证 `longrun-20-resource-1`：
+  - `budget_exhausted`，1155 calls / `$1.3068`，无 cleanup/finalization 失败；
+  - bot kick 2 次；2 次 worker `SIGABRT`；
+  - `runtime_exit.stderr_tail` 捕获：
+    `runtime/cgo: pthread_create failed: Resource temporarily unavailable`
+    以及 `11 death listeners` 的 MaxListeners 警告。
+- 判断：主要不是内存 OOM，而是 **进程/线程资源限制**（runsc/Go runtime 线程创建失败）；
+  death listener 增长是程序保留事件监听的次要问题。
+- 修复：bot/identity/launcher/server `pids_limit` 从 64/128 提升到 **256**；
+  worker memory 已提升到 4g、guardian 2 GiB；server 8g/Java 3G heap；
+  Supervisor 8g。下一轮 run 验证。
+- root 清理后约 5.4 GB 可用；实验资源路径全部在 `/ssd_data/caizihao`，
+  Docker data-root 仍为共享 `/var/lib/docker`（迁移需维护窗口）。
