@@ -16,7 +16,7 @@ from minecraft_harness.deployment_generation import render_compose
 from minecraft_harness.models import ModelError, ModelResponse
 from minecraft_harness.recorder import Recorder
 from minecraft_harness.runner_rpc import RpcClient, RpcError, RpcServer
-from minecraft_harness.supervisor import Supervisor
+from minecraft_harness.supervisor import RuntimeUnavailable, Supervisor
 from minecraft_harness.agents.web import WebTools
 
 
@@ -476,3 +476,42 @@ class ComposeRestartPolicyTests(unittest.TestCase):
             if name.startswith(("identity", "launcher", "bot")):
                 self.assertEqual(service["restart"], "unless-stopped", name)
         self.assertEqual(services["server"]["environment"]["MAX_PLAYERS"], "4")
+
+
+class SupervisorPauseControlTests(unittest.IsolatedAsyncioTestCase):
+    """Pause must be a real gate, not only a budget-admission side effect."""
+
+    class _Gateway:
+        def __init__(self):
+            self.admission = asyncio.Event()
+            self.admission.set()
+            self.fault = RuntimeUnavailable("runtime fault")
+            self.paused = False
+            self.world_epoch = 0
+
+        async def pause_sessions(self):
+            self.paused = True
+
+        async def resume_sessions(self):
+            self.paused = False
+
+    class _Budget:
+        def __init__(self):
+            self.admission = asyncio.Event()
+            self.admission.set()
+
+    async def test_pause_sets_gate_and_resume_clears_it(self):
+        supervisor = Supervisor(_supervisor_config(), Path(tempfile.mkdtemp()) / "run")
+        self.addCleanup(shutil.rmtree, supervisor.run_dir, True)
+        recorder = _BudgetRecorder(self).recorder
+        supervisor.recorder = recorder
+        supervisor.gateway = self._Gateway()
+        supervisor.budget = self._Budget()
+        await supervisor._control("pause", None, None)
+        self.assertTrue(supervisor.paused)
+        self.assertEqual(supervisor.status, "reasoning_paused_world_running")
+        self.assertFalse(supervisor.gateway.admission.is_set())
+        await supervisor._control("resume", None, None)
+        self.assertFalse(supervisor.paused)
+        self.assertEqual(supervisor.status, "running")
+        self.assertTrue(supervisor.gateway.admission.is_set())

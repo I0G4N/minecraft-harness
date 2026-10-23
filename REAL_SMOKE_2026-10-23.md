@@ -94,7 +94,7 @@ Result:
 
 ## Verification
 
-- Full Python suite after the fix: **745 passed, 3 skipped, 734 subtests**
+- Full Python suite after the fix: **746 passed, 3 skipped, 734 subtests**
   (`PYTHONPATH=src:.venv/site-packages .test-venv/bin/python -m pytest -q`).
 - Pi/Observer targeted: **189 passed, 119 subtests**.
 - Both smoke commands used a real DeepSeek key (injected only via the process

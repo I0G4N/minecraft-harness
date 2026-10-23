@@ -118,6 +118,12 @@ class Supervisor:
         self._fail_run_triggered = False
         self._paused_started = None
         self._paused_total = 0.0
+        # Operator pause must suppress automatic runtime recovery; otherwise a
+        # faulted runtime can enter a recovery loop that rejects the pause
+        # control with "maintenance operation already in progress" forever.
+        self.paused = False
+        self._next_recovery_at = 0.0
+        self._runtime_recovery_exhausted = False
 
     def _manifest(self):
         encoded = json.dumps(self.config, sort_keys=True).encode()
@@ -674,6 +680,17 @@ class Supervisor:
                         operation.result()
                     except RuntimeUnavailable as exc:
                         self.gateway.fault = exc
+                        # Do not spin: bounded recovery failures get a backoff
+                        # window, and a total-limit failure stops automatic
+                        # recovery so operator pause/stop controls can apply.
+                        settings = self.config.get("supervision", {})
+                        recoveries = self.recorder.get_state("runtime_recoveries", 0)
+                        if ("total runtime recovery limit exhausted" in str(exc)
+                                or recoveries >= settings.get("max_recoveries", 20)):
+                            self._runtime_recovery_exhausted = True
+                        else:
+                            self._next_recovery_at = time.monotonic() + min(
+                                float(settings.get("recovery_max_s", 30)), 30.0)
                     operation = None
                 if now >= next_heartbeat:
                     await asyncio.to_thread(self.recorder.set_state, "active_wall_seconds",
@@ -685,17 +702,44 @@ class Supervisor:
                         self.budget.stopped = True
                         self.recorder.finish_control(control["control_id"], "applied", {"status": "stopped"})
                     elif operation:
-                        self.recorder.finish_control(control["control_id"], "failed", {"error": "maintenance operation already in progress"})
+                        # Pause/freeze is an operator override even while a
+                        # runtime-recovery/server-health task is in flight: set
+                        # the paused gate, cancel that automatic operation and
+                        # apply the control immediately.
+                        if (control["command"] in {"pause", "freeze"}
+                                and operation.get_name() in {"runtime-recovery",
+                                                             "server-health"}):
+                            self.paused = True
+                            operation.cancel()
+                            try:
+                                await operation
+                            except BaseException:
+                                pass
+                            operation = None
+                            operation = asyncio.create_task(
+                                self._apply_control(control, server, collector),
+                                name="operator-maintenance")
+                        else:
+                            self.recorder.finish_control(
+                                control["control_id"], "failed",
+                                {"error": "maintenance operation already in progress"})
                     else:
-                        operation = asyncio.create_task(self._apply_control(control, server, collector), name="operator-maintenance")
+                        operation = asyncio.create_task(
+                            self._apply_control(control, server, collector),
+                            name="operator-maintenance")
                 if self.budget.stop_requested():
                     self.status = "stopped" if self.budget.stopped else "budget_exhausted"
                     break
-                if not operation and not self.frozen and self.gateway.fault:
+                if (not operation and not self.frozen and not self.paused
+                        and not self._runtime_recovery_exhausted
+                        and self.gateway.fault and now >= self._next_recovery_at):
                     if isinstance(self.gateway.fault, RuntimeReliabilityError):
                         raise self.gateway.fault
-                    operation = asyncio.create_task(self._recover_runtime(server, collector), name="runtime-recovery")
-                if not operation and not self.frozen and server.container and now >= next_server_check:
+                    operation = asyncio.create_task(
+                        self._recover_runtime(server, collector),
+                        name="runtime-recovery")
+                if (not operation and not self.frozen and not self.paused
+                        and server.container and now >= next_server_check):
                     async def check_server():
                         try:
                             await server.ready()
@@ -1218,6 +1262,7 @@ class Supervisor:
         elif command in {"pause", "freeze"}:
             if command == "freeze" and not server.container:
                 raise RuntimeError("world freeze requires server.managed_container")
+            self.paused = True
             self.budget.admission.clear()
             self.gateway.admission.clear()
             self._pause_clock()
@@ -1230,6 +1275,9 @@ class Supervisor:
                 self.recorder.set_state("world_frozen", True)
             self.status = "world_frozen" if self.frozen else "reasoning_paused_world_running"
         elif command == "resume":
+            self.paused = False
+            self._runtime_recovery_exhausted = False
+            self._next_recovery_at = 0.0
             if self.frozen or self.sessions_fenced:
                 await self._reconcile_world(server)
                 await server.start()

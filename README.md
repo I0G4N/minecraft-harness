@@ -347,7 +347,7 @@ Mineflayer bot + DeepSeek `deepseek-flash` 完成 1 Agent + LLM Observer 验证�
 费用为已知值；证据与启动要点见 `validation/2026-10-21-real-minecraft/`。4 Agent paper_aligned 与
 日尺度运行仍未验证。本机容器间游戏网络受宿主代理限制，验证时使用 host 网络、未改宿主全局策略。
 
-**2026-10-23 当前回归（宿主，无 Docker）**：全量 Python **745 passed / 3 skipped / 734
+**2026-10-23 当前回归（宿主，无 Docker）**：全量 Python **746 passed / 3 skipped / 734
 subtests**；Pi/Observer 定向 **189 passed / 119 subtests**；Node **51 passed**。3 个 skipped
 为 Docker-gated 完整 compose 测试；本窗口已用真实 DeepSeek 跑 host + container Pi
 credential smoke（synthetic Minecraft runtime；见 REAL_SMOKE_2026-10-23.md），但未跑完整
