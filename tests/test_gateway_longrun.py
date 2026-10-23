@@ -1,5 +1,6 @@
 """Real-process long-running transport failures, without Minecraft or model calls."""
 import asyncio
+import json
 import os
 import shutil
 import tempfile
@@ -285,3 +286,70 @@ class GatewayLongrunTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(feed['world_epoch'], gateway.world_epoch)
         self.assertGreater(feed['runtime_epoch'], first)
         self.assertEqual(feed['session_id'], gateway.sessions['alice']['session_id'])
+
+    async def test_shutdown_retries_remote_session_delete_timeout(self):
+        """A slow sandbox teardown is retried instead of poisoning the run.
+
+        Reproduces the 2026-10-23 15-minute run: player1 had an active
+        280-second program at the wall deadline, the remote worker took longer
+        than the 10 s request timeout to confirm exit, and the single DELETE
+        attempt turned a completed run into infra_failed.  The second attempt
+        must observe the closed session, commit its audit tail and succeed.
+        """
+        config = validate_config({})['runtime']
+        config.update(url='http://runtime.fixture', request_timeout_s=.05,
+                      close_request_timeout_s=.1, close_timeout_s=3,
+                      startup_timeout_s=1, heartbeat_interval_s=.05, lease_timeout_s=1)
+        gateway = ExecutionGateway(config, self.recorder, ['alice'], self.path)
+        gateway.token = 'shutdown-fixture-supervisor-token'
+        session = {'session_id': 'shutdown-fixture-session', 'agent_id': 'alice',
+                   'run_id': self.recorder.run_id, 'world_epoch': 0,
+                   'lease_timeout_ms': 1000, 'paused': False, 'closed': False,
+                   'event_cursor': 0, 'acked_cursor': 0}
+        state = {'deleted': False, 'retain_deletes': 0}
+
+        async def transport(request):
+            path, method = request.url.path, request.method
+            if path == '/health':
+                return httpx.Response(200, json={'protocol_version': 2, 'mode': 'fake'})
+            if method == 'POST' and path == '/v1/sessions':
+                return httpx.Response(201, json=session)
+            if method == 'POST' and path.endswith('/heartbeat'):
+                return httpx.Response(200, json=session)
+            if method == 'POST' and path.endswith('/events/ack'):
+                body = json.loads(request.content or b'{}')
+                return httpx.Response(200, json={**session, 'acked_cursor': body.get('cursor', 0)})
+            if method == 'GET' and path == '/v1/sessions/alice':
+                return httpx.Response(404 if state['deleted'] else 200,
+                                      json={} if state['deleted'] else session)
+            if method == 'GET' and path.endswith('/events'):
+                return httpx.Response(200, json={**session, 'events': [], 'next_cursor': 0, 'has_more': False})
+            if method == 'DELETE':
+                if 'retain=true' in str(request.url):
+                    state['retain_deletes'] += 1
+                    if state['retain_deletes'] == 1:
+                        # Longer than close_request_timeout_s: the client
+                        # times out while the runtime is still stopping the
+                        # sandbox.  The retry must not be treated as a
+                        # protocol contradiction.
+                        await asyncio.sleep(.3)
+                    return httpx.Response(200, json={**session, 'closed': True, 'deleted': False,
+                        'confirmed_old_process_exit': True, 'events': [], 'next_cursor': 0, 'has_more': False})
+                state['deleted'] = True
+                return httpx.Response(200, json={**session, 'closed': True, 'deleted': True,
+                    'confirmed_old_process_exit': True, 'events': []})
+            return httpx.Response(404, json={'error': 'unexpected fixture route'})
+
+        await gateway.client.aclose()
+        gateway.client = httpx.AsyncClient(transport=httpx.MockTransport(transport), trust_env=False)
+        self.gateways.append(gateway)
+        await gateway.start()
+        await gateway._stop_maintenance()
+        await gateway.close()
+        self.assertEqual(gateway.sessions, {})
+        self.assertTrue(state['deleted'])
+        self.assertGreaterEqual(state['retain_deletes'], 2)
+        retries = [event for event in self.recorder.all_events()
+                   if event['kind'] == 'runtime_shutdown_retry']
+        self.assertGreaterEqual(len(retries), 1)
+        self.assertEqual(retries[0]['payload']['agent_id'], 'alice')

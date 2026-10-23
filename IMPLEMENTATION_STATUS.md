@@ -232,3 +232,29 @@
   `docker compose down`，记录 `SUPERVISOR_CONTAINER_EXIT`。
 - 2 分钟验证：wrapper 退出后容器继续运行，4/4 ready，运行结束 cleanup rc=0，栈已清理。
 - 说明文档：[PERSISTENT_SUPERVISOR.md](PERSISTENT_SUPERVISOR.md)
+
+
+## 2026-10-23 15min run 收尾清理误判修复
+
+- 现象：15 分钟 run 跑满 wall、world 已保存，却因
+  `cleanup_failed: could not confirm runtime shutdown` 被标为 `infra_failed`。
+- 根因：player1 在 wall 截止时仍有 280s program 在运行；`gateway.close()`
+  关闭 session 时，runtime 必须停止 remote worker sandbox 并确认旧进程退出，
+  teardown 超过普通 `request_timeout_s=10`；一次超时即
+  `runtime_shutdown_unconfirmed`，外部 runtime URL 模式无 fallback，
+  最终 `cleanup_failed`。`docker compose down` 不会清理 launcher 的 worker
+  sandbox，因此还出现 `mc-worker-paper4-15min-player1-...` 残留。
+- 修复：
+  - `runtime.close_request_timeout_s=30` / `runtime.close_timeout_s=60`；
+  - `gateway.close()` 在 bounded deadline 内重试幂等 session DELETE，记录
+    `runtime_shutdown_retry`；协议/审计矛盾不重试；
+  - teardown 按项目名清理 `mc-worker-<project>-*` sandbox。
+- 验证：
+  - 新增 gateway 慢 DELETE 回归测试；gateway 13 tests 全通过；
+  - 真实 1 分钟强制重试 run：4 agent 第 1 次 DELETE 全部超时，
+    player1/2/3 第 2 次再次超时，共 7 次重试后成功；`rc=0`，
+    `budget_exhausted`，无 `cleanup_failed`，worker/network 全部清理；
+  - 对照 1.5 分钟 run：81 calls / `$0.175`，`rc=0`，normal teardown 通过。
+- 全量 Python（带 pi_runtime node_modules 与绝对 PYTHONPATH）：**759 passed, 3 skipped,
+  734 subtests**；仅 `test_cli_longrun.py` 的 doctor 子进程测试在相对
+  `PYTHONPATH=src` 下会环境失败，绝对路径下 1 passed。

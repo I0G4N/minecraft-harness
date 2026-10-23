@@ -27,6 +27,14 @@ DEFAULTS = {
                 "program_timeout_default_s": 60, "program_timeout_max_s": 180,
                 "minecraft_version": "1.20.4", "host": "127.0.0.1", "port": 25565,
                 "request_timeout_s": 10, "startup_timeout_s": 60, "heartbeat_interval_s": 5, "lease_timeout_s": 30,
+                # Session deletion is not a normal request: the runtime must
+                # first stop the remote execution sandbox and confirm the old
+                # process exited, which can legitimately take longer than the
+                # ordinary control-plane timeout.  Retrying an idempotent
+                # DELETE within this bounded budget prevents a completed run
+                # from being marked infra_failed solely because teardown
+                # outlived the ordinary request timeout.
+                "close_request_timeout_s": 30, "close_timeout_s": 60,
                 "response_max_bytes": 4 * 1024 ** 2, "lifecycle": "strict", "max_background_jobs": 8,
                 "max_background_ttl_ms": 86400000, "leftover_policy": "reset", "recover_session_loss": False,
                 "runner_mode": "inprocess", "runner_restart_limit": 5,
@@ -262,8 +270,11 @@ def validate_config(raw: dict) -> dict:
         _environment_name(env, f"runtime.token_envs.{agent}")
     for key in ("program_timeout_default_s", "program_timeout_max_s"):
         _number(rt[key], "runtime." + key, maximum=7 * 24 * 3600)
-    for key in ("request_timeout_s", "startup_timeout_s", "heartbeat_interval_s", "lease_timeout_s"):
+    for key in ("request_timeout_s", "startup_timeout_s", "heartbeat_interval_s", "lease_timeout_s",
+                "close_request_timeout_s", "close_timeout_s"):
         _number(rt[key], "runtime." + key, maximum=3600)
+    if rt["close_timeout_s"] < rt["close_request_timeout_s"]:
+        raise ValueError("runtime.close_timeout_s must be at least runtime.close_request_timeout_s")
     if rt["program_timeout_default_s"] > rt["program_timeout_max_s"]:
         raise ValueError("invalid program timeout range")
     if rt["heartbeat_interval_s"] * 2 >= rt["lease_timeout_s"]:

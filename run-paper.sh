@@ -437,6 +437,19 @@ compose_up() {
   fi
 }
 
+cleanup_worker_containers() {
+  # Launchers create per-execution worker sandboxes outside Compose.  Remove
+  # only this project's named leftovers so an interrupted session close cannot
+  # strand a container/network after the Supervisor has exited.
+  local ids
+  ids="$(docker ps -aq --filter "name=mc-worker-${STACK_PROJECT}-" 2>/dev/null || true)"
+  if [ -n "$ids" ]; then
+    echo "WORKER_CLEANUP $(printf '%s' "$ids" | tr '\n' ' ')"
+    # shellcheck disable=SC2086
+    docker rm -f $ids >/dev/null 2>&1 || true
+  fi
+}
+
 wait_world() {
   local world deadline
   world="$(resolve_world_path)"
@@ -632,6 +645,7 @@ fi
   echo "WORLD_ARCHIVE $ARCHIVE"
   # Stop remaining bot stack to release resources; preserve containers for inspection.
   docker ps "${STACK_SELECTOR[@]}" -q | xargs -r docker stop --time 20 >/dev/null 2>&1 || true
+  cleanup_worker_containers
   echo "DONE $(date -u +%FT%TZ)"
   exit $RC
 } >> "$LOG" 2>&1

@@ -609,7 +609,43 @@ class ExecutionGateway:
         if hasattr(self.recorder, "settle_session"):
             await self._record("settle_session", agent, session["session_id"], reason)
 
-    async def fence(self):
+    async def fence(self, *, request_timeout=None, retry_deadline=None):
+        """Close every runtime session and record its final audit tail.
+
+        ``request_timeout``/``retry_deadline`` are used only for normal run
+        shutdown.  Session deletion is idempotent but can legitimately exceed
+        the ordinary control-plane timeout: the runtime must stop the remote
+        execution sandbox and confirm the old process exited before it can
+        return.  A transient transport timeout during that teardown is retried
+        within the caller-provided deadline instead of permanently marking a
+        completed run infrastructure-failed.  Recovery callers keep the old
+        single-attempt semantics (no deadline).
+        """
+        async def request(method, path, *, agent_id, timeout=None):
+            effective = timeout if timeout is not None else request_timeout
+            if retry_deadline is None:
+                return await self._request(method, path, agent_id=agent_id, timeout=effective)
+            attempt = 0
+            delay = .5
+            while True:
+                remaining = retry_deadline - time.monotonic()
+                if remaining <= 0:
+                    raise RuntimeUnavailable("runtime cleanup deadline exhausted")
+                attempt += 1
+                attempt_timeout = min(effective, remaining) if effective is not None else remaining
+                try:
+                    return await self._request(method, path, agent_id=agent_id, timeout=attempt_timeout)
+                except RuntimeUnavailable as exc:
+                    remaining = retry_deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise
+                    await self._record("append", "runtime_shutdown_retry", {
+                        "method": method, "path": path.split("?", 1)[0],
+                        "agent_id": agent_id, "attempt": attempt,
+                        "error": str(exc)[:500]}, world_epoch=self.world_epoch)
+                    await asyncio.sleep(min(delay, remaining))
+                    delay = min(delay * 2, 5)
+
         async def delete(agent):
             self.fencing.add(agent)
             try:
@@ -617,7 +653,8 @@ class ExecutionGateway:
                     session = self.sessions.get(agent)
                     if not session:
                         try:
-                            session = await self._request("GET", f"/v1/sessions/{agent}", agent_id=agent)
+                            session = await request("GET", f"/v1/sessions/{agent}", agent_id=agent,
+                                                    timeout=self.config.get("request_timeout_s", 10))
                         except httpx.HTTPStatusError as exc:
                             if exc.response.status_code == 404:
                                 return
@@ -625,7 +662,8 @@ class ExecutionGateway:
                     for _ in range(128):
                         cursor = await self._record("transport_cursor", agent, session["session_id"])
                         query = urlencode({"retain": "true", "after_cursor": cursor, "session_id": session["session_id"]})
-                        result = await self._request("DELETE", f"/v1/sessions/{agent}?{query}", agent_id=agent)
+                        result = await request("DELETE", f"/v1/sessions/{agent}?{query}", agent_id=agent,
+                                               timeout=request_timeout)
                         if result.get("already_absent"):
                             raise RuntimeReliabilityError("registered session disappeared before its final audit tail was recorded")
                         if not result.get("confirmed_old_process_exit"):
@@ -635,7 +673,7 @@ class ExecutionGateway:
                         await self._commit_ack(agent, session, result, closing=True)
                         if not result.get("has_more"):
                             cursor = self.node_cursors[agent]
-                            final = await self._request("DELETE", f"/v1/sessions/{agent}?" + urlencode({"after_cursor": cursor, "session_id": session["session_id"]}), agent_id=agent)
+                            final = await request("DELETE", f"/v1/sessions/{agent}?" + urlencode({"after_cursor": cursor, "session_id": session["session_id"]}), agent_id=agent, timeout=request_timeout)
                             if not final.get("deleted"):
                                 continue
                             if final.get("events"):
@@ -761,8 +799,18 @@ class ExecutionGateway:
         await self._stop_maintenance()
         try:
             if fence and (self.url or self.config.get("urls")):
+                # Remote sandbox teardown can outlive the ordinary request
+                # timeout.  Give session fencing a bounded cleanup budget and
+                # retry idempotent DELETEs inside it; this is the difference
+                # between "run ended normally, worker took 12 s to stop" and a
+                # false infra_failed verdict.  A genuine protocol contradiction
+                # (RuntimeReliabilityError) is never retried.
+                close_timeout = float(self.config.get("close_timeout_s", 60))
+                close_request_timeout = float(self.config.get("close_request_timeout_s", 30))
+                close_deadline = time.monotonic() + close_timeout
                 try:
-                    await self.fence()
+                    await self.fence(request_timeout=min(close_request_timeout, close_timeout),
+                                     retry_deadline=close_deadline)
                 except Exception as exc:
                     shutdown_error = exc
                     if self.auto_spawn:

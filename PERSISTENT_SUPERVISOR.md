@@ -92,3 +92,58 @@ docker ps -a --filter name=<project>-supervisor
   - 使用独立的 run dir / fresh world；
   - 监控 `pi_session_sample/alert/rotated`、resource、observer；
   - 长 run 前先做 10–15 分钟持久化验证。
+
+## 2026-10-23 15 分钟 run 的收尾误判：cleanup_failed
+
+15 分钟 run（20:04–20:19）已经跑满 wall 并把 world 完整保存，但报告是
+`infra_failed`。真正原因不是实验/预算/server 失败，而是**关闭 session 的单个 HTTP
+请求超时**。
+
+### 时间线（UTC）
+
+- `12:19:42`：wall deadline 到点，Supervisor 停止 Pi runners；
+- player1 仍有 `execution f19f342a...` 在运行（`timeout_ms=280000`，12:17:57 启动；
+  wall 结束时还差约 2 分半才自然结束）；
+- `gateway.close()` → `fence()` 并发 DELETE 各 agent 的 session；当时使用普通
+  `runtime.request_timeout_s=10`；
+- DELETE 触发 runtime `Session.close()`：先 `finish(current)`，再
+  `killWorker('session_closed')` → remote worker `stop()` / `confirmStopped()`；
+  remote worker 的确认 deadline 是 15s，launcher 的 `docker rm -f` / `inspect`
+  各自还有 15s 超时，因此 teardown 合法地超过 10s；
+- `12:19:53.088`：`TimeoutError` → `runtime_shutdown_unconfirmed`；
+- 由于是外部 runtime URL 模式（`auto_spawn=false`），没有 owned-process fallback，
+  `cleanup_failed` 把整个 run 标记为 `infra_failed`；
+- 随后 world save / server stop / compose down 仍然执行，但残留了
+  `mc-worker-paper4-15min-player1-984b5577`，印证 sandbox 当时仍在 teardown。
+
+### 根因
+
+1. 普通控制面 `request_timeout_s=10` 被复用到了 session DELETE；DELETE 的语义是
+   “停止 sandbox + 确认旧进程退出 + 返回最终事件尾”，耗时天然更长；
+2. `gateway.close()` 的 fence 只有一次尝试，没有在超时后重试幂等 DELETE；
+3. 外部 runtime URL 模式没有 owned-process fallback；
+4. `docker compose down` 不负责 launcher 创建的 per-execution worker sandbox，
+   超时后容易留下 orphan 容器/网络。
+
+### 修复
+
+- 新增 `runtime.close_request_timeout_s`（默认 30s）和
+  `runtime.close_timeout_s`（默认 60s）；
+- `gateway.close()` 的 fence 在 bounded deadline 内重试幂等 GET/DELETE；
+  只重试 `RuntimeUnavailable`（transport/超时），
+  `RuntimeReliabilityError`（协议/审计矛盾）绝不重试；每次重试记录
+  `runtime_shutdown_retry`；
+- `scripts/container_supervisor.sh` 和 `run-paper.sh` 在 teardown 时按项目名
+  `mc-worker-<project>-*` 清理 launcher 创建的 worker sandbox 残留。
+
+### 验证
+
+- 单元回归：`tests/test_gateway_longrun.py` 新增慢 DELETE 超时后重试成功测试；
+  gateway 全量 13 tests 通过；
+- 真实 1 分钟强制重试 run（`smoke-teardown-3`，故意设
+  `close_request_timeout_s=0.2`）：4 个 agent 的 DELETE 第 1 次全部超时，player1/2/3
+  第 2 次再次超时，共 **7 次 `runtime_shutdown_retry`**；随后全部成功，
+  `run_status=budget_exhausted`，`SUPERVISOR_CONTAINER_EXIT ... rc=0`，
+  无 `cleanup_failed`/`runtime_shutdown_unconfirmed`，worker/network 全部清理；
+- 对照 1.5 分钟 run（`smoke-teardown-2`，`close_request_timeout_s=2`）：
+  81 model calls / `$0.175`，rc=0，无 retry（teardown <2s），同样通过。

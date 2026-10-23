@@ -27,6 +27,16 @@ cleanup() {
     docker exec "${PROJECT}-server" harness-control save >/dev/null 2>&1 || true
     docker stop --time 45 "${PROJECT}-server" >/dev/null 2>&1 || true
   fi
+  # Per-execution worker sandboxes are created by the privileged launchers,
+  # not by Compose.  Remove only this project's explicitly named leftovers
+  # before network teardown; otherwise a timed-out session close can strand a
+  # mc-worker container and keep the project networks alive.
+  worker_ids="$(docker ps -aq --filter "name=mc-worker-${PROJECT}-" 2>/dev/null || true)"
+  if [ -n "$worker_ids" ]; then
+    echo "SUPERVISOR_CONTAINER worker-cleanup $(printf '%s' "$worker_ids" | tr '\n' ' ')"
+    # shellcheck disable=SC2086
+    docker rm -f $worker_ids >/dev/null 2>&1 || true
+  fi
   if [ -n "$ENV_FILE" ] && [ -f "$ENV_FILE" ]; then
     docker compose -p "$PROJECT" -f "$COMPOSE_FILE" --env-file "$ENV_FILE" down --remove-orphans >/dev/null 2>&1 || true
   else
