@@ -459,7 +459,7 @@ class PiObserverSpecTests(_ManagerFixture):
         self.assertEqual(loaded.pi_context_window, 32000)
         self.assertEqual(loaded.interval_s, 30.0)
         self.assertEqual(loaded.max_reviews, 7)
-        self.assertEqual(loaded.pi_session_max_bytes, 1_000_000_000)
+        self.assertEqual(loaded.pi_session_max_bytes, 2_000_000_000)
         self.assertEqual(loaded.pi_artifact_max_bytes, 4_000_000_000)
         self.assertEqual(loaded.agent_config["profile"], "paper_aligned")
         self.assertEqual(loaded.pi_model["model"], "fake-model")

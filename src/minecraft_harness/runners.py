@@ -2066,7 +2066,9 @@ class RunnerManager:
             storage = {}
         return {
             "pi_session_max_bytes": int(
-                storage.get("pi_session_max_bytes", 1_000_000_000)),
+                storage.get("pi_session_max_bytes", 2_000_000_000)),
+            "pi_session_rotation_limit": int(
+                storage.get("pi_session_rotation_limit", 3)),
             "pi_artifact_max_bytes": int(
                 storage.get("pi_artifact_max_bytes", 4_000_000_000)),
         }

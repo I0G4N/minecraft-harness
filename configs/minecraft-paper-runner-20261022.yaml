@@ -134,10 +134,12 @@ storage:
   # projections instead of being stored in full; usage is persisted per agent
   # under the runner state dir so restarts do not reset it. Both are also
   # enforced by the Supervisor storage guard.
-  # Run-wide budget check: 5 agents x (6 GB artifacts + 1 GB session + 1 GB
-  # archive) = 40 GB, leaving ~11.5 GB of the 51,539,607,552-byte run cap for
-  # the ledger/evaluator/API artifacts.
-  pi_session_max_bytes: 1000000000
+  # Run-wide budget check: 5 agents x (6 GB artifacts + 2 GB session + 1 GB
+  # archive) = 45 GB, leaving broad headroom in the 100 GiB run cap for the
+  # ledger/evaluator/API artifacts. A player session may rotate at 95%; each
+  # rotation is bounded (default 3) and recorded with a handoff summary.
+  pi_session_max_bytes: 2000000000
+  pi_session_rotation_limit: 3
   pi_artifact_max_bytes: 6000000000
 supervision:
   recovery_attempts: 8

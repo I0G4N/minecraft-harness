@@ -36,6 +36,7 @@ import stat
 import sys
 import threading
 import time
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping
@@ -110,7 +111,7 @@ PI_ABORT_GRACE_SECONDS = 6.0
 PI_TERMINATE_GRACE_SECONDS = 4.0
 BUDGET_POLL_SECONDS = 2.0
 
-DEFAULT_PI_SESSION_MAX_BYTES = 1_000_000_000
+DEFAULT_PI_SESSION_MAX_BYTES = 2_000_000_000
 DEFAULT_PI_ARTIFACT_MAX_BYTES = 4_000_000_000
 PI_SESSION_ARCHIVE_DIRNAME = "pi-sessions-archive"
 PI_SESSION_ARCHIVE_MAX_BYTES = 1_000_000_000
@@ -159,6 +160,11 @@ ROTATED_PROMPT = (
     "fresh session. Read your durable notes and verify the actual current state before "
     "acting; do not replay any action whose outcome is uncertain."
 )
+# Session retention thresholds are fractions of pi_session_max_bytes.  The
+# 95% mark starts a bounded in-run rotation before the hard cap is reached.
+SESSION_ALERT_THRESHOLDS = (0.80, 0.90, 0.95)
+SESSION_ROTATION_THRESHOLD = 0.95
+SESSION_GROWTH_SAMPLE_SECONDS = 60.0
 
 
 class PiRunnerError(RuntimeError):
@@ -220,6 +226,7 @@ class PiSpec:
     pi_cli: Path
     pi_context_window: int
     pi_session_max_bytes: int
+    pi_session_rotation_limit: int
     pi_artifact_max_bytes: int
     heartbeat_s: float
     agent_config: dict[str, Any]
@@ -331,6 +338,10 @@ def _validate_spec(document: Any, environment: PiEnvironment) -> PiSpec:
     if (type(pi_session_max_bytes) is not int
             or not MIN_RETENTION_BYTES <= pi_session_max_bytes <= MAX_RETENTION_BYTES):
         raise PiRunnerError("Runner spec pi_session_max_bytes is out of range")
+    pi_session_rotation_limit = document.get("pi_session_rotation_limit", 3)
+    if (type(pi_session_rotation_limit) is not int
+            or not 0 <= pi_session_rotation_limit <= 100):
+        raise PiRunnerError("Runner spec pi_session_rotation_limit is out of range")
     pi_artifact_max_bytes = document.get("pi_artifact_max_bytes",
                                          DEFAULT_PI_ARTIFACT_MAX_BYTES)
     if (type(pi_artifact_max_bytes) is not int
@@ -349,6 +360,7 @@ def _validate_spec(document: Any, environment: PiEnvironment) -> PiSpec:
         broker_socket=broker_socket, cli_environment=cli_environment,
         pi_cli=pi_cli, pi_context_window=int(context_window),
         pi_session_max_bytes=pi_session_max_bytes,
+        pi_session_rotation_limit=pi_session_rotation_limit,
         pi_artifact_max_bytes=pi_artifact_max_bytes,
         heartbeat_s=heartbeat_s, agent_config=agent_config, pi_model=pi_model,
     )
@@ -796,22 +808,192 @@ def _session_total_bytes(session_dir: Path) -> int:
     return sum(item["size"] for item in _session_files(session_dir))
 
 
+def _latest_compaction_summary(session_dir: Path, *, max_chars: int = 12000) -> str:
+    """Return the newest Pi compaction summary for a rotation handoff."""
+    files = _session_files(session_dir)
+    if not files:
+        return ""
+    newest = files[-1]["path"]
+    summary = ""
+    try:
+        with newest.open("r", encoding="utf-8", errors="replace") as stream:
+            for line in stream:
+                try:
+                    entry = json.loads(line)
+                except (TypeError, ValueError):
+                    continue
+                if isinstance(entry, dict) and entry.get("type") == "compaction":
+                    value = entry.get("summary")
+                    if isinstance(value, str) and value.strip():
+                        summary = value
+    except OSError:
+        return ""
+    return summary[:max_chars]
+
+
+def _archive_session_path(path: Path, session_dir: Path,
+                          state_root: Path) -> dict[str, Any]:
+    """Atomically move one Pi session JSONL into the bounded archive."""
+    metadata = path.stat()
+    archive_root = _archive_root(state_root)
+    stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+    destination_dir = archive_root / stamp
+    destination_dir.mkdir(parents=True, exist_ok=True)
+    relative = path.relative_to(session_dir)
+    destination = destination_dir / relative
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    os.replace(path, destination)
+    # Never immediately prune the file we just archived just because a single
+    # active session is larger than the default archive budget; handoff evidence
+    # and the rotation event must remain inspectable.
+    pruned = _prune_session_archive(
+        archive_root, max_bytes=max(PI_SESSION_ARCHIVE_MAX_BYTES, int(metadata.st_size)))
+    return {
+        "archived": str(destination.relative_to(archive_root)),
+        "bytes": int(metadata.st_size),
+        "archive_pruned": pruned[-16:],
+    }
+
+
+def _archive_active_session(session_dir: Path, state_root: Path) -> dict[str, Any] | None:
+    """Atomically archive the newest Pi session file for an in-run rotation."""
+    files = _session_files(session_dir)
+    if not files:
+        return None
+    total_before = sum(item["size"] for item in files)
+    result = _archive_session_path(files[-1]["path"], session_dir, state_root)
+    result["total_before"] = total_before
+    return result
+
+
+def _rotation_handoff(prepared: "PreparedPiRunner") -> str:
+    summary = _latest_compaction_summary(prepared.paths.session_dir)
+    return summary
+
+
+def _rotation_prompt(handoff: str) -> str:
+    if not handoff:
+        return ROTATED_PROMPT
+    return (
+        "The previous Pi session exceeded its retention limit and was archived, so this is "
+        "a fresh session. A handoff summary produced by the previous session follows.\n\n"
+        "--- HANDOFF SUMMARY ---\n" + handoff + "\n--- END HANDOFF SUMMARY ---\n\n"
+        "Read your durable notes and verify the actual current state before acting; do not "
+        "replay any action whose outcome is uncertain. Continue toward the same objective."
+    )
+
+
+def _archive_all_active_sessions(session_dir: Path, state_root: Path) -> list[dict[str, Any]]:
+    archived: list[dict[str, Any]] = []
+    while True:
+        result = _archive_active_session(session_dir, state_root)
+        if result is None:
+            return archived
+        archived.append(result)
+
+
+async def _pi_command_response(prepared: "PreparedPiRunner",
+                               process: asyncio.subprocess.Process,
+                               queue: asyncio.Queue,
+                               state: dict[str, Any],
+                               command: dict[str, Any],
+                               *, timeout_s: float = 30.0) -> dict[str, Any]:
+    """Send one Pi RPC command and wait for its matching response event."""
+    stdin = process.stdin
+    if stdin is None:
+        raise PiRunnerError("Pi subprocess has no stdin pipe")
+    request_id = "rotation-" + uuid.uuid4().hex
+    await _send_json(stdin, {**command, "id": request_id})
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        try:
+            record = await asyncio.wait_for(queue.get(), timeout=min(0.5, max(0.01, deadline - time.monotonic())))
+        except asyncio.TimeoutError:
+            continue
+        if record is None:
+            raise PiRunnerError("Pi exited while waiting for an RPC response")
+        if (record.get("type") == "response"
+                and record.get("id") == request_id):
+            return record
+        _handle_pi_event(prepared, record, state)
+    raise PiRunnerError("timed out waiting for Pi RPC response")
+
+
+def _session_alert_event(prepared: "PreparedPiRunner", state: dict[str, Any],
+                         total: int, limit: int) -> None:
+    alerted = set(state.get("session_alerted") or ())
+    for threshold in SESSION_ALERT_THRESHOLDS:
+        if total < limit * threshold or threshold in alerted:
+            continue
+        alerted.add(threshold)
+        severity = "critical" if threshold >= SESSION_ROTATION_THRESHOLD else "warning"
+        prepared.append_event("pi_session_alert", {
+            "runtime": "pi", "kind": "session",
+            "reason": "pi_session_max_bytes",
+            "threshold": threshold,
+            "severity": severity,
+            "used_bytes": total, "limit_bytes": limit,
+            "percent": round(100.0 * total / limit, 2),
+        })
+    state["session_alerted"] = sorted(alerted)
+
+
+def _record_session_growth(prepared: "PreparedPiRunner", state: dict[str, Any],
+                           total: int, limit: int) -> None:
+    now = time.monotonic()
+    last_at = state.get("session_last_sample_at")
+    last_bytes = state.get("session_last_sample_bytes")
+    if not isinstance(last_at, (int, float)):
+        # Establish the sampling baseline without emitting a zero-growth event.
+        state["session_last_sample_at"] = now
+        state["session_last_sample_bytes"] = total
+        return
+    if now - last_at < SESSION_GROWTH_SAMPLE_SECONDS:
+        return
+    interval = max(0.001, now - last_at) if isinstance(last_at, (int, float)) else 0.0
+    prepared.append_event("pi_session_sample", {
+        "runtime": "pi", "kind": "session",
+        "bytes": total, "limit_bytes": limit,
+        "percent": round(100.0 * total / limit, 2) if limit else 0.0,
+        "growth_bytes": (total - last_bytes) if isinstance(last_bytes, int) else 0,
+        "growth_bytes_per_second": (
+            round((total - last_bytes) / interval, 3)
+            if isinstance(last_bytes, int) and interval else 0.0),
+        "rotations": int(state.get("session_rotations", 0)),
+    })
+    state["session_last_sample_at"] = now
+    state["session_last_sample_bytes"] = total
+
+
 def _check_active_session_limit(prepared: "PreparedPiRunner",
                                 state: dict[str, Any],
                                 stop_event: asyncio.Event) -> bool:
-    """Stop the runner if the active Pi session outgrows its retention cap."""
+    """Warn, sample, then rotate or stop when a Pi session grows too large.
+
+    At 95% the real runner requests a bounded in-run rotation (archive + fresh
+    session + handoff). A runner without rotation enabled (for example a unit
+    fixture) keeps the fail-safe hard stop at the cap.
+    """
     total = _session_total_bytes(prepared.paths.session_dir)
     limit = prepared.spec.pi_session_max_bytes
     state["session_bytes"] = total
-    if (limit > 0 and not state.get("session_pressure_recorded")
-            and total >= limit * 0.9):
-        state["session_pressure_recorded"] = True
-        prepared.append_event("pi_retention_pressure", {
-            "runtime": "pi", "kind": "session",
-            "reason": "pi_session_max_bytes_pressure",
-            "used_bytes": total, "limit_bytes": limit,
-            "percent": round(100.0 * total / limit, 2), "threshold": 0.9,
+    if limit <= 0:
+        return False
+    _session_alert_event(prepared, state, total, limit)
+    _record_session_growth(prepared, state, total, limit)
+    rotation_limit = int(getattr(prepared.spec, "pi_session_rotation_limit", 0) or 0)
+    rotation_allowed = bool(state.get("rotation_allowed")) and rotation_limit > 0
+    if rotation_allowed and total >= limit * SESSION_ROTATION_THRESHOLD:
+        state["session_limit"] = True
+        state["session_rotation_requested"] = True
+        prepared.append_event("pi_session_rotation_started", {
+            "runtime": "pi", "reason": "pi_session_max_bytes",
+            "bytes": total, "limit_bytes": limit,
+            "percent": round(100.0 * total / limit, 2),
+            "rotation": int(state.get("session_rotations", 0)) + 1,
         })
+        stop_event.set()
+        return True
     if total <= limit:
         return False
     state["session_limit"] = True
@@ -1454,6 +1636,7 @@ async def _abort_and_wait(prepared: PreparedPiRunner,
         except (BrokenPipeError, ConnectionError, RuntimeError, OSError):
             pass
     deadline = time.monotonic() + PI_ABORT_GRACE_SECONDS
+    settled = False
     while time.monotonic() < deadline and process.returncode is None:
         remaining = deadline - time.monotonic()
         try:
@@ -1463,7 +1646,31 @@ async def _abort_and_wait(prepared: PreparedPiRunner,
         if record is None:
             break
         if record.get("type") == "agent_settled":
+            settled = True
             break
+    if state.get("session_rotation_requested") and state.get("rotation_allowed"):
+        if not settled or process.returncode is not None:
+            # The process is unusable for an in-place new_session rotation; fall
+            # back to the hard stop rather than claiming a successful rotation.
+            await _close_stdin(process)
+            await _terminate_process(process)
+            prepared.append_event("pi_session_rotation_failed", {
+                "runtime": "pi", "reason": "rotation_abort_timeout",
+                "bytes": state.get("session_bytes"),
+                "limit_bytes": prepared.spec.pi_session_max_bytes,
+                "process_exited": process.returncode is not None,
+            })
+            return {"agent_id": prepared.spec.agent_id, "status": "infra_failed",
+                    "reason": "pi_session_rotation_abort_timeout",
+                    "turns": _turns(state),
+                    "session_bytes": state.get("session_bytes"),
+                    "session_limit_bytes": prepared.spec.pi_session_max_bytes}
+        # Keep the Pi process and its loaded model/auth state. The caller sends
+        # new_session and archives the old JSONL before prompting the handoff.
+        return {"agent_id": prepared.spec.agent_id, "status": "session_rotate",
+                "reason": "pi_session_max_bytes", "turns": _turns(state),
+                "session_bytes": state.get("session_bytes"),
+                "session_limit_bytes": prepared.spec.pi_session_max_bytes}
     await _close_stdin(process)
     await _terminate_process(process)
     status = "infra_failed" if state.get("session_limit") else "stopped"
@@ -1504,7 +1711,8 @@ async def _session_loop(prepared: PreparedPiRunner,
                         queue: asyncio.Queue,
                         stop_event: asyncio.Event,
                         stop_wait: asyncio.Task,
-                        state: dict[str, Any]) -> dict[str, Any]:
+                        state: dict[str, Any],
+                        initial_prompt: str | None = None) -> dict[str, Any]:
     stdin = process.stdin
     if stdin is None:
         raise PiRunnerError("Pi subprocess has no stdin pipe")
@@ -1517,7 +1725,7 @@ async def _session_loop(prepared: PreparedPiRunner,
         await _send_json(stdin, {"id": f"prompt-{prompt_counter}",
                                  "type": "prompt", "message": message})
 
-    await send_prompt(_initial_prompt(prepared))
+    await send_prompt(initial_prompt if initial_prompt is not None else _initial_prompt(prepared))
     max_turns = int(prepared.spec.agent_config.get("max_turns", 100) or 100)
     max_turns = max(1, min(max_turns, 100000))
 
@@ -1667,7 +1875,12 @@ async def _run_prepared(prepared: PreparedPiRunner, early_stop: threading.Event,
         }, real_stdout)
         return 0
 
-    state: dict[str, Any] = {"status": "running", "rounds": 0}
+    state: dict[str, Any] = {
+        "status": "running", "rounds": 0, "session_rotations": 0,
+        "session_alerted": [], "session_last_sample_at": time.monotonic(),
+        "session_last_sample_bytes": None,
+    }
+    rotation_limit = max(0, int(getattr(prepared.spec, "pi_session_rotation_limit", 0) or 0))
     log_handle = open(prepared.paths.log_path, "ab")
     process: asyncio.subprocess.Process | None = None
     peer_registry: LoopbackPeerRegistry | None = None
@@ -1719,35 +1932,143 @@ async def _run_prepared(prepared: PreparedPiRunner, early_stop: threading.Event,
         budget_task = asyncio.create_task(
             _budget_watch_loop(prepared.client, stop_event, state),
             name="pi-budget-watch")
-        guard_task = asyncio.create_task(
-            _session_guard_loop(prepared, stop_event, state),
-            name="pi-session-guard")
-        stop_wait = asyncio.create_task(stop_event.wait(), name="pi-stop")
-        try:
-            return_value = await _session_loop(prepared, process, queue, stop_event,
-                                               stop_wait, state)
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:
-            # Readiness was already announced: report a terminal infra failure so
-            # the supervisor does not have to restart the runner to learn it.
-            return_value = {"agent_id": prepared.spec.agent_id,
-                            "status": "infra_failed", "turns": _turns(state),
-                            "error": type(exc).__name__}
-            prepared.append_event("agent_error", {
-                "runtime": "pi", "error": type(exc).__name__})
-            prepared.append_event("agent_stopped", {
-                "runtime": "pi", "status": "infra_failed", "turns": _turns(state)})
-        state["status"] = return_value.get("status", "infra_failed")
-        snapshot = prepared.artifact_budget.snapshot()
-        return_value.setdefault("artifact_bytes", snapshot["used_bytes"])
-        return_value.setdefault("artifact_limit_bytes", snapshot["limit_bytes"])
-        return_value.setdefault("artifact_retained_count", snapshot["retained_count"])
-        return_value.setdefault("artifact_metadata_bytes", snapshot["metadata_bytes"])
-        return_value.setdefault("artifact_pressure", bool(snapshot["pressure_recorded"]))
-        return_value.setdefault("artifact_budget_state", snapshot["state"])
-        await _deliver_finished(prepared.client, return_value, real_stdout)
-        return 0
+        initial_prompt = _initial_prompt(prepared)
+        while True:
+            stop_event.clear()
+            state["rotation_allowed"] = rotation_limit > 0
+            guard_task = asyncio.create_task(
+                _session_guard_loop(prepared, stop_event, state),
+                name="pi-session-guard")
+            stop_wait = asyncio.create_task(stop_event.wait(), name="pi-stop")
+            try:
+                return_value = await _session_loop(prepared, process, queue,
+                                                   stop_event, stop_wait, state,
+                                                   initial_prompt=initial_prompt)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                # Readiness was already announced: report a terminal infra failure so
+                # the supervisor does not have to restart the runner to learn it.
+                return_value = {"agent_id": prepared.spec.agent_id,
+                                "status": "infra_failed", "turns": _turns(state),
+                                "error": type(exc).__name__}
+                prepared.append_event("agent_error", {
+                    "runtime": "pi", "error": type(exc).__name__})
+                prepared.append_event("agent_stopped", {
+                    "runtime": "pi", "status": "infra_failed", "turns": _turns(state)})
+            for task in (guard_task, stop_wait):
+                if task is not None and not task.done():
+                    task.cancel()
+            await asyncio.gather(*[task for task in (guard_task, stop_wait)
+                                   if task is not None], return_exceptions=True)
+            guard_task = stop_wait = None
+            if return_value.get("status") == "session_rotate":
+                if state["session_rotations"] < rotation_limit:
+                    old_files = [item["path"] for item in
+                                 _session_files(prepared.paths.session_dir)]
+                    handoff = _rotation_handoff(prepared)
+                    old_bytes = int(state.get("session_bytes") or 0)
+                    try:
+                        # A fresh Pi session must re-bind the loopback model
+                        # provider. Restore the 0600 models.json before
+                        # new_session; re-arm the one-shot scrub so the next
+                        # authenticated model request removes it again.
+                        if prepared.proxy.client_api_key:
+                            _write_private(
+                                prepared.paths.models_path,
+                                json.dumps(_models_document(
+                                    prepared.spec, prepared.proxy.base_url,
+                                    prepared.proxy.client_api_key),
+                                    ensure_ascii=False, indent=2) + "\n")
+                            prepared.proxy.rearm_client_auth_scrub()
+                        response = await _pi_command_response(
+                            prepared, process, queue, state,
+                            {"type": "new_session"}, timeout_s=30.0)
+                        if not response.get("success"):
+                            raise PiRunnerError(
+                                "Pi new_session rejected: " +
+                                str(response.get("error", ""))[:500])
+                        archived = []
+                        for path in old_files:
+                            if path.is_file():
+                                archived.append(_archive_session_path(
+                                    path, prepared.paths.session_dir,
+                                    prepared.spec.state_root))
+                    except Exception as exc:
+                        prepared.append_event("pi_session_rotation_failed", {
+                            "runtime": "pi", "reason": "new_session_failed",
+                            "error": type(exc).__name__,
+                            "bytes": old_bytes,
+                            "limit_bytes": prepared.spec.pi_session_max_bytes,
+                        })
+                        return_value = {
+                            "agent_id": prepared.spec.agent_id,
+                            "status": "infra_failed",
+                            "reason": "pi_session_rotation_failed",
+                            "error": type(exc).__name__,
+                            "turns": _turns(state),
+                            "session_bytes": old_bytes,
+                            "session_limit_bytes": prepared.spec.pi_session_max_bytes,
+                        }
+                        prepared.append_event("agent_stopped", {
+                            "runtime": "pi", "status": "infra_failed",
+                            "reason": "pi_session_rotation_failed",
+                            "turns": _turns(state)})
+                    else:
+                        state["session_rotations"] += 1
+                        state["session_limit"] = False
+                        state["session_rotation_requested"] = False
+                        state["session_alerted"] = []
+                        state["session_bytes"] = 0
+                        state["session_last_sample_at"] = time.monotonic()
+                        state["session_last_sample_bytes"] = None
+                        prepared.append_event("pi_session_rotated", {
+                            "runtime": "pi", "reason": "pi_session_max_bytes",
+                            "automatic": True,
+                            "rotation": state["session_rotations"],
+                            "session_epoch": state["session_rotations"],
+                            "bytes": old_bytes,
+                            "limit_bytes": prepared.spec.pi_session_max_bytes,
+                            "archived": archived,
+                            "handoff_chars": len(handoff),
+                            "handoff_sha256": hashlib.sha256(
+                                handoff.encode("utf-8")).hexdigest(),
+                        })
+                        initial_prompt = _rotation_prompt(handoff)
+                        continue
+                else:
+                    prepared.append_event("pi_session_rotation_exhausted", {
+                        "runtime": "pi", "reason": "pi_session_max_bytes",
+                        "rotations": state["session_rotations"],
+                        "limit": rotation_limit,
+                        "bytes": state.get("session_bytes"),
+                        "limit_bytes": prepared.spec.pi_session_max_bytes,
+                    })
+                    return_value = {
+                        "agent_id": prepared.spec.agent_id,
+                        "status": "infra_failed",
+                        "reason": "pi_session_rotation_exhausted",
+                        "turns": _turns(state),
+                        "session_rotations": state["session_rotations"],
+                        "session_bytes": state.get("session_bytes"),
+                        "session_limit_bytes": prepared.spec.pi_session_max_bytes,
+                    }
+                    prepared.append_event("agent_stopped", {
+                        "runtime": "pi", "status": "infra_failed",
+                        "reason": "pi_session_rotation_exhausted",
+                        "turns": _turns(state)})
+            state["status"] = return_value.get("status", "infra_failed")
+            snapshot = prepared.artifact_budget.snapshot()
+            return_value.setdefault("artifact_bytes", snapshot["used_bytes"])
+            return_value.setdefault("artifact_limit_bytes", snapshot["limit_bytes"])
+            return_value.setdefault("artifact_retained_count", snapshot["retained_count"])
+            return_value.setdefault("artifact_metadata_bytes", snapshot["metadata_bytes"])
+            return_value.setdefault("artifact_pressure", bool(snapshot["pressure_recorded"]))
+            return_value.setdefault("artifact_budget_state", snapshot["state"])
+            return_value.setdefault("session_rotations", state["session_rotations"])
+            await _deliver_finished(prepared.client, return_value, real_stdout)
+            return 0
+
     finally:
         for task in (pump_task, heartbeat_task, budget_task, guard_task, stop_wait):
             if task is not None and not task.done():

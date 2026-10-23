@@ -64,7 +64,8 @@ DEFAULTS = {
                 # Pi session JSONL and model/tool artifact retention. Sessions
                 # older than the prune point are removed on runner start; new
                 # artifacts above the cap become metadata-only summaries.
-                "pi_session_max_bytes": 1_000_000_000,
+                "pi_session_max_bytes": 2_000_000_000,
+                "pi_session_rotation_limit": 3,
                 "pi_artifact_max_bytes": 4_000_000_000},
     "supervision": {"poll_interval_s": .2, "evaluation_interval_s": 2, "resource_check_interval_s": 5, "resource_sample_interval_s": 10,
                     "recovery_attempts": 3, "max_recoveries": 20, "recovery_base_s": 1, "recovery_max_s": 30, "shutdown_timeout_s": 30,
@@ -287,7 +288,10 @@ def validate_config(raw: dict) -> dict:
         raise ValueError("server.managed_container is invalid")
     for key, value in result["storage"].items():
         if key in DEFAULTS["storage"]:
-            _integer(value, "storage." + key, minimum=0 if key == "min_free_disk_bytes" else 1024)
+            minimum = 0 if key in {"min_free_disk_bytes", "pi_session_rotation_limit"} else 1024
+            _integer(value, "storage." + key, minimum=minimum)
+    _integer(result["storage"]["pi_session_rotation_limit"],
+             "storage.pi_session_rotation_limit", minimum=0, maximum=100)
     if result["storage"]["max_artifact_bytes"] > result["storage"]["max_run_bytes"]:
         raise ValueError("storage.max_artifact_bytes cannot exceed storage.max_run_bytes")
     if result["storage"]["pi_artifact_max_bytes"] > result["storage"]["max_run_bytes"]:

@@ -838,6 +838,17 @@ class PiModelProxy:
         return peer_pid == allowed
 
     # -- HTTP handling --------------------------------------------------
+    def rearm_client_auth_scrub(self) -> None:
+        """Re-arm the one-shot auth-file scrub after an in-place Pi rotation.
+
+        Pi's new_session keeps the process and model registry alive, but it may
+        need the loopback models.json again to bind a model. Re-write that file
+        before new_session, then scrub it after the first authenticated model
+        request of the fresh session.
+        """
+        with self._auth_lock:
+            self._client_authenticated = False
+
     def _authenticate_client(self, handler: "_ProxyHandler") -> bool:
         """Validate the per-run Pi CLI credential on local model requests.
 

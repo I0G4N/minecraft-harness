@@ -7,7 +7,7 @@
 - 玩家和 Observer 都使用真实 Pi coding-agent CLI（`runtime.runner_runtime: pi`，RPC 模式）：Pi 负责 loop/session/context/compaction；玩家工具为 built-in read/write/edit/bash + memory/web extension，游戏只经 `mc exec --file`；Observer 使用只读 `records_read/evidence_read/observer_report/infra_issue`，无 bash/mc/team-memory/broker。Python 只保留 Supervisor、ledger、budget、Minecraft gateway 和 python-mode 回退。下一轮 `minecraft-paper-runner-20261022.yaml` 已切 `runner_runtime: pi` + container。`pi_runtime` 依赖 pin 到 1.4.0，首次部署需 `npm ci --prefix pi_runtime`。
 - 内部仍保留 Python runtime 的 Pi 风格 context projection / compaction / branch summary / effect sandwich：工具先写 `tool_intent`（仅参数 SHA256），崩溃后 `tool_effect_unknown` 且不重放；团队记忆 FTS5 ranked `memory_search`。这些只在 `runner_runtime=python` 或 Observer 路径使用。
 - 长程稳定性：单玩家 model/infra 失败按 `agent_failure_policy=isolate` 记录 `agent_degraded` 并继续；Observer 失败默认 `observer_degraded` 降级；pause 不再消耗 wall budget；web 调用受 `budgets.max_web_calls` 限制；runner RPC 有默认超时；Compose 的 identity/launcher/bot 使用 `unless-stopped`；runner 重启加载 `run_dir/source-snapshot` 冻结源码。runner-mode Observer 通过 ledger 重要事件在 ≤1 s 内唤醒 review。
-- 验证：Python **757 passed, 3 skipped, 734 subtests**；Pi/Observer 定向 **196 passed / 119 subtests**（含真实 Pi CLI host e2e、memory/web extension、fixture observer bridge/RPC、session/artifact retention）；Node **51 passed**。**本窗口已跑真实 DeepSeek 的 host + container Pi credential smoke**（synthetic Minecraft runtime；见 REAL_SMOKE_2026-10-23.md）：host 15/15 model/tool、container 13/13 model + 15/15 tool，均无 token/key 泄漏；3 个 Docker-gated 完整 compose 测试仍 skipped；已跑 6-agent 真实 Minecraft 全栈 smoke（6/6 runtime_ready，40/40 model，52/51 tools，0 infrastructure_error），详见 SIX_AGENT_SMOKE_2026-10-23.md。`run-paper.sh --prepare` 现在会在 compose up 之前检查**两个** Pi extension（`minecraft-tools.js` + `observer-tools.js`），并跑一次无启动容器镜像 probe（Node ≥ 22 / Pi CLI / 两扩展 / Python imports，`docker run --rm --network none`）；Docker 不可用时只报告并拒绝启动。`final11` 已停止并归档（旧 Supervisor 退出、compose down，run 目录保留）；6-agent smoke 已完成。`run-paper.sh` 默认只 prepare，`--start` 才启动。
+- 验证：Python **762 passed, 3 skipped, 734 subtests**；Pi/Observer 定向 **196 passed / 119 subtests**（含真实 Pi CLI host e2e、memory/web extension、fixture observer bridge/RPC、session/artifact retention）；Node **51 passed**。**本窗口已跑真实 DeepSeek 的 host + container Pi credential smoke**（synthetic Minecraft runtime；见 REAL_SMOKE_2026-10-23.md）：host 15/15 model/tool、container 13/13 model + 15/15 tool，均无 token/key 泄漏；3 个 Docker-gated 完整 compose 测试仍 skipped；已跑 6-agent 真实 Minecraft 全栈 smoke（6/6 runtime_ready，40/40 model，52/51 tools，0 infrastructure_error），详见 SIX_AGENT_SMOKE_2026-10-23.md。`run-paper.sh --prepare` 现在会在 compose up 之前检查**两个** Pi extension（`minecraft-tools.js` + `observer-tools.js`），并跑一次无启动容器镜像 probe（Node ≥ 22 / Pi CLI / 两扩展 / Python imports，`docker run --rm --network none`）；Docker 不可用时只报告并拒绝启动。`final11` 已停止并归档（旧 Supervisor 退出、compose down，run 目录保留）；6-agent smoke 已完成。`run-paper.sh` 默认只 prepare，`--start` 才启动。
 - 详细设计、偏差与验收命令见 [PI_METHOD_ALIGNMENT.md](PI_METHOD_ALIGNMENT.md) 第 9 节。
 
 ## 2026-10-21 真实模型复核与修复（独立运行）
@@ -125,12 +125,12 @@
 - Pi session/artifact retention：session 启动剪枝/活跃超限轮转，artifact 共享预算超限转 metadata-only；paper run 配置 1 GB/8 GB。
 - Observer：`runner_runtime=pi` 时改用 `pi_observer_runner.py` + observer 只读 tool bridge/ServiceHub RPC，Python ObserverAgent 仅作回退。
 - 安全审计 F1–F6 已修（PID1 env、artifact grant 所有权、viewed-event 证据、report key 注入、bridge 错误泄漏、infra issue id/kinds）。
-- 验证：757 passed / 3 skipped / 734 subtests；Pi/Observer 定向 196 passed / 119 subtests。本窗口真实 DeepSeek host+container Pi credential smoke 均通过（synthetic runtime；见 REAL_SMOKE_2026-10-23.md）；3 个 Docker-gated 完整 compose 测试仍 skipped；已跑 6-agent 真实 Minecraft 全栈 smoke（6/6 runtime_ready，40/40 model，52/51 tools，0 infrastructure_error），详见 SIX_AGENT_SMOKE_2026-10-23.md。`run-paper.sh --prepare` 新增无启动镜像 probe：要求两个 Pi extension，检查 Node ≥ 22 / Pi CLI / Python imports，Docker 不可用或 probe 失败即拒绝 `--start`。
+- 验证：762 passed / 3 skipped / 734 subtests；Pi/Observer 定向 196 passed / 119 subtests。本窗口真实 DeepSeek host+container Pi credential smoke 均通过（synthetic runtime；见 REAL_SMOKE_2026-10-23.md）；3 个 Docker-gated 完整 compose 测试仍 skipped；已跑 6-agent 真实 Minecraft 全栈 smoke（6/6 runtime_ready，40/40 model，52/51 tools，0 infrastructure_error），详见 SIX_AGENT_SMOKE_2026-10-23.md。`run-paper.sh --prepare` 新增无启动镜像 probe：要求两个 Pi extension，检查 Node ≥ 22 / Pi CLI / Python imports，Docker 不可用或 probe 失败即拒绝 `--start`。
 
 ### 已知残余与未验证（2026-10-23，accepted / 后续 task）
 
 - **Pi 子进程凭据残余（P2-3/P2-6，accepted）**：`/proc/<runner>/environ` 已不再暴露 model key / RPC token（`PR_SET_DUMPABLE=0`，container runner 无 `--init`）；但 Pi 子进程 env 仍含 bridge token（只授权 memory/web/observer 工具）和 player `MC_AGENT_TOKEN`（游戏/CLI 必需）。model 可用自身 bash 读取该 env 并直接调用 loopback bridge，从而绕过 Pi 的 `tool_intent/tool_result` 投影（ServiceHub 仍记录 memory/reference 事件）。该偏差已记录并接受，**不得据此宣称完整工具事件审计**。
-- **active session 停止不自动轮转（P2-4，accepted residual）**：达到 `storage.pi_session_max_bytes` 的活跃 session 会 clean abort 并记录事件，但**不会在进程内自动归档/重启**，也**没有操作者告警阈值**；player 映射为 `infra_failed`/`agent_degraded`，Observer 为 `observer_degraded`，run 继续但已失去该 agent。54h run 需人工监控，自动轮转/告警为后续改进。
+- **active session 自动轮转（2026-10-23 已实现）**：Pi session cap 默认 2 GB；80/90/95% 发 `pi_session_alert`，每 60s 发 `pi_session_sample`；95% 触发有界 in-run rotation（默认最多 3 次）：停止当前 turn、发送 Pi `new_session`、归档旧 JSONL、用 compaction handoff prompt 继续，事件 `pi_session_rotation_started`/`pi_session_rotated` 显式记录。Observer 仍为 hard-stop 路径。
 - **run-wide retention（P1-5 已修）**：artifact 会计由 ServiceHub `<run_dir>/pi-budget.sqlite3` 集中控制（per-agent + global cap、原子 take、RPC fail-closed）；model-writable `/state/pi-artifact-budget.json` 伪造/删除不能重置 usage。Session retention 仍为 filesystem-based。
 - **容器 Pi smoke 本窗口未验证（P2-5）**：只有历史一次性 smoke；本窗口 3 个 Docker-gated 测试 skipped。付费长 run 前必须用专用 Docker 窗口跑真实 container Pi/Compose 短 smoke 并记录实际 image ID。
 
@@ -140,7 +140,7 @@
 - P1-2：mid-stream SSE 不再二次 HTTP 响应/终止符，只有 model_error + 一次 UNKNOWN settle。
 - P1-3：paper pi+container 默认 `runner_egress=model_only`：runner `--network none`，host UDS PiModelForwarder 只转发 `/v1/chat/completions`，provider key 不进入 runner env。
 - P1-4：ArtifactBudget 持久化（含 metadata）、玩家/Observer 关闭 retention、90% pressure、paper 5-agent 40GB < 51.5GB 上限。
-- P2：wrapper 双 extension + no-start image probe；docs 当前 757 passed / 3 skipped / 734 subtests；bridge/MC token、active-session 无自动轮转、完整 Docker 全栈 smoke 仍是 residual。
+- P2：wrapper 双 extension + no-start image probe；docs 当前 762 passed / 3 skipped / 734 subtests；bridge/MC token、完整 Docker 全栈 smoke 仍是 residual；Pi session 自动轮转/告警已实现。
 
 ## 2026-10-23 Pi 本地凭据隔离 + 真实烟测
 
@@ -158,7 +158,7 @@
   - recovery/server-health 期间的 pause/freeze control 会取消该 operation 并立即应用 control；
   - recovery 失败增加 backoff；达到 `max_recoveries` 后停止自动 recovery，等待 operator pause/stop/resume；
   - resume 清除 paused/recovery-exhausted gate。
-- 测试：新增 pause/resume control unit test；全量 **757 passed / 3 skipped / 734 subtests**。
+- 测试：新增 pause/resume control unit test；全量 **762 passed / 3 skipped / 734 subtests**。
 - `final11` 已停止并归档；新代码只影响未来启动的 Supervisor。
 
 
@@ -192,7 +192,7 @@
   **0 bot kick、0 heartbeat timeout、pending {}**、0 infrastructure_error；
   recheck model p50 1.31s / p95 4.17s / max 7.84s（此前 5min run 为 1.64/5.83/18.19，
   非受控对比）。
-- 全量 Python：**757 passed, 3 skipped, 734 subtests**。
+- 全量 Python：**762 passed, 3 skipped, 734 subtests**。
 
 
 ## 2026-10-23 max_run_bytes 调整
@@ -204,3 +204,19 @@
 - `max_artifact_bytes`/`pi_artifact_max_bytes` 仍为 16 GiB/4 GB，低于新 run cap。
 - 长程检查报告已注明：100 GiB 下按 8-agent 5min 粗估约 100h 余量，但真实长时
   storage 曲线仍是 54h 前的必测项。
+
+
+## 2026-10-23 Pi session cap / auto-rotation
+
+- `storage.pi_session_max_bytes`: **2,000,000,000 bytes (2 GB)**；
+  `storage.pi_session_rotation_limit`: **3**（0–100，0 表示不自动轮转）。
+- 80/90/95% 阈值发 `pi_session_alert`；每 60s 发 `pi_session_sample`
+  （bytes/limit/percent/growth/rotations）。
+- 95% 在 Pi RPC 进程内执行有界 rotation：`new_session` + 归档旧 JSONL +
+  compaction handoff prompt + 重新发 prompt；不重启 Pi 进程，不丢 workspace/memory。
+- rotation 失败（abort timeout/new_session/archive）会记录
+  `pi_session_rotation_failed` 并降级；达到 rotation limit 记录
+  `pi_session_rotation_exhausted` 后按 infra_failed 结束该 agent。
+- Observer 目前仍是 2GB hard-stop + alerts，不含 in-run rotation。
+- 新增 e2e：真实 Pi CLI + fake upstream，强制小 cap 触发 rotation，验证
+  `pi_session_rotation_started`/`pi_session_rotated`、旧 session 归档和继续执行。

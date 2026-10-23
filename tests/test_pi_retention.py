@@ -52,7 +52,7 @@ def _write_session(path: Path, size: int, *, age_seconds: float) -> None:
     os.utime(path, (stamp, stamp))
 
 
-def _fake_prepared(root: Path, *, session_max: int):
+def _fake_prepared(root: Path, *, session_max: int, rotation_limit: int = 0):
     session_dir = root / "pi-sessions"
     session_dir.mkdir(parents=True, exist_ok=True)
     append_event = lambda kind, payload: _fake_prepared.events.append((kind, payload))  # noqa: E731
@@ -61,6 +61,8 @@ def _fake_prepared(root: Path, *, session_max: int):
         paths=SimpleNamespace(session_dir=session_dir,
                               agent_dir=root / "state" / "home" / ".pi" / "agent"),
         spec=SimpleNamespace(pi_session_max_bytes=session_max,
+                             pi_session_rotation_limit=rotation_limit,
+                             state_root=root / "state",
                              agent_id="player1"),
         append_event=append_event,
     )
@@ -174,7 +176,12 @@ class SessionRetentionTests(unittest.TestCase):
         self.assertTrue(state["session_limit"])
         self.assertEqual(state["session_bytes"], 2000)
         kinds = [kind for kind, _payload in _fake_prepared.events]
-        self.assertEqual(kinds, ["pi_retention_pressure", "pi_session_size_limit"])
+        self.assertEqual(kinds, ["pi_session_alert", "pi_session_alert",
+                                 "pi_session_alert", "pi_session_size_limit"])
+        self.assertTrue(all(payload["severity"] == "warning" or
+                            payload["severity"] == "critical"
+                            for kind, payload in _fake_prepared.events
+                            if kind == "pi_session_alert"))
         limit_event = next(payload for kind, payload in _fake_prepared.events
                            if kind == "pi_session_size_limit")
         self.assertEqual(limit_event["limit_bytes"], 1000)
@@ -253,7 +260,8 @@ class SpecAndConfigTests(unittest.TestCase):
     def test_config_validation_of_retention_knobs(self):
         defaults = validate_config({})
         self.assertEqual(defaults["storage"]["pi_session_max_bytes"],
-                         1_000_000_000)
+                         2_000_000_000)
+        self.assertEqual(defaults["storage"]["pi_session_rotation_limit"], 3)
         self.assertEqual(defaults["storage"]["pi_artifact_max_bytes"],
                          4_000_000_000)
         with self.assertRaises(ValueError):
@@ -504,22 +512,45 @@ class SessionPressureTests(unittest.TestCase):
         self.addCleanup(self.temporary.cleanup)
         self.root = Path(self.temporary.name)
 
-    def test_near_cap_session_emits_one_pressure_event(self):
+    def test_near_cap_session_emits_threshold_alerts(self):
         prepared = _fake_prepared(self.root, session_max=1000)
         _write_session(prepared.paths.session_dir / "active.jsonl", 950, age_seconds=1)
         stop_event = asyncio.Event()
         state: dict = {}
         self.assertFalse(pi_runner._check_active_session_limit(prepared, state, stop_event))
         self.assertFalse(stop_event.is_set())
-        pressure = [payload for kind, payload in _fake_prepared.events
-                    if kind == "pi_retention_pressure"]
-        self.assertEqual(len(pressure), 1)
-        self.assertEqual(pressure[0]["kind"], "session")
-        self.assertEqual(pressure[0]["used_bytes"], 950)
+        alerts = [payload for kind, payload in _fake_prepared.events
+                  if kind == "pi_session_alert"]
+        self.assertEqual([item["threshold"] for item in alerts], [0.8, 0.9, 0.95])
+        self.assertEqual(alerts[-1]["severity"], "critical")
         pi_runner._check_active_session_limit(prepared, state, stop_event)
-        pressure = [payload for kind, payload in _fake_prepared.events
-                    if kind == "pi_retention_pressure"]
-        self.assertEqual(len(pressure), 1)
+        self.assertEqual(len([kind for kind, _payload in _fake_prepared.events
+                              if kind == "pi_session_alert"]), 3)
+
+    def test_rotation_threshold_requests_rotation_without_hard_stop(self):
+        prepared = _fake_prepared(self.root, session_max=1000, rotation_limit=3)
+        _write_session(prepared.paths.session_dir / "active.jsonl", 960, age_seconds=1)
+        stop_event = asyncio.Event()
+        state: dict = {"rotation_allowed": True}
+        self.assertTrue(pi_runner._check_active_session_limit(prepared, state, stop_event))
+        self.assertTrue(stop_event.is_set())
+        self.assertTrue(state["session_rotation_requested"])
+        kinds = [kind for kind, _payload in _fake_prepared.events]
+        self.assertIn("pi_session_rotation_started", kinds)
+        self.assertNotIn("pi_session_size_limit", kinds)
+
+    def test_growth_sample_is_recorded_periodically(self):
+        prepared = _fake_prepared(self.root, session_max=1000)
+        _write_session(prepared.paths.session_dir / "active.jsonl", 500, age_seconds=1)
+        state: dict = {"session_last_sample_at": time.monotonic() - 61,
+                       "session_last_sample_bytes": 100}
+        stop_event = asyncio.Event()
+        pi_runner._check_active_session_limit(prepared, state, stop_event)
+        samples = [payload for kind, payload in _fake_prepared.events
+                   if kind == "pi_session_sample"]
+        self.assertEqual(len(samples), 1)
+        self.assertEqual(samples[0]["bytes"], 500)
+        self.assertEqual(samples[0]["growth_bytes"], 400)
 
     def test_startup_near_cap_retention_warns(self):
         client = _FakeClient()
@@ -570,7 +601,7 @@ class PaperCapTests(unittest.TestCase):
         archive = pi_runner.PI_SESSION_ARCHIVE_MAX_BYTES
         max_run = storage["max_run_bytes"]
         self.assertEqual(artifacts, 6_000_000_000)
-        self.assertEqual(sessions, 1_000_000_000)
+        self.assertEqual(sessions, 2_000_000_000)
         self.assertEqual(archive, 1_000_000_000)
         agents = 5  # 4 players + Observer
         total = agents * (artifacts + sessions + archive)
@@ -889,3 +920,34 @@ class CentralBudgetIsolationTests(unittest.TestCase):
         # The trusted authority lives beside the mounted state dir, not inside it.
         budget_path = self.run_dir / "pi-budget.sqlite3"
         self.assertNotEqual(budget_path.parent, state_dir)
+
+
+class RotationHandoffTests(unittest.TestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.root = Path(self.temporary.name)
+
+    def test_handoff_summary_is_read_and_oversized_session_is_archived(self):
+        prepared = _fake_prepared(self.root, session_max=2_000_000_000,
+                                  rotation_limit=3)
+        session = prepared.paths.session_dir / "active.jsonl"
+        session.write_text(
+            json.dumps({"type": "session", "id": "s1"}) + "\n" +
+            json.dumps({"type": "compaction", "summary": "carry forward objective X"}) + "\n" +
+            json.dumps({"type": "message", "message": {"role": "user"}}) + "\n",
+            encoding="utf-8")
+        handoff = pi_runner._rotation_handoff(prepared)
+        self.assertIn("carry forward objective X", handoff)
+        prompt = pi_runner._rotation_prompt(handoff)
+        self.assertIn("HANDOFF SUMMARY", prompt)
+        self.assertIn("carry forward objective X", prompt)
+        archived = pi_runner._archive_session_path(
+            session, prepared.paths.session_dir, prepared.spec.state_root)
+        self.assertFalse(session.exists())
+        archived_path = prepared.spec.state_root / "pi-sessions-archive" / archived["archived"]
+        self.assertTrue(archived_path.is_file())
+        self.assertIn("carry forward objective X", archived_path.read_text(encoding="utf-8"))
+
+    def test_rotation_prompt_falls_back_to_generic_recovery(self):
+        self.assertEqual(pi_runner._rotation_prompt(""), pi_runner.ROTATED_PROMPT)

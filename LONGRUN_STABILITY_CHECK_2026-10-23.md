@@ -81,13 +81,14 @@ Actions:
 - Do not extrapolate from the 300 s fake soak; it has much higher call rate and
   different artifact sizes.
 
-### 2. Active Pi-session cap stops the agent, not auto-rotate
+### 2. Active Pi-session rotation (fixed after this check)
 
-`_check_active_session_limit` sets `session_limit`, stops the Pi runner, and
-records `pi_session_size_limit`; the Supervisor does not automatically rotate
-that agent's session in place or raise an operator alert. A long run can lose
-one agent while continuing. Pre-spawn retention/rotation works, but active-run
-rotation is not automated.
+The original check found that `_check_active_session_limit` only stopped the
+agent. Since then the cap is 2 GB, 80/90/95% alerts and 60s growth samples are
+recorded, and at 95% the player Pi runner performs a bounded in-place
+`new_session` rotation with JSONL archive + compaction handoff (default max 3).
+The Observer remains on the hard-stop path. See
+`IMPLEMENTATION_STATUS.md` 2026-10-23 Pi session cap / auto-rotation.
 
 Actions:
 

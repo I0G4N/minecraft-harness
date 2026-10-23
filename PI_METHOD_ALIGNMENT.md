@@ -165,14 +165,14 @@ mtime 与 18:33 一致，`runner_*` 事件为 0。
 | 长程稳定性 | `supervisor.py`、`budget.py`、`runner_rpc.py`、`agents/web.py`、`deployment_generation.py`、`infra/compose*.yaml`、`tests/test_stability.py` | 62 passed（定向）；RPC 3.12 回归 23 passed |
 | source snapshot + runner 预算接线 | `runners.py`、`runner.py`、`tests/test_source_snapshot.py`、`tests/test_runner_entry.py` | 77 passed（-k not container）；3 个 Docker gate 跳过 |
 | **Pi RPC 玩家/Observer runtime** | `pi_runner.py`、`pi_observer_runner.py`、`pi_model_proxy.py`、`pi_tool_bridge.py`、`pi_observer_bridge.py`、`pi_security.py`、`runners.py`、`config.py`、`supervisor.py`、`pi_runtime/extensions/*.js`、`tests/test_pi_*.py`、`test_observer_rpc.py` | Pi/Observer 定向 **196 passed / 119 subtests**（memory/web、retention、Observer bridge/RPC、host e2e）；paper-runner config 已切 `runner_runtime: pi` + container |
-| 全量回归（Pi 接线后） | 宿主 `.test-venv`（3.12） | **757 passed, 3 skipped, 734 subtests**；Pi/Observer 定向 196 passed / 119 subtests |
+| 全量回归（Pi 接线后） | 宿主 `.test-venv`（3.12） | **762 passed, 3 skipped, 734 subtests**；Pi/Observer 定向 196 passed / 119 subtests |
 
 验收命令（宿主，不启动实验 / 不启动 Docker）：
 
 ```bash
 cd /ssd_data/caizihao/minecraft/zkdx/experiments/minecraft_harness
 PYTHONPATH=$PWD/src:$PWD/.venv/lib/python3.11/site-packages \
-  .test-venv/bin/python -m pytest -q          # 757 passed, 3 skipped, 734 subtests
+  .test-venv/bin/python -m pytest -q          # 762 passed, 3 skipped, 734 subtests
 PYTHONPATH=$PWD/src:$PWD/.venv/lib/python3.11/site-packages \
   .test-venv/bin/python -m pytest -q \
   tests/test_pi_model_proxy.py tests/test_pi_runner_manager.py \
@@ -183,7 +183,7 @@ npm test --prefix bot_runtime                 # 51 passed（上一窗口）
 已知剩余边界（下一轮正式 run 前应记录为 deviation）：
 
 - 全量 suite 已恢复绿色：`test_pi_runner_manager.py` 的旧断言已更新为
-  paper-runner=pi / whole-session=python；当前 757 passed, 3 skipped, 734 subtests。
+  paper-runner=pi / whole-session=python；当前 762 passed, 3 skipped, 734 subtests。
 - 模型/主机仍是 DeepSeek `deepseek-flash` + 同机容器，不是 Gemini 4 Argon + 5 台 cloud machine。
 - Docker-gated runner 容器测试（3 个）本窗口仍未执行（skipped，未启动 Docker）；source snapshot
   的容器挂载由单元测试覆盖，正式 run 前应在专用窗口跑 gated 测试。
@@ -322,11 +322,14 @@ wrapper 默认）已显式切到 `runtime.runner_runtime: pi` + `runner_mode: co
     tool-call smoke（4 次 bash tool，全部 is_error=false，proof 文件写入，4 次
     reserve/settle）均成功；fake SSE 测试之外的 provider 兼容性风险降低，但仍需
     container/compose 全栈短 smoke。
-11. **active session 停止不自动轮转（P2-4，accepted residual）**：达到
-    `storage.pi_session_max_bytes` 的活跃 session clean abort + 事件后**不会在进程内自动
+11. **active session 自动轮转（2026-10-23 已实现）**：达到
+    `storage.pi_session_max_bytes`（默认 2 GB）的活跃 session 达到 95% 后会进行**有界
+    自动 rotation**：记录 alert/sample，停止当前 Pi turn，发送 `new_session`，归档旧
+    JSONL，并用 compaction handoff prompt 继续；默认每 agent 最多 3 次，事件显式记录。
+    旧文句（不会自动轮转）已过时；Observer 目前仍为 hard-stop 路径。
     归档/重启**；player 映射 `infra_failed`/`agent_degraded`，Observer 映射
     `observer_degraded`，run 继续但已失去该 agent，且**没有操作者告警阈值**。54h run 需
-    人工监控；自动轮转/告警属后续改进。
+    人工监控；自动轮转/告警已实现，Observer 仍为 hard-stop。
 12. **run-wide retention（P1-5 已修）**：artifact 会计已移到受信 ServiceHub：
     `<run_dir>/pi-budget.sqlite3`（0600，WAL，不挂载）保存每 agent used/metadata/retained/
     pressure，`pi.budget.take/charge_metadata/snapshot` 走身份绑定的 RPC；每个 take 在
@@ -387,7 +390,7 @@ reserve/settle 恰好一次、ready/heartbeat/finished、SIGTERM 干净收尾、
   cap-drop 容器内同 uid 读 `/proc/1/environ` 得 `PermissionError`。Pi 子进程仍持有
   bridge token（只授权固定工具）与 player `MC_AGENT_TOKEN`（游戏必需），不再持有上游 key/
   RPC token。
-- **Pi session/artifact retention**：`storage.pi_session_max_bytes`（默认 1 GB）在 runner
+- **Pi session/artifact retention**：`storage.pi_session_max_bytes`（默认 2 GB）在 runner
   启动时剪枝最旧完整 session，活跃 session 超限则原子归档并 fresh start（recovery prompt）；
   运行中每 ~30 s 检查，超限 clean abort + `pi_session_size_limit` 事件。共享
   `ArtifactBudget`（默认 4 GB）覆盖 model request/response、tool result、compaction；超限
@@ -401,7 +404,7 @@ reserve/settle 恰好一次、ready/heartbeat/finished、SIGTERM 干净收尾、
   advisory-only），active 轮询 ledger important event 或 interval。
 - **安全审计**：[AUDIT_2026-10-23_OBSERVER_SECURITY.md](AUDIT_2026-10-23_OBSERVER_SECURITY.md)
   的 F1–F6 全部修复：容器 PID1 env、artifact grant 所有权、viewed-event 证据绑定、报告
-  key 注入、bridge 错误泄漏、infra_issue issue_id/kind。全量 **757 passed, 3 skipped,
+  key 注入、bridge 错误泄漏、infra_issue issue_id/kind。全量 **762 passed, 3 skipped,
   734 subtests**；Pi/Observer 定向 **196 passed / 119 subtests**。完整 4-agent compose
   长测仍待专用 Docker 窗口。
 
@@ -425,11 +428,11 @@ reserve/settle 恰好一次、ready/heartbeat/finished、SIGTERM 干净收尾、
   `<run_dir>/pi-budget.sqlite3` 集中控制（0600，WAL，不挂载；per-agent + `max_run_bytes`
   global cap；每个 take 是 `BEGIN IMMEDIATE` 原子事务；伪造/删除 model-writable marker 不能
   重置 usage；RPC 不可用 fail-closed）。玩家/Observer 关闭时执行 session retention 并 flush；
-  90% artifact/session pressure 事件；paper 配置每 agent 6 GB artifacts + 1 GB session +
+  90% artifact/session pressure 事件；paper 配置每 agent 6 GB artifacts + 2 GB session +
   1 GB archive，5 agents session/archive 共 10 GB + artifacts global cap < 51.5 GB run cap。
 - **P2**：wrapper preflight 要求两个 Pi extension 并在 compose 前做 no-start image probe；
-  docs 统一到当前 full suite **757 passed, 3 skipped, 734 subtests**（3 个 Docker-gated
-  skip）；bridge/MC token、active-session 无自动轮转、完整容器 smoke 未执行均明确记录为
+  docs 统一到当前 full suite **762 passed, 3 skipped, 734 subtests**（3 个 Docker-gated
+  skip）；bridge/MC token、active-session 自动轮转/告警已实现；Observer hard-stop、完整容器 smoke 未执行仍记录为
   residual。
 
 ## 13. 2026-10-23 真实烟测 + Pi 本地凭据隔离（residual #2）
@@ -493,4 +496,4 @@ reserve/settle 恰好一次、ready/heartbeat/finished、SIGTERM 干净收尾、
 - heartbeat watcher 在 agent finished 后退出；budget shutdown 清空在途 pending。
 - Pi model proxy 复用 httpx.Client/连接池；server 增加 spigot 移动容忍配置。
 - 8-agent 2 分钟复测 0 heartbeat timeout / 0 bot kick / pending 空；recheck
-  model p50 1.31s / p95 4.17s；全量 Python 757 passed / 3 skipped。
+  model p50 1.31s / p95 4.17s；全量 Python 762 passed / 3 skipped。

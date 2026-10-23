@@ -174,9 +174,11 @@ class _PiE2EBase(unittest.IsolatedAsyncioTestCase):
         }
 
     async def start_runner(self, hub, token, socket_path, upstream, *, max_turns=1,
-                           extra_env=None, role="player"):
+                           extra_env=None, role="player", spec_overrides=None):
         spec_path = self.root / "spec.json"
         spec = self._spec(upstream, max_turns=max_turns)
+        if spec_overrides:
+            spec.update(spec_overrides)
         spec["role"] = role
         spec_path.write_text(json.dumps(spec), encoding="utf-8")
         spec_path.chmod(0o600)
@@ -651,6 +653,45 @@ class PiE2ERuntimeTests(_PiE2EBase):
         self.assertTrue(any(kind == "agent_stopped" and reason in {"signal", "budget_stop"}
                             for kind, reason in kinds), kinds)
         self.assertFalse((self.workspace / "pi-late.txt").exists())
+
+    async def test_in_run_session_limit_rotates_and_hands_off(self):
+        def scenario(index, body):
+            if index == 0:
+                command = (f"sleep 0.3; printf %s {PROOF_TEXT} > {PROOF_NAME}; python3 -c 'print(\"x\" * 30000)'")
+                return {"chunks": [{
+                    "id": "chatcmpl-pi-rotate", "object": "chat.completion.chunk",
+                    "created": int(time.time()), "model": body.get("model"),
+                    "choices": [{"index": 0, "delta": {"role": "assistant",
+                                                       "content": None, "tool_calls": [{
+                        "index": 0, "id": "call-pi-rotate-1", "type": "function",
+                        "function": {"name": "bash", "arguments": json.dumps(
+                            {"command": command})}}]}, "finish_reason": None}]}]}
+            return {"chunks": [{
+                "id": "chatcmpl-pi-rotate", "object": "chat.completion.chunk",
+                "created": int(time.time()), "model": body.get("model"),
+                "choices": [{"index": 0, "delta": {"role": "assistant",
+                                                   "content": "handoff complete"},
+                             "finish_reason": "stop"}]}]}
+        upstream = self.make_upstream(scenario)
+        hub, token, socket_path = await self.start_control_plane()
+        process = await self.start_runner(
+            hub, token, socket_path, upstream, max_turns=3,
+            spec_overrides={"pi_session_max_bytes": 20000,
+                            "pi_session_rotation_limit": 2},
+            extra_env={"HARNESS_PI_SESSION_GUARD_S": "0.05"})
+        await asyncio.wait_for(hub.ready_event.wait(), 120)
+        await asyncio.wait_for(hub.finished_event.wait(), 90)
+        returncode, _stdout, stderr = await self.finish(process)
+        self.assertEqual(returncode, 0, stderr.decode(errors="replace")[-3000:])
+        kinds = [event["kind"] for event in hub.events]
+        self.assertIn("pi_session_rotation_started", kinds)
+        self.assertIn("pi_session_rotated", kinds)
+        rotated = next(event["payload"] for event in hub.events
+                       if event["kind"] == "pi_session_rotated")
+        self.assertTrue(rotated["automatic"])
+        self.assertEqual(rotated["rotation"], 1)
+        self.assertIn("handoff_sha256", rotated)
+        self.assertTrue((self.workspace / PROOF_NAME).is_file())
 
     async def test_pi_session_is_resumed_with_continue_after_restart(self):
         def first_scenario(index, body):
