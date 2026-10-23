@@ -498,5 +498,35 @@ class PiToolsExtensionRuntimeTests(unittest.IsolatedAsyncioTestCase):
         # (The random token itself is generated at runtime and never logged.)
 
 
+
+class BridgePeerAllowlistTests(unittest.TestCase):
+    def setUp(self):
+        self.rpc = FakeBridgeRpc()
+        self.bridge = PiToolBridge(self.rpc, agent_id="player1")
+        self.bridge.start()
+        self.addCleanup(self.bridge.stop)
+
+    def _post(self) -> httpx.Response:
+        client = httpx.Client(trust_env=False, timeout=5)
+        try:
+            return client.post(self.bridge.base_url + "/tool",
+                               json={"tool": "memory_list", "arguments": {}},
+                               headers={"authorization": "Bearer " + self.bridge.token})
+        finally:
+            client.close()
+
+    def test_foreign_peer_is_closed_before_any_http_response(self):
+        self.bridge.set_allowed_peer_pid(os.getpid() + 1)
+        with self.assertRaises(httpx.TransportError):
+            self._post()
+        self.assertEqual(self.rpc.calls, [])
+
+    def test_allowed_pid_passes_through_authentication(self):
+        self.bridge.set_allowed_peer_pid(os.getpid())
+        response = self._post()
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.json()["ok"])
+
+
 if __name__ == "__main__":
     unittest.main()

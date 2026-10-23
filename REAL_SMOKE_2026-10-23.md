@@ -94,9 +94,52 @@ Result:
 
 ## Verification
 
-- Full Python suite after the fix: **746 passed, 3 skipped, 734 subtests**
+- Full Python suite after the fix: **753 passed, 3 skipped, 734 subtests**
   (`PYTHONPATH=src:.venv/site-packages .test-venv/bin/python -m pytest -q`).
-- Pi/Observer targeted: **189 passed, 119 subtests**.
+- Pi/Observer targeted: **196 passed, 119 subtests**.
 - Both smoke commands used a real DeepSeek key (injected only via the process
   environment, never written to disk) and real Pi CLI 1.4.0; no Docker experiment
   stack was started; no `final11` containers were touched.
+
+
+## 2026-10-23 post-guard isolation smoke (dynamic N)
+
+After adding the LD_PRELOAD prctl guard and loopback peer-PID allowlist:
+
+- **Host, N=1** (process mode, real DeepSeek):
+  - model/tool: 12 model request/response, 12 tool intents/results;
+  - `proc-env.txt`: `PI_PID=110 ... cat: /proc/110/environ: Permission denied` →
+    `PROC_DENIED`;
+  - `bridge-check.txt`: `BRIDGE_RESPONSE b''` (connection closed before HTTP);
+  - `final-env.txt`: no bridge/runner/MC token, no upstream key.
+- **Container, N=2** (model_only + `--network none` + UDS forwarder, real DeepSeek):
+  - 24 model request/response, 30 tool intents/results across player1/player2;
+  - both agents: `PROC_DENIED`, `BRIDGE_REPLY b''`, no token/key in env;
+  - runner containers removed; no harness runner leftovers;
+  - this exercises dynamic exact-N=2 configuration.
+
+Full suite after these changes: **753 passed, 3 skipped, 734 subtests**;
+Pi/Observer targeted: **196 passed, 119 subtests**.
+
+Residual: the guard is Linux/x86_64; root/CAP_SYS_PTRACE can still read `/proc`
+(unchanged OS trust model); complete Minecraft/4-agent compose smoke still
+pending.
+
+## 2026-10-23 post-guard isolation smoke (dynamic N=4)
+
+Same container/model_only configuration as the N=2 run, with
+`agents.count=4` / `ids=[player1..player4]` (real DeepSeek):
+
+- 24 model request/response, 31 tool intents/results across four agents;
+- every agent's `proc-env.txt`:
+  `cat: /proc/10/environ: Permission denied` / `PROC_DENIED`;
+- every agent's `bridge-check.txt`: `BRIDGE_REPLY b''` (connection closed before
+  HTTP);
+- no bridge/runner/MC token or upstream key in any `final-env.txt`;
+- no leftover harness runner containers.
+
+Evidence under `validation/pi-real-smoke-20261023/multi4/`. This validates the
+dynamic exact-N=4 (paper count) container path with the new guard and peer
+allowlist. Status still ends `budget_exhausted` because the scripted agents keep
+inspecting after completing the requested checks; the requested checks all
+completed before budget exhaustion.

@@ -32,3 +32,4 @@ mc-logs/
 Caddyfile
 pi_runtime/node_modules/
 .venv
+.mc-s/

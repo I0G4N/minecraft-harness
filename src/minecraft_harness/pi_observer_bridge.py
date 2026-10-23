@@ -23,6 +23,7 @@ needs it to reach this loopback server).  It authorizes only the four observer
 tools above; it is not a control-plane, shell or game credential.
 """
 from __future__ import annotations
+from .pi_security import loopback_peer_pid
 
 import hmac
 import json
@@ -111,6 +112,9 @@ class PiObserverBridge:
         self.base_url = ""
         self._server: ThreadingHTTPServer | None = None
         self._thread: threading.Thread | None = None
+        # Loopback peer allowlist: set to the spawned Pi pid right after spawn.
+        self._allowed_peer_pid: int | None = None
+        self._peer_registry: Any = None
 
     # -- lifecycle ------------------------------------------------------
     def start(self) -> str:
@@ -124,6 +128,15 @@ class PiObserverBridge:
             def log_message(self, *_args: Any) -> None:
                 # Never log headers or bodies: they contain records and tokens.
                 return
+
+            def handle_one_request(self) -> None:
+                if not getattr(self, "_peer_checked", False):
+                    self._peer_checked = True
+                    self._peer_ok = bridge.peer_allowed(self.connection)
+                if not self._peer_ok:
+                    self.close_connection = True
+                    return
+                super().handle_one_request()
 
             def do_POST(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler API
                 bridge._handle_post(self)
@@ -160,6 +173,33 @@ class PiObserverBridge:
     def __exit__(self, *_exc: Any) -> bool:
         self.stop()
         return False
+
+    # -- loopback peer allowlist ----------------------------------------
+    def set_allowed_peer_pid(self, pid: int | None) -> None:
+        self._allowed_peer_pid = int(pid) if pid else None
+
+    @property
+    def allowed_peer_pid(self) -> int | None:
+        return self._allowed_peer_pid
+
+    def set_peer_registry(self, registry: Any) -> None:
+        self._peer_registry = registry
+
+    def peer_allowed(self, connection: Any) -> bool:
+        """True when the TCP peer is the spawned Pi process (or before spawn)."""
+        allowed = self._allowed_peer_pid
+        if allowed is None:
+            return True
+        peer_pid = None
+        registry = self._peer_registry
+        if registry is not None:
+            try:
+                peer_pid = registry.lookup(int(connection.getpeername()[1]))
+            except (OSError, TypeError, ValueError):
+                peer_pid = None
+        if peer_pid is None:
+            peer_pid = loopback_peer_pid(connection)
+        return peer_pid == allowed
 
     # -- HTTP handling --------------------------------------------------
     def _authorized(self, handler: BaseHTTPRequestHandler) -> bool:

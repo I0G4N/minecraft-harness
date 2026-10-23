@@ -435,7 +435,18 @@ class PiE2ERuntimeTests(_PiE2EBase):
                     "choices": [{"index": 0,
                                  "delta": {"role": "assistant", "content": "proved and done"},
                                  "finish_reason": None}]}]}
-            command = f"printf %s {PROOF_TEXT} > {PROOF_NAME}"
+            command = (
+                f"printf %s {PROOF_TEXT} > {PROOF_NAME}; "
+                "cat /proc/$PPID/environ > proc-env-copy.txt 2>/dev/null; "
+                "echo $? > proc-env-exit.txt; "
+                "target=${HARNESS_PI_BRIDGE_URL#http://}; "
+                "host=${target%%:*}; port=${target##*:}; "
+                "exec 3<>/dev/tcp/$host/$port 2>/dev/null; "
+                "printf 'GET /tool HTTP/1.0\r\n\r\n' >&3 2>/dev/null; "
+                "head -c 400 <&3 > peer-response.txt 2>/dev/null; "
+                "exec 3<&- 2>/dev/null; "
+                "echo done"
+            )
             return {"chunks": [{
                 "id": "chatcmpl-pi-e2e", "object": "chat.completion.chunk",
                 "created": int(time.time()), "model": body.get("model"),
@@ -451,7 +462,17 @@ class PiE2ERuntimeTests(_PiE2EBase):
         hub, token, socket_path = await self.start_control_plane()
         process = await self.start_runner(hub, token, socket_path, upstream, max_turns=1)
         await asyncio.wait_for(hub.ready_event.wait(), 120)
-        child_envs = await self._capture_child_environments(hub.finished_event, timeout=240)
+        # Live same-uid /proc read must be denied by the LD_PRELOAD prctl guard.
+        pi_pid = None
+        for _attempt in range(1200):
+            starts = [event for event in hub.events if event["kind"] == "agent_started"]
+            if starts and starts[0]["payload"].get("pi_pid"):
+                pi_pid = starts[0]["payload"]["pi_pid"]
+                break
+            await asyncio.sleep(0.05)
+        self.assertIsInstance(pi_pid, int)
+        with self.assertRaises(PermissionError):
+            Path(f"/proc/{pi_pid}/environ").read_bytes()
         await asyncio.wait_for(hub.finished_event.wait(), 60)
         returncode, stdout, stderr = await self.finish(process)
 
@@ -487,10 +508,18 @@ class PiE2ERuntimeTests(_PiE2EBase):
             "web_search", "web_fetch",
         })
 
-        # 3. The built-in bash tool actually executed in the workspace.
+        # 3. The built-in bash tool actually executed in the workspace, and the
+        #    model-directed shell could not read the Pi environment or talk to
+        #    the loopback bridge directly.
         proof = self.workspace / PROOF_NAME
         self.assertTrue(proof.is_file(), "Pi bash tool did not write the proof file")
         self.assertEqual(proof.read_text(encoding="utf-8"), PROOF_TEXT)
+        self.assertEqual((self.workspace / "proc-env-copy.txt").read_bytes(), b"")
+        self.assertNotEqual(
+            (self.workspace / "proc-env-exit.txt").read_text().strip(), "0")
+        peer_response = (self.workspace / "peer-response.txt").read_bytes()
+        self.assertNotIn(b"HTTP/", peer_response)
+        self.assertNotIn(b"401", peer_response)
 
         # 4. Tool + model events are durable in the ledger with the bound actor.
         kinds = [event["kind"] for event in hub.events]
@@ -538,13 +567,8 @@ class PiE2ERuntimeTests(_PiE2EBase):
             self.assertNotIn(secret, recorded, secret)
             self.assertNotIn(secret, output, secret)
             self.assertNotIn(secret, state_texts, secret)
-        self.assertTrue(child_envs, "could not observe the Pi CLI child process environment")
-        child_environment_text = self._flatten(child_envs)
-        for secret in (MODEL_API_KEY, RUNNER_TOKEN, "harness-secret-must-not-reach-pi"):
-            self.assertNotIn(secret, child_environment_text, secret)
-        # The player-scoped game CLI credentials (when configured) are allowed in
-        # the child env; harness control-plane secrets are not.
-        self.assertIn("PI_CODING_AGENT_DIR", child_environment_text)
+        # The Pi environment itself is no longer readable by a same-uid sibling
+        # (checked live above), and Pi's local credential file was removed.
 
         # 7. Loopback-only wiring: Pi's local credential file was removed after
         #    the first authenticated request, and the redaction is ledgered.

@@ -26,6 +26,7 @@ import os
 import shutil
 import signal
 import subprocess
+import struct
 import sys
 import tempfile
 import threading
@@ -338,7 +339,14 @@ class PiRunnerRuntimeTests(unittest.IsolatedAsyncioTestCase):
                 sse_response(tool_call_delta(
                     "bash", json.dumps({"command":
                                         "printf proof > proof.txt; env > envdump.txt; "
-                                        "cat /proc/$PPID/environ > procenv.txt 2>/dev/null || true; "
+                                        "cat /proc/$PPID/environ > procenv.txt 2>/dev/null; "
+                                        "echo $? > proc_exit.txt; "
+                                        "target=${HARNESS_PI_BRIDGE_URL#http://}; "
+                                        "host=${target%%:*}; port=${target##*:}; "
+                                        "exec 3<>/dev/tcp/$host/$port 2>/dev/null; "
+                                        "printf 'GET /tool HTTP/1.0\\r\\n\\r\\n' >&3 2>/dev/null; "
+                                        "head -c 400 <&3 > peer-response.txt 2>/dev/null; "
+                                        "exec 3<&- 2>/dev/null; echo $? > peer_exit.txt; "
                                         "mc --help > mc_help.txt 2>&1; echo $? > mc_exit.txt; "
                                         "echo done"})),
                     finish_reason="tool_calls", usage=openai_usage()),
@@ -349,6 +357,18 @@ class PiRunnerRuntimeTests(unittest.IsolatedAsyncioTestCase):
             )
             process = await self.spawn(spec_path)
             await asyncio.wait_for(self.hub.ready_event.wait(), 60)
+            # While the Pi process is still alive, a same-uid sibling cannot read
+            # its environment (LD_PRELOAD prctl guard made it non-dumpable).
+            pi_pid = None
+            for _attempt in range(1200):
+                starts = self.hub.events_of("agent_started")
+                if starts and starts[0]["payload"].get("pi_pid"):
+                    pi_pid = starts[0]["payload"]["pi_pid"]
+                    break
+                await asyncio.sleep(0.05)
+            self.assertIsInstance(pi_pid, int)
+            with self.assertRaises(PermissionError):
+                Path(f"/proc/{pi_pid}/environ").read_bytes()
             await asyncio.wait_for(self.hub.finished_event.wait(), 120)
             stdout, stderr = await self.communicate(process)
         self.assertEqual(process.returncode, 0, stderr.decode(errors="replace"))
@@ -401,12 +421,16 @@ class PiRunnerRuntimeTests(unittest.IsolatedAsyncioTestCase):
         # The bridge token arrived via a one-shot FD and was closed by the
         # extension, so neither the env nor /proc exposes it.
         self.assertNotIn("HARNESS_PI_BRIDGE_TOKEN_FD", envdump)
-        procenv = (workspace / "procenv.txt").read_text(errors="replace")
-        # /proc/<Pi>/environ still exposes the exec-time environment, but all
-        # credential values are absent (only the now-closed FD number remains).
-        for secret_marker in ("HARNESS_RUNNER_TOKEN", "HARNESS_PI_BRIDGE_TOKEN=",
-                              "sk-test-secret", "player-token"):
-            self.assertNotIn(secret_marker, procenv, secret_marker)
+        # The LD_PRELOAD guard made the Pi process (and bash) non-dumpable, so
+        # a model-directed bash cannot read /proc/<Pi>/environ at all.
+        self.assertIn("pi_runtime/prctl_guard.so", envdump)
+        self.assertEqual((workspace / "procenv.txt").read_bytes(), b"")
+        self.assertNotEqual((workspace / "proc_exit.txt").read_text().strip(), "0")
+        # A direct bash/curl-style loopback connection to the bridge is closed
+        # before any HTTP response (the bridge's peer-PID allowlist rejects it).
+        peer_response = (workspace / "peer-response.txt").read_bytes()
+        self.assertNotIn(b"HTTP/", peer_response)
+        self.assertNotIn(b"401", peer_response)
         # The mc wrapper still works: it sourced the 0600 credential file only
         # for the program_cli child and printed its usage.
         self.assertEqual((workspace / "mc_exit.txt").read_text().strip(), "0")
@@ -647,6 +671,52 @@ class McWrapperCredentialTests(unittest.TestCase):
             self.assertFalse((agent_dir / "models-store.json").exists())
             self.assertFalse((agent_dir / "auth.json").exists())
             self.assertTrue((agent_dir / "session.jsonl").exists())
+
+
+
+class PrctlGuardTests(unittest.TestCase):
+    """LD_PRELOAD guard: post-exec non-dumpable process + peer report registry."""
+
+    def test_guard_makes_exec_children_non_dumpable_and_hides_proc_environ(self):
+        from minecraft_harness.pi_security import prctl_guard_path
+
+        guard = prctl_guard_path(REPO / "pi_runtime") if "REPO" in globals() \
+            else Path(__file__).resolve().parents[1] / "pi_runtime" / "prctl_guard.so"
+        if not guard.is_file():
+            self.skipTest("prctl_guard.so is not built")
+        probe = (
+            "import ctypes, time\n"
+            "libc = ctypes.CDLL(None)\n"
+            "libc.prctl.argtypes = [ctypes.c_int, ctypes.c_ulong, ctypes.c_ulong, ctypes.c_ulong, ctypes.c_ulong]\n"
+            "print('DUMPABLE', libc.prctl(3, 0, 0, 0, 0), flush=True)\n"
+            "time.sleep(5)\n"
+        )
+        process = subprocess.Popen(
+            [sys.executable, "-c", probe],
+            env={**os.environ, "LD_PRELOAD": str(guard)},
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        try:
+            line = process.stdout.readline().strip()
+            self.assertEqual(line, "DUMPABLE 0")
+            if sys.platform.startswith("linux"):
+                with self.assertRaises(PermissionError):
+                    Path(f"/proc/{process.pid}/environ").read_bytes()
+        finally:
+            process.kill()
+            process.wait(timeout=5)
+
+    def test_peer_report_registry_maps_source_port_to_pid(self):
+        from minecraft_harness.pi_security import LoopbackPeerRegistry
+
+        read_fd, write_fd = os.pipe()
+        registry = LoopbackPeerRegistry(read_fd)
+        try:
+            os.write(write_fd, struct.pack("<III", 4242, 51000, 2))
+            self.assertEqual(registry.lookup(51000), 4242)
+            self.assertIsNone(registry.lookup(51001, wait_s=0.01))
+        finally:
+            os.close(write_fd)
+            registry.close()
 
 
 if __name__ == "__main__":

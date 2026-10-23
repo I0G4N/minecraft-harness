@@ -41,7 +41,8 @@ from pathlib import Path
 from typing import Any, Mapping
 
 from .agents.prompts import paper_player_prompt, player_prompt
-from .pi_security import CredentialHygieneError, harden_process_credentials
+from .pi_security import (CredentialHygieneError, LoopbackPeerRegistry,
+                          PEER_REPORT_FD_ENV, harden_process_credentials)
 from .pi_model_proxy import (ArtifactBudget, PiModelProxy,
                              budgeted_artifact_text)
 from .pi_tool_bridge import PiToolBridge
@@ -65,6 +66,7 @@ ENV_NODE = "HARNESS_NODE"
 # The bridge token is passed through an inherited one-shot FD; only the FD
 # number (not a secret) is in the Pi environment.
 ENV_PI_BRIDGE_TOKEN_FD = "HARNESS_PI_BRIDGE_TOKEN_FD"
+_PI_PRCTL_GUARD_FILENAME = "prctl_guard.so"
 # Provider apiKeys under these command-line environment entries are secrets and
 # stay out of the Pi environment: the mc wrapper sources them from a 0600 file.
 _SENSITIVE_CLI_ENV_NAMES = frozenset({"MC_AGENT_TOKEN", "MC_SUBMISSION_AUTHORITY"})
@@ -832,7 +834,8 @@ def _write_private(path: Path, text: str, mode: int = 0o600) -> None:
 
 
 def _child_environment(spec: PiSpec, *, home: Path, bin_dir: Path,
-                       tmp_dir: Path, bridge_url: str) -> dict[str, str]:
+                       tmp_dir: Path, bridge_url: str,
+                       preload_guard: Path | None = None) -> dict[str, str]:
     parent = os.environ
     environment: dict[str, str] = {}
     for key in _FORWARDED_CHILD_ENV_KEYS:
@@ -865,6 +868,14 @@ def _child_environment(spec: PiSpec, *, home: Path, bin_dir: Path,
         environment[key] = value
     if spec.broker_socket and "MC_RUNTIME_SOCKET" not in environment:
         environment["MC_RUNTIME_SOCKET"] = spec.broker_socket
+    if preload_guard is not None:
+        # Post-exec constructor sets PR_SET_DUMPABLE=0 in the Pi CLI and in
+        # every process it spawns (bash/tools); preserve any inherited preload.
+        existing_preload = parent.get("LD_PRELOAD", "")
+        parts = [str(preload_guard)]
+        if existing_preload and existing_preload != str(preload_guard):
+            parts.append(existing_preload)
+        environment["LD_PRELOAD"] = ":".join(parts)
     environment.update({
         "HARNESS_PI_BRIDGE_URL": bridge_url,
         "PI_CODING_AGENT_DIR": str(home / ".pi" / "agent"),
@@ -901,6 +912,22 @@ def _pi_extension_path(spec: PiSpec) -> Path:
         raise PiRunnerError(
             "the Pi memory/web tools extension is missing: " + str(fallback))
     return fallback
+
+
+def _prctl_guard_path(spec: PiSpec) -> Path | None:
+    """Locate the LD_PRELOAD prctl guard inside the pinned pi_runtime tree.
+
+    The guard fires a constructor after execve so the Pi CLI (and every child it
+    spawns) becomes non-dumpable, which no pre-exec hook can achieve. Missing
+    guard is non-fatal: credential isolation still relies on env scrubbing.
+    """
+    for parent in spec.pi_cli.parents:
+        if parent.name == "pi_runtime":
+            candidate = parent / _PI_PRCTL_GUARD_FILENAME
+            if candidate.is_file():
+                return candidate
+    fallback = _repo_root() / "pi_runtime" / _PI_PRCTL_GUARD_FILENAME
+    return fallback if fallback.is_file() else None
 
 
 def _pi_command(spec: PiSpec, *, prompt_path: Path, session_dir: Path,
@@ -1086,7 +1113,8 @@ def prepare_runner(environment: PiEnvironment, spec: PiSpec) -> PreparedPiRunner
                               extension_path=extension_path)
         child_env = _child_environment(spec, home=paths.home,
                                        bin_dir=paths.bin_dir, tmp_dir=paths.tmp_dir,
-                                       bridge_url=bridge_url)
+                                       bridge_url=bridge_url,
+                                       preload_guard=_prctl_guard_path(spec))
     except BaseException:
         if bridge is not None:
             bridge.stop()
@@ -1191,6 +1219,8 @@ async def _heartbeat_loop(client: RpcClient, state: dict[str, Any],
         await asyncio.sleep(interval_s)
         payload = {"turns": _turns(state), "status": state.get("status", "running"),
                    "rss_bytes": _process_rss_bytes(), "runtime": "pi"}
+        if state.get("pi_pid"):
+            payload["pi_pid"] = int(state["pi_pid"])
         if artifact_budget is not None:
             artifact_budget.flush()
             snapshot = artifact_budget.snapshot()
@@ -1360,6 +1390,7 @@ def _handle_pi_event(prepared: PreparedPiRunner, record: dict[str, Any],
             "runtime": "pi", "round": _turns(state),
             "resumed": prepared.session_resume,
             "model": str(prepared.spec.pi_model.get("model", ""))[:200],
+            "pi_pid": int(state["pi_pid"]) if state.get("pi_pid") else None,
         })
     elif record_type == "tool_execution_start":
         tool = str(record.get("toolName", ""))[:100]
@@ -1639,6 +1670,7 @@ async def _run_prepared(prepared: PreparedPiRunner, early_stop: threading.Event,
     state: dict[str, Any] = {"status": "running", "rounds": 0}
     log_handle = open(prepared.paths.log_path, "ab")
     process: asyncio.subprocess.Process | None = None
+    peer_registry: LoopbackPeerRegistry | None = None
     heartbeat_task: asyncio.Task | None = None
     budget_task: asyncio.Task | None = None
     guard_task: asyncio.Task | None = None
@@ -1646,23 +1678,37 @@ async def _run_prepared(prepared: PreparedPiRunner, early_stop: threading.Event,
     pump_task: asyncio.Task | None = None
     try:
         bridge_fd = _create_bridge_token_fd(prepared.bridge.token)
+        # The LD_PRELOAD guard reports (pid, source_port) for loopback connects
+        # so the proxy/bridge can allowlist the spawned Pi process even though a
+        # non-dumpable Pi's /proc/<pid>/fd is not readable by the runner.
+        peer_read_fd, peer_write_fd = os.pipe()
+        peer_registry = LoopbackPeerRegistry(peer_read_fd)
         spawn_env = dict(prepared.child_env)
         spawn_env[ENV_PI_BRIDGE_TOKEN_FD] = str(bridge_fd)
+        spawn_env[PEER_REPORT_FD_ENV] = str(peer_write_fd)
+        prepared.proxy.set_peer_registry(peer_registry)
+        prepared.bridge.set_peer_registry(peer_registry)
         try:
             process = await asyncio.create_subprocess_exec(
                 *prepared.command, cwd=str(prepared.spec.workspace_root),
                 env=spawn_env, stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE, stderr=log_handle,
                 limit=PI_STREAM_LIMIT, start_new_session=True,
-                pass_fds=(bridge_fd,))
+                pass_fds=(bridge_fd, peer_write_fd))
         except OSError as exc:
             raise PiRunnerError(
                 f"Could not start the Pi CLI: {exc.strerror or type(exc).__name__}") from None
         finally:
-            try:
-                os.close(bridge_fd)
-            except OSError:
-                pass
+            for descriptor in (bridge_fd, peer_write_fd):
+                try:
+                    os.close(descriptor)
+                except OSError:
+                    pass
+        state["pi_pid"] = process.pid
+        # Only the spawned Pi process may use the loopback model proxy/bridge;
+        # direct shell/curl connections are closed before any HTTP response.
+        prepared.proxy.set_allowed_peer_pid(process.pid)
+        prepared.bridge.set_allowed_peer_pid(process.pid)
         queue: asyncio.Queue = asyncio.Queue()
         pump_task = asyncio.create_task(_pump_stdout(process.stdout, queue),
                                         name="pi-stdout")
@@ -1716,6 +1762,12 @@ async def _run_prepared(prepared: PreparedPiRunner, early_stop: threading.Event,
                 await _terminate_process(process, grace=2.0)
             except Exception:
                 pass
+        prepared.proxy.set_allowed_peer_pid(None)
+        prepared.proxy.set_peer_registry(None)
+        prepared.bridge.set_allowed_peer_pid(None)
+        prepared.bridge.set_peer_registry(None)
+        if peer_registry is not None:
+            peer_registry.close()
         _apply_shutdown_retention(prepared)
         try:
             log_handle.close()

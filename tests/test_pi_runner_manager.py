@@ -55,6 +55,7 @@ def _fake_source_root(root, *, extensions=True):
         extension_dir.mkdir(parents=True)
         (extension_dir / "minecraft-tools.js").write_text("// player tools\n")
         (extension_dir / "observer-tools.js").write_text("// observer tools\n")
+        (root / "pi_runtime" / "prctl_guard.so").write_bytes(b"fake guard")
     (root / ".venv" / "lib" / "python3.11" / "site-packages").mkdir(parents=True)
     return root
 

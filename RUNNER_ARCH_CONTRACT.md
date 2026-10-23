@@ -385,8 +385,8 @@ stops/starts `final11` or another run and never touches `mc-runs/final11`.
 
 ## Verification
 
-Current host status (2026-10-23): full Python suite **746 passed / 3 skipped /
-734 subtests**; Pi/Observer targeted **189 passed / 119 subtests**; Node **51**.
+Current host status (2026-10-23): full Python suite **753 passed / 3 skipped /
+734 subtests**; Pi/Observer targeted **196 passed / 119 subtests**; Node **51**.
 The 3 skipped tests are Docker-gated; no fresh container Pi/Compose smoke was run
 in this window (only a prior-window one-shot smoke). Wrapper checks:
 `bash -n run-paper.sh` plus the fake-Docker `--prepare` preflight smoke (both Pi

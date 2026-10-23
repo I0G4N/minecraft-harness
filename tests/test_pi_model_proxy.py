@@ -1020,5 +1020,52 @@ class LocalProxyAuthTests(unittest.TestCase):
         self.assertEqual(len(self.upstream.requests), 2)
 
 
+
+class PeerAllowlistTests(unittest.TestCase):
+    """Only the spawned Pi pid may use the loopback proxy."""
+
+    def setUp(self):
+        self.rpc = FakeRpc()
+        self.upstream = FakeUpstream()
+        self.upstream.start()
+        self.addCleanup(self.upstream.stop)
+
+    def proxy(self) -> PiModelProxy:
+        proxy = PiModelProxy(
+            {"base_url": self.upstream.base_url, "model": "upstream-model",
+             "timeout_s": 10}, self.rpc, agent_id="player1")
+        proxy.start()
+        self.addCleanup(proxy.stop)
+        return proxy
+
+    def test_foreign_peer_is_closed_before_any_http_response(self):
+        proxy = self.proxy()
+        proxy.set_allowed_peer_pid(os.getpid() + 1)
+        client = httpx.Client(trust_env=False, timeout=5)
+        try:
+            with self.assertRaises(httpx.TransportError):
+                client.post(proxy.base_url + "/chat/completions",
+                            json=request_body(stream=False))
+        finally:
+            client.close()
+        self.assertEqual(self.upstream.requests, [])
+        self.assertEqual(self.rpc.calls_for("budget.reserve"), [])
+        self.assertEqual(self.rpc.settlements, [])
+
+    def test_allowed_pid_receives_http_response(self):
+        self.upstream.script = [{"kind": "sse", "chunks": sse_chunks(
+            "hello", usage=openai_usage(3, 2))}]
+        proxy = self.proxy()
+        proxy.set_allowed_peer_pid(os.getpid())
+        client = httpx.Client(trust_env=False, timeout=5)
+        try:
+            response = client.post(proxy.base_url + "/chat/completions",
+                                   json=request_body(stream=False))
+        finally:
+            client.close()
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(self.rpc.settle_event.wait(5))
+
+
 if __name__ == "__main__":
     unittest.main()

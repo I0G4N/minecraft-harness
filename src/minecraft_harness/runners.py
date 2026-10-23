@@ -2191,6 +2191,12 @@ class RunnerManager:
             if not extension.is_file():
                 raise RunnerControlError(
                     "the pinned Pi " + role + " extension is missing: " + str(extension))
+        if sys.platform.startswith("linux"):
+            guard = tree / "prctl_guard.so"
+            if not guard.is_file():
+                raise RunnerControlError(
+                    "the pinned Pi prctl guard is missing: " + str(guard) +
+                    " (build pi_runtime/prctl_guard.so)")
 
     # ---- lifecycle ----------------------------------------------------
     async def start(self):

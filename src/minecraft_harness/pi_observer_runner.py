@@ -345,7 +345,8 @@ def _observer_command(spec: PiObserverSpec, *, prompt_path: Path, session_dir: P
 
 
 def _child_environment(*, home: Path, bin_dir: Path, tmp_dir: Path,
-                       bridge_url: str) -> dict[str, str]:
+                       bridge_url: str,
+                       preload_guard: Path | None = None) -> dict[str, str]:
     parent = os.environ
     environment: dict[str, str] = {}
     for key in _FORWARDED_CHILD_ENV_KEYS:
@@ -367,6 +368,12 @@ def _child_environment(*, home: Path, bin_dir: Path, tmp_dir: Path,
             entries.append(host)
     environment["NO_PROXY"] = ",".join(entries)
     environment["no_proxy"] = environment["NO_PROXY"]
+    if preload_guard is not None:
+        existing_preload = parent.get("LD_PRELOAD", "")
+        parts = [str(preload_guard)]
+        if existing_preload and existing_preload != str(preload_guard):
+            parts.append(existing_preload)
+        environment["LD_PRELOAD"] = ":".join(parts)
     environment.update({
         "HARNESS_PI_BRIDGE_URL": bridge_url,
         "PI_CODING_AGENT_DIR": str(home / ".pi" / "agent"),
@@ -517,7 +524,8 @@ def prepare_observer(environment: _pi.PiEnvironment,
                                     extension_path=extension_path)
         child_env = _child_environment(home=paths.home, bin_dir=paths.bin_dir,
                                        tmp_dir=paths.tmp_dir,
-                                       bridge_url=bridge_url)
+                                       bridge_url=bridge_url,
+                                       preload_guard=_pi._prctl_guard_path(spec))
     except BaseException:
         if bridge is not None:
             bridge.stop()
@@ -577,6 +585,7 @@ def _handle_pi_event(prepared: PreparedPiObserver, record: dict[str, Any],
             "runtime": "pi-observer", "round": _turns(state),
             "resumed": prepared.session_resume,
             "model": str(prepared.spec.pi_model.get("model", ""))[:200],
+            "pi_pid": int(state["pi_pid"]) if state.get("pi_pid") else None,
         })
     elif record_type == "tool_execution_start":
         tool = str(record.get("toolName", ""))[:100]
@@ -715,6 +724,8 @@ async def _heartbeat_loop(client: Any, state: dict[str, Any],
                    "status": state.get("status", "running"),
                    "rss_bytes": _process_rss_bytes(),
                    "runtime": "pi-observer"}
+        if state.get("pi_pid"):
+            payload["pi_pid"] = int(state["pi_pid"])
         try:
             await client.call("runner.heartbeat", payload, timeout_s=timeout_s)
         except asyncio.CancelledError:
@@ -966,29 +977,39 @@ async def _run_prepared(prepared: PreparedPiObserver,
                              "reviews": 0, "reports": 0, "event_cursor": 0}
     log_handle = open(prepared.paths.log_path, "ab")
     process: asyncio.subprocess.Process | None = None
+    peer_registry: Any = None
     heartbeat_task: asyncio.Task | None = None
     budget_task: asyncio.Task | None = None
     stop_wait: asyncio.Task | None = None
     pump_task: asyncio.Task | None = None
     try:
         bridge_fd = _pi._create_bridge_token_fd(prepared.bridge.token)
+        peer_read_fd, peer_write_fd = os.pipe()
+        peer_registry = _pi.LoopbackPeerRegistry(peer_read_fd)
         spawn_env = dict(prepared.child_env)
         spawn_env[_pi.ENV_PI_BRIDGE_TOKEN_FD] = str(bridge_fd)
+        spawn_env[_pi.PEER_REPORT_FD_ENV] = str(peer_write_fd)
+        prepared.proxy.set_peer_registry(peer_registry)
+        prepared.bridge.set_peer_registry(peer_registry)
         try:
             process = await asyncio.create_subprocess_exec(
                 *prepared.command, cwd=str(prepared.spec.workspace_root),
                 env=spawn_env, stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE, stderr=log_handle,
                 limit=PI_OBSERVER_STREAM_LIMIT, start_new_session=True,
-                pass_fds=(bridge_fd,))
+                pass_fds=(bridge_fd, peer_write_fd))
         except OSError as exc:
             raise PiObserverError(
                 f"Could not start the Pi CLI: {exc.strerror or type(exc).__name__}") from None
         finally:
-            try:
-                os.close(bridge_fd)
-            except OSError:
-                pass
+            for descriptor in (bridge_fd, peer_write_fd):
+                try:
+                    os.close(descriptor)
+                except OSError:
+                    pass
+        state["pi_pid"] = process.pid
+        prepared.proxy.set_allowed_peer_pid(process.pid)
+        prepared.bridge.set_allowed_peer_pid(process.pid)
         queue: asyncio.Queue = asyncio.Queue()
         pump_task = asyncio.create_task(_pi._pump_stdout(process.stdout, queue),
                                         name="pi-observer-stdout")
@@ -1032,6 +1053,12 @@ async def _run_prepared(prepared: PreparedPiObserver,
                 await _pi._terminate_process(process, grace=2.0)
             except Exception:
                 pass
+        prepared.proxy.set_allowed_peer_pid(None)
+        prepared.proxy.set_peer_registry(None)
+        prepared.bridge.set_allowed_peer_pid(None)
+        prepared.bridge.set_peer_registry(None)
+        if peer_registry is not None:
+            peer_registry.close()
         try:
             _pi.apply_session_retention(
                 prepared.paths.session_dir, max_bytes=prepared.spec.pi_session_max_bytes,

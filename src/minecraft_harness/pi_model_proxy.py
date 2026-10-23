@@ -39,6 +39,8 @@ from urllib.parse import urlsplit, urlunsplit
 
 import httpx
 
+from .pi_security import loopback_peer_pid
+
 # Conservative unknown-usage marker: the budget charges the admission-time
 # reservation when token usage cannot be established.
 UNKNOWN_USAGE = {"prompt_tokens": None, "completion_tokens": None, "total_tokens": None}
@@ -608,7 +610,9 @@ class PiModelProxy:
                  transport: httpx.BaseTransport | None = None,
                  artifact_budget: ArtifactBudget | None = None,
                  client_api_key: str | None = None,
-                 on_client_authenticated: Any = None) -> None:
+                 on_client_authenticated: Any = None,
+                 allowed_peer_pid: int | None = None,
+                 peer_registry: Any = None) -> None:
         if not isinstance(model, dict):
             raise ValueError("Pi model config must be an object")
         self.model = model
@@ -648,6 +652,12 @@ class PiModelProxy:
         self.api_key_env = model.get("api_key_env")
         self.client_api_key = (str(client_api_key) if client_api_key else None)
         self._on_client_authenticated = on_client_authenticated
+        # Loopback peer allowlist: set to the spawned Pi CLI pid right after
+        # spawn; until then (startup race) connections are accepted.
+        self._allowed_peer_pid = (int(allowed_peer_pid) if allowed_peer_pid else None)
+        self._peer_registry = peer_registry
+        self._peer_registry_lock = threading.Lock()
+        self._peer_lock = threading.Lock()
         self._client_authenticated = False
         self._auth_lock = threading.Lock()
         self.artifact_budget = (artifact_budget if artifact_budget is not None
@@ -769,6 +779,38 @@ class PiModelProxy:
     def _note_ledger_error(self) -> None:
         with self._lock:
             self.ledger_errors += 1
+
+    # -- loopback peer allowlist ----------------------------------------
+    def set_allowed_peer_pid(self, pid: int | None) -> None:
+        with self._peer_lock:
+            self._allowed_peer_pid = int(pid) if pid else None
+
+    def set_peer_registry(self, registry: Any) -> None:
+        with self._peer_registry_lock:
+            self._peer_registry = registry
+
+    @property
+    def allowed_peer_pid(self) -> int | None:
+        with self._peer_lock:
+            return self._allowed_peer_pid
+
+    def peer_allowed(self, connection: Any) -> bool:
+        """True when the TCP peer is the spawned Pi process (or before spawn)."""
+        allowed = self.allowed_peer_pid
+        if allowed is None:
+            return True
+        with self._peer_registry_lock:
+            registry = self._peer_registry
+        peer_pid = None
+        if registry is not None:
+            try:
+                peer_pid = registry.lookup(int(connection.getpeername()[1]))
+            except (OSError, TypeError, ValueError):
+                peer_pid = None
+        if peer_pid is None:
+            # Fallback for dumpable peers / tests without the LD_PRELOAD guard.
+            peer_pid = loopback_peer_pid(connection)
+        return peer_pid == allowed
 
     # -- HTTP handling --------------------------------------------------
     def _authenticate_client(self, handler: "_ProxyHandler") -> bool:
@@ -1092,6 +1134,17 @@ class _ProxyHandler(BaseHTTPRequestHandler):
         # Never log request/response bodies or headers: they can contain
         # prompts, tool output and (for upstream calls) credentials.
         return
+
+    def handle_one_request(self) -> None:
+        # Reject non-Pi loopback peers before reading a request line so a
+        # model-directed shell cannot even probe the endpoint (no HTTP reply).
+        if not getattr(self, "_peer_checked", False):
+            self._peer_checked = True
+            self._peer_ok = self.proxy.peer_allowed(self.connection)
+        if not self._peer_ok:
+            self.close_connection = True
+            return
+        super().handle_one_request()
 
     def do_GET(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler API
         self.proxy._handle_get(self)

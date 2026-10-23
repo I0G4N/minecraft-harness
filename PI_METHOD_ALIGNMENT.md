@@ -164,15 +164,15 @@ mtime 与 18:33 一致，`runner_*` 事件为 0。
 | Pi 风格 context/记忆/工具 journal | `agents/context.py`（新）、`agents/core.py`、`agents/loop.py`、`memory/store.py`、`runner.py`、`runners.py` | 82 passed（定向）；全量通过 |
 | 长程稳定性 | `supervisor.py`、`budget.py`、`runner_rpc.py`、`agents/web.py`、`deployment_generation.py`、`infra/compose*.yaml`、`tests/test_stability.py` | 62 passed（定向）；RPC 3.12 回归 23 passed |
 | source snapshot + runner 预算接线 | `runners.py`、`runner.py`、`tests/test_source_snapshot.py`、`tests/test_runner_entry.py` | 77 passed（-k not container）；3 个 Docker gate 跳过 |
-| **Pi RPC 玩家/Observer runtime** | `pi_runner.py`、`pi_observer_runner.py`、`pi_model_proxy.py`、`pi_tool_bridge.py`、`pi_observer_bridge.py`、`pi_security.py`、`runners.py`、`config.py`、`supervisor.py`、`pi_runtime/extensions/*.js`、`tests/test_pi_*.py`、`test_observer_rpc.py` | Pi/Observer 定向 **189 passed / 119 subtests**（memory/web、retention、Observer bridge/RPC、host e2e）；paper-runner config 已切 `runner_runtime: pi` + container |
-| 全量回归（Pi 接线后） | 宿主 `.test-venv`（3.12） | **746 passed, 3 skipped, 734 subtests**；Pi/Observer 定向 189 passed / 119 subtests |
+| **Pi RPC 玩家/Observer runtime** | `pi_runner.py`、`pi_observer_runner.py`、`pi_model_proxy.py`、`pi_tool_bridge.py`、`pi_observer_bridge.py`、`pi_security.py`、`runners.py`、`config.py`、`supervisor.py`、`pi_runtime/extensions/*.js`、`tests/test_pi_*.py`、`test_observer_rpc.py` | Pi/Observer 定向 **196 passed / 119 subtests**（memory/web、retention、Observer bridge/RPC、host e2e）；paper-runner config 已切 `runner_runtime: pi` + container |
+| 全量回归（Pi 接线后） | 宿主 `.test-venv`（3.12） | **753 passed, 3 skipped, 734 subtests**；Pi/Observer 定向 196 passed / 119 subtests |
 
 验收命令（宿主，不启动实验 / 不启动 Docker）：
 
 ```bash
 cd /ssd_data/caizihao/minecraft/zkdx/experiments/minecraft_harness
 PYTHONPATH=$PWD/src:$PWD/.venv/lib/python3.11/site-packages \
-  .test-venv/bin/python -m pytest -q          # 746 passed, 3 skipped, 734 subtests
+  .test-venv/bin/python -m pytest -q          # 753 passed, 3 skipped, 734 subtests
 PYTHONPATH=$PWD/src:$PWD/.venv/lib/python3.11/site-packages \
   .test-venv/bin/python -m pytest -q \
   tests/test_pi_model_proxy.py tests/test_pi_runner_manager.py \
@@ -183,7 +183,7 @@ npm test --prefix bot_runtime                 # 51 passed（上一窗口）
 已知剩余边界（下一轮正式 run 前应记录为 deviation）：
 
 - 全量 suite 已恢复绿色：`test_pi_runner_manager.py` 的旧断言已更新为
-  paper-runner=pi / whole-session=python；当前 746 passed, 3 skipped, 734 subtests。
+  paper-runner=pi / whole-session=python；当前 753 passed, 3 skipped, 734 subtests。
 - 模型/主机仍是 DeepSeek `deepseek-flash` + 同机容器，不是 Gemini 4 Argon + 5 台 cloud machine。
 - Docker-gated runner 容器测试（3 个）本窗口仍未执行（skipped，未启动 Docker）；source snapshot
   的容器挂载由单元测试覆盖，正式 run 前应在专用窗口跑 gated 测试。
@@ -343,7 +343,7 @@ PYTHONPATH=$PWD/src:$PWD/.venv/lib/python3.11/site-packages \
   tests/test_pi_model_proxy.py tests/test_pi_runner_manager.py \
   tests/test_pi_runner.py tests/test_pi_e2e.py tests/test_pi_tools.py \
   tests/test_servicehub_web.py
-# Pi/Observer 定向：189 passed, 119 subtests passed
+# Pi/Observer 定向：196 passed, 119 subtests passed
 ```
 
 `tests/test_pi_e2e.py`（新增，独立验证）：真实 `python -m minecraft_harness.pi_runner` +
@@ -401,8 +401,8 @@ reserve/settle 恰好一次、ready/heartbeat/finished、SIGTERM 干净收尾、
   advisory-only），active 轮询 ledger important event 或 interval。
 - **安全审计**：[AUDIT_2026-10-23_OBSERVER_SECURITY.md](AUDIT_2026-10-23_OBSERVER_SECURITY.md)
   的 F1–F6 全部修复：容器 PID1 env、artifact grant 所有权、viewed-event 证据绑定、报告
-  key 注入、bridge 错误泄漏、infra_issue issue_id/kind。全量 **746 passed, 3 skipped,
-  734 subtests**；Pi/Observer 定向 **189 passed / 119 subtests**。完整 4-agent compose
+  key 注入、bridge 错误泄漏、infra_issue issue_id/kind。全量 **753 passed, 3 skipped,
+  734 subtests**；Pi/Observer 定向 **196 passed / 119 subtests**。完整 4-agent compose
   长测仍待专用 Docker 窗口。
 
 ## 12. 2026-10-23 P1 审计收口
@@ -428,7 +428,7 @@ reserve/settle 恰好一次、ready/heartbeat/finished、SIGTERM 干净收尾、
   90% artifact/session pressure 事件；paper 配置每 agent 6 GB artifacts + 1 GB session +
   1 GB archive，5 agents session/archive 共 10 GB + artifacts global cap < 51.5 GB run cap。
 - **P2**：wrapper preflight 要求两个 Pi extension 并在 compose 前做 no-start image probe；
-  docs 统一到当前 full suite **746 passed, 3 skipped, 734 subtests**（3 个 Docker-gated
+  docs 统一到当前 full suite **753 passed, 3 skipped, 734 subtests**（3 个 Docker-gated
   skip）；bridge/MC token、active-session 无自动轮转、完整容器 smoke 未执行均明确记录为
   residual。
 
@@ -452,3 +452,24 @@ reserve/settle 恰好一次、ready/heartbeat/finished、SIGTERM 干净收尾、
 - **残余（同 uid 边界）**：Linux 在 execve 重置 dumpable，Pi child `/proc/<pid>/environ`
   仍可读，但其中只有路径/非秘密 routing 和已关闭 FD 编号；`mc-env` 同 uid 可读（mc 必需，
   own-game scope）；loopback proxy/bridge 仍网络可达，但没有上述随机 credential 时 401。
+
+
+## 14. 2026-10-23 /proc 与 loopback 可达性收口
+
+- **Pi `/proc/<pid>/environ`**：Linux 在 `execve` 重置 dumpable，pre-exec prctl 无效。新增
+  `pi_runtime/prctl_guard.c`（编译为 `prctl_guard.so`）作为 LD_PRELOAD constructor，在 Pi
+  exec 后设置 `PR_SET_DUMPABLE=0`；player/observer Pi 子进程及其 bash/tool 后代均不可被
+  同 uid 读取 `/proc/<Pi>/environ`。实测模型 bash `cat /proc/$pi_pid/environ` 得到
+  `Permission denied`；真实 smoke 的 proc-env.txt 记录 `PROC_DENIED`。
+- **Loopback proxy/bridge**：guard 同时 interpose `connect(2)`，通过继承的 `FD_CLOEXEC` pipe
+  把 `(pid, source_port)` 报给 runner 的 `LoopbackPeerRegistry`；PiModelProxy /
+  PiToolBridge / PiObserverBridge 只接受 `allowed_peer_pid == Pi PID` 的连接，其他连接在
+  解析 HTTP 前关闭（没有 401/403 响应）。bash 即使拿到 loopback URL 也只能得到
+  `BRIDGE_REPLY b''`（连接被关闭），不能直接调用 memory/web/bridge 或本地模型代理。
+- **动态多 agent smoke**：真实 DeepSeek + Pi：
+  - host N=1：bash 检查得到 `PROC_DENIED`、bridge 返回空/关闭；env 无 token/key。
+  - container N=2（`model_only` + `--network none` + UDS forwarder）：两名 agent 均为
+    `PROC_DENIED`、bridge `b''`，无 token/key，24 model request/response、30 tools，
+    runner containers 清理干净。证明动态 N=2 exact-N 路径可用，未跑完整 Minecraft 世界。
+- `.so` 是 x86_64 glibc 构建产物，容器挂载整棵 pi_runtime；`RunnerManager` 与
+  `run-paper.sh` 现在会在 Linux 上 fail closed 如果 guard 缺失。

@@ -435,6 +435,15 @@ class PiObserverBridgeTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             PiObserverBridge(FakeRpc(agent_id="player1"))
 
+    def test_peer_pid_allowlist_rejects_foreign_loopback_clients(self):
+        self.bridge.set_allowed_peer_pid(os.getpid() + 1)
+        with self.assertRaises((urllib.error.URLError, ConnectionError,
+                                TimeoutError)):
+            self.post("records_read", {})
+        self.assertEqual(self.rpc.calls, [])
+        self.bridge.set_allowed_peer_pid(os.getpid())
+        self.assertEqual(self.post("records_read", {})[0], 200)
+
     def test_authentication_and_unknown_tools(self):
         self.assertEqual(self.post("records_read", {})[0], 200)
         status, payload = self.post("records_read", {}, token="wrong")
@@ -800,6 +809,16 @@ class PiObserverRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.upstream.set_script(*self.report_script())
         process = await self.spawn(spec_path)
         await asyncio.wait_for(self.hub.ready_event.wait(), 60)
+        pi_pid = None
+        for _attempt in range(1200):
+            starts = self.hub.events_of("agent_started")
+            if starts and starts[0]["payload"].get("pi_pid"):
+                pi_pid = starts[0]["payload"]["pi_pid"]
+                break
+            await asyncio.sleep(0.05)
+        self.assertIsInstance(pi_pid, int)
+        with self.assertRaises(PermissionError):
+            Path(f"/proc/{pi_pid}/environ").read_bytes()
         await asyncio.wait_for(self.hub.finished_event.wait(), 120)
         stdout, stderr = await self.communicate(process)
         self.assertEqual(process.returncode, 0, stderr.decode(errors="replace"))
@@ -1090,11 +1109,14 @@ class PiObserverRuntimeTests(unittest.IsolatedAsyncioTestCase):
             "MC_MODEL_API_KEY": "sk-upstream",
             "DEEPSEEK_API_KEY": "sk-upstream-2",
             "MC_AGENT_TOKEN": "player-token",
+            "LD_PRELOAD": "/tmp/unrelated-preload.so",
         }
+        guard = Path(__file__).resolve().parents[1] / "pi_runtime" / "prctl_guard.so"
         with mock.patch.dict(os.environ, parent, clear=True):
             environment = _child_environment(
                 home=self.root / "home", bin_dir=self.root / "bin",
-                tmp_dir=self.root / "tmp", bridge_url="http://127.0.0.1:1")
+                tmp_dir=self.root / "tmp", bridge_url="http://127.0.0.1:1",
+                preload_guard=guard)
         encoded = json.dumps(environment)
         for secret in ("runner-token", "sk-upstream", "sk-upstream-2",
                        "player-token", "HARNESS_RUNNER_TOKEN",
@@ -1104,6 +1126,9 @@ class PiObserverRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("HARNESS_PI_BRIDGE_TOKEN_FD", environment)
         self.assertEqual(environment["HARNESS_PI_BRIDGE_URL"], "http://127.0.0.1:1")
         self.assertIn("NO_PROXY", environment)
+        preload = environment.get("LD_PRELOAD", "")
+        self.assertIn("prctl_guard.so", preload)
+        self.assertIn("/tmp/unrelated-preload.so", preload)
 
 
 if __name__ == "__main__":

@@ -350,6 +350,9 @@ preflight() {
         fail "Pi extension is missing: $PI_RUNTIME_ROOT/extensions/$extension (run npm ci --prefix $H/pi_runtime)"
       fi
     done
+    if [ ! -f "$PI_RUNTIME_ROOT/prctl_guard.so" ]; then
+      fail "Pi prctl guard is missing: $PI_RUNTIME_ROOT/prctl_guard.so (build it from prctl_guard.c)"
+    fi
   fi
 
   # Per-player bot/admin tokens are required before the Supervisor can admit
