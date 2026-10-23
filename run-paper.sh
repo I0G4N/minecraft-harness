@@ -31,6 +31,18 @@ mkdir -p "$RUN_DIR" "$DEST/mc-logs" "$H/infra/server-data-backups"
 cd "$H"
 CONFIG="${PAPER_CONFIG:-configs/minecraft-paper-runner-20261022.yaml}"
 
+# Host wrapper Python.  The pinned uv venv may be readable only by the
+# supervisor container user on some deployments; allow an explicit override and
+# fall back to the disposable test venv/python3 when needed.
+PYTHON_BIN="${HARNESS_PYTHON:-$H/.venv/bin/python}"
+if [ ! -x "$PYTHON_BIN" ] && [ -x "$H/.test-venv/bin/python" ]; then
+  PYTHON_BIN="$H/.test-venv/bin/python"
+fi
+if [ ! -x "$PYTHON_BIN" ]; then
+  PYTHON_BIN="$(command -v python3 || true)"
+fi
+[ -n "$PYTHON_BIN" ] || { echo "$0: no usable Python interpreter" >&2; exit 2; }
+
 # Container runner settings for the no-start image preflight probe.  These are
 # overwritten from the frozen config by read_runner_settings() during preflight;
 # the defaults mirror config.py and never start anything by themselves.
@@ -68,7 +80,7 @@ SERVER_CONTAINER="${PAPER_SERVER_CONTAINER:-}"
 if [ -z "$SERVER_CONTAINER" ] && [ -f "$CONFIG" ]; then
   # Prefer the harness venv, but allow a host python3 with PyYAML when the
   # wrapper itself is inspected outside the launcher container.
-  for parser in "$H/.venv/bin/python" python3; do
+  for parser in "$PYTHON_BIN" python3; do
     command -v "$parser" >/dev/null 2>&1 || continue
     parsed="$(PYTHONPATH="$H/src" "$parser" - "$CONFIG" 2>/dev/null <<'PYCONFIG'
 import sys, yaml
@@ -135,7 +147,7 @@ resolve_world_path() {
   # Resolve the configured world path with the harness venv, falling back to a
   # host python3 that has PyYAML. Never invent a different path silently.
   local resolved=""
-  for parser in "$H/.venv/bin/python" python3; do
+  for parser in "$PYTHON_BIN" python3; do
     command -v "$parser" >/dev/null 2>&1 || continue
     resolved="$(PYTHONPATH="$H/src" "$parser" - "$CONFIG" 2>/dev/null <<'PYWORLD'
 import sys
@@ -157,7 +169,7 @@ read_runner_settings() {
   # not guess these: the no-start image probe needs the actual image/python and
   # whether a Pi runtime is selected.
   local parser resolved=""
-  for parser in "$H/.venv/bin/python" python3; do
+  for parser in "$PYTHON_BIN" python3; do
     command -v "$parser" >/dev/null 2>&1 || continue
     resolved="$(PYTHONPATH="$H/src" "$parser" - "$CONFIG" 2>/dev/null <<'PYRUNNER'
 import sys
@@ -441,9 +453,29 @@ wait_world() {
   fail "timed out after ${STACK_START_TIMEOUT_S}s waiting for $world/level.dat"
 }
 
+wait_server_ready() {
+  # level.dat appears while the server is still generating the spawn area. The
+  # Supervisor must not create bot sessions until the server has finished
+  # "Done ("; otherwise the first runtime transport call can race the server.
+  local world log deadline
+  world="$(resolve_world_path)"
+  log="$(dirname "$world")/logs/latest.log"
+  deadline=$((SECONDS + STACK_START_TIMEOUT_S))
+  while [ "$SECONDS" -lt "$deadline" ]; do
+    if [ -f "$log" ] && grep -q 'Done (' "$log" 2>/dev/null; then
+      return 0
+    fi
+    if ! docker inspect -f '{{.State.Running}}' "$SERVER_CONTAINER" 2>/dev/null | grep -q true; then
+      fail "server container $SERVER_CONTAINER stopped before readiness"
+    fi
+    sleep 2
+  done
+  fail "timed out after ${STACK_START_TIMEOUT_S}s waiting for Minecraft server readiness"
+}
+
 bot_health_urls() {
   local parser out=""
-  for parser in "$H/.venv/bin/python" python3; do
+  for parser in "$PYTHON_BIN" python3; do
     command -v "$parser" >/dev/null 2>&1 || continue
     out="$(PYTHONPATH="$H/src" "$parser" - "$CONFIG" 2>/dev/null <<'PYURLS'
 import sys
@@ -498,7 +530,7 @@ prepare_world_marker() {
   local WORLD_PATH
   WORLD_PATH="$(resolve_world_path)"
   if [ ! -s "$(dirname "$WORLD_PATH")/.harness-world.json" ]; then
-    local WORLD_PY="$H/.venv/bin/python"
+    local WORLD_PY="$PYTHON_BIN"
     [ -x "$WORLD_PY" ] || WORLD_PY=python3
     PYTHONPATH="$H/src" "$WORLD_PY" - "$WORLD_PATH" <<'PYMARK'
 import json, secrets, sys
@@ -537,6 +569,7 @@ fi
 preflight
 compose_up
 wait_world
+wait_server_ready
 prepare_world_marker
 preflight_world
 wait_bot_health
@@ -546,7 +579,7 @@ wait_bot_health
   if [ -n "$ENV_FILE" ] && [ -f "$ENV_FILE" ]; then
     echo "ENV_FILE $ENV_FILE"
   fi
-  PYTHONPATH="$H/src" "$H/.venv/bin/python" -m minecraft_harness.cli run \
+  PYTHONPATH="$H/src:$H/.venv/lib/python3.11/site-packages" "$PYTHON_BIN" -m minecraft_harness.cli run \
     --config "$CONFIG" \
     --run-dir "$RUN_DIR"
   RC=$?
@@ -559,7 +592,8 @@ wait_bot_health
   fi
   STAMP=$(date -u +%Y%m%dT%H%M%SZ)
   ARCHIVE="$H/infra/server-data-backups/world-$STAMP-after-four-agent-paper.tar.gz"
-  tar -czf "$ARCHIVE" -C "$H/infra/server-data" world logs 2>/dev/null || true
+  WORLD_ROOT="$(dirname "$(resolve_world_path)")"
+  tar -czf "$ARCHIVE" -C "$WORLD_ROOT" world logs 2>/dev/null || true
   echo "WORLD_ARCHIVE $ARCHIVE"
   # Stop remaining bot stack to release resources; preserve containers for inspection.
   docker ps "${STACK_SELECTOR[@]}" -q | xargs -r docker stop --time 20 >/dev/null 2>&1 || true

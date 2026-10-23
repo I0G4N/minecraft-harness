@@ -134,7 +134,8 @@ async def capture_deployment(config, sessions, coding_containers, *, run_id):
     server_name = config['server'].get('managed_container')
     if paper and not server_name:
         raise DeploymentInspectionError('Formal paper deployment requires an inspectable managed server')
-    if not isinstance(coding_containers, dict) or len(coding_containers) > 5 or not isinstance(sessions, dict) or len(sessions) > 16:
+    if (not isinstance(coding_containers, dict) or len(coding_containers) > 17
+            or not isinstance(sessions, dict) or len(sessions) > 17):
         raise DeploymentInspectionError('Deployment identity list exceeds bounds')
     captured = {'schema_version': 1, 'captured_at': datetime.now(timezone.utc).isoformat(), 'operator_only': True,
                 'verified': True, 'server': None, 'workspaces': {}, 'runtime_sessions': {}, 'images': {}, 'worker_networks': {}, 'worker_containers': {}, 'owned_project': None, 'project_containers': {}, 'deviations': []}
