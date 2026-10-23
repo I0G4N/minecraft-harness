@@ -395,3 +395,17 @@
   Supervisor 8g。下一轮 run 验证。
 - root 清理后约 5.4 GB 可用；实验资源路径全部在 `/ssd_data/caizihao`，
   Docker data-root 仍为共享 `/var/lib/docker`（迁移需维护窗口）。
+
+
+## 2026-10-24 四轮 1 小时 8-agent 稳定性实验完成
+
+- 4/4 轮均跑满 60 分钟 wall，`run_status=budget_exhausted`，report failures 为空，
+  cleanup/finalization/shutdown-retry 均为 0。
+- Round 1-05: 2,376 calls / $2.98 / 1 chat-spam kick / 0 protocol or movement kick.
+- Round 2-01: 3,208 calls / $4.33 / 0 kick / 0 decoder / 0 invalid movement / 0 SIGABRT.
+- Round 3-01: 2,604 calls / $3.60 / 0 kick / 0 decoder / 0 invalid movement / 0 SIGABRT.
+- Round 4-01: 2,870 calls / $3.73 / 0 kick / 0 decoder / 0 invalid movement / 0 SIGABRT.
+- Total 11,058 model requests, $14.65 ledger subtotal.
+- Fixes found during campaign: hide raw protocol internals from agent programs,
+  entity read-only snapshots, nonfinite-state worker guard, identity-proxy
+  drain/chat rate limits. Final report: `mc-runs/p8-4round-stability-report.md`.
