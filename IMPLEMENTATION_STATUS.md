@@ -376,3 +376,5 @@
 - Viewer 5xx：Caddy 对 `/viewer/playerN/` 增加 6s upstream retry，并配置
   `handle_errors` 返回自动刷新页（503 + 2s reload），不再直接显示 502；
   无后端时验证返回重连页，临时后端时验证 200。
+- 重建 worker/launcher image 以保持 runtime source/provenance 一致：
+  worker `sha256:a915d447...`、launcher `sha256:ae0b15cf...`。
