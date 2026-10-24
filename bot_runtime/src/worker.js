@@ -298,13 +298,23 @@ function startBotStateGuard() {
   // letting it hammer the server with malformed movement.
   if (config.mode !== 'minecraft') return;
   let hadFinite = false;
+  let nonfiniteSince = null;
+  let observedNonfinite = 0;
   const timer = setInterval(() => {
     const entity = bot && bot.entity;
     const position = entity && entity.position;
     if (!position) return;
     const values = [position.x, position.y, position.z, entity.yaw, entity.pitch];
-    if (values.every(Number.isFinite)) { hadFinite = true; return; }
+    if (values.every(Number.isFinite)) { hadFinite = true; nonfiniteSince = null; return; }
     if (!hadFinite) return;
+    // Give the client a bounded window to recover from a transient teleport /
+    // chunk update instead of restarting the worker on the first bad tick.
+    if (nonfiniteSince === null) {
+      nonfiniteSince = Date.now();
+      observedNonfinite++;
+      process.stderr.write('NONFINITE_BOT_STATE_OBSERVED ' + JSON.stringify({ agent: config.username, execution: currentScope?.id ?? null, at: new Date(nonfiniteSince).toISOString(), count: observedNonfinite }) + '\n');
+    }
+    if (Date.now() - nonfiniteSince < 30000) return;
     let detail;
     try {
       const entity = bot.entity;
