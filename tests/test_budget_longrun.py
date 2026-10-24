@@ -83,13 +83,13 @@ class BudgetLongRunTests(unittest.IsolatedAsyncioTestCase):
                 self.assertAlmostEqual(budget.state["cost_usd"], reserved)
                 await budget.reserve("bob")
 
-    async def test_output_reservation_violation_stops_further_calls(self):
+    async def test_output_reservation_violation_is_recorded_without_stopping_wall_limited_run(self):
         budget = Budget(self.config, self.recorder, max_output_tokens=100)
         reservation = await budget.reserve("alice")
         await budget.settle(reservation, {"prompt_tokens": 1, "completion_tokens": 101})
-        self.assertTrue(budget.stop_requested())
-        with self.assertRaises(BudgetExhausted):
-            await budget.reserve("bob")
+        self.assertFalse(budget.stop_requested())
+        self.assertIn("output_bound_exceeded", self.recorder.get_state("budget"))
+        await budget.reserve("bob")
 
     async def test_failed_admission_transaction_cannot_be_followed_by_provider_request(self):
         budget = Budget(self.config, self.recorder)

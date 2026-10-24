@@ -241,10 +241,15 @@ class Budget:
                 else:
                     updated["input_tokens"] += inp
                     updated["output_tokens"] += out
-                    if (self.config.get("max_input_tokens") and inp > self.config["max_input_tokens"]) or out > self.max_output_tokens:
+                    if self.config.get("max_input_tokens") and inp > self.config["max_input_tokens"]:
                         self.stopped = True
                         updated["bound_exceeded"] = {"input_tokens": inp, "output_tokens": out,
                             "max_input_tokens": self.config.get("max_input_tokens"), "max_output_tokens": self.max_output_tokens}
+                    elif out > self.max_output_tokens:
+                        # A provider returning one token over the requested output ceiling
+                        # must not terminate an otherwise wall-limited experiment.
+                        updated["output_bound_exceeded"] = {"input_tokens": inp, "output_tokens": out,
+                            "max_output_tokens": self.max_output_tokens}
                 try:
                     self.recorder.state_event("budget", updated, "model_usage", {"reservation_id": reservation_id,
                         "usage": usage, "normalized_usage": normalized, "cost": estimated,
