@@ -4,7 +4,7 @@ import net from 'node:net';
 import { once } from 'node:events';
 import { setTimeout as delay } from 'node:timers/promises';
 import { deflateSync } from 'node:zlib';
-import { inspectMovement, PacketFrames, startIdentityProxy, varint } from '../src/identity-proxy.js';
+import { inspectChat, inspectMovement, PacketFrames, startIdentityProxy, varint } from '../src/identity-proxy.js';
 
 const text = value => Buffer.concat([varint(Buffer.byteLength(value)), Buffer.from(value)]);
 const packet = (id, body = Buffer.alloc(0), compressed = false) => {
@@ -86,4 +86,15 @@ test('movement sanitizer rejects non-finite and truncated position packets', () 
   assert.equal(inspectMovement(far, 1, 'position').reason, 'out-of-range');
 
   assert.equal(inspectMovement(Buffer.alloc(5), 1, 'position').reason, 'truncated');
+});
+
+
+test('serverbound chat strings over 256 bytes are rejected before the server', () => {
+  const ok = Buffer.concat([varint(256), Buffer.alloc(256)]);
+  assert.equal(inspectChat(ok, 0, 'chat_message'), null);
+  const long = Buffer.concat([varint(257), Buffer.alloc(257)]);
+  assert.deepEqual(inspectChat(long, 0, 'chat_message'), { reason: 'string-too-long', length: 257 });
+  const short = Buffer.concat([varint(10), Buffer.alloc(3)]);
+  assert.deepEqual(inspectChat(short, 0, 'chat_command'), { reason: 'truncated', length: 10 });
+  assert.equal(inspectChat(long, 0, 'position'), null);
 });

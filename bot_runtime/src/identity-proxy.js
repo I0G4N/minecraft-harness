@@ -51,6 +51,15 @@ function packetName(state, direction, id) {
 }
 
 const MOVEMENT_PACKET_NAMES = new Set(['position', 'position_look']);
+const CHAT_PACKET_NAMES = new Set(['chat_message', 'chat_command', 'chat_command_signed']);
+export function inspectChat(body, offset, name) {
+  if (!CHAT_PACKET_NAMES.has(name)) return null;
+  const length = readVarint(body, offset);
+  if (!length) return { reason: 'truncated', length: null };
+  if (length.value > 256) return { reason: 'string-too-long', length: length.value };
+  if (length.end + length.value > body.length) return { reason: 'truncated', length: length.value };
+  return null;
+}
 export function inspectMovement(body, offset, name) {
   const need = name === 'position' ? 25 : name === 'position_look' ? 33 : 0;
   if (!need) return { reason: 'not-movement', values: [] };
@@ -79,7 +88,7 @@ export async function startIdentityProxy({ host = '127.0.0.1', port = 0, targetH
   targetPort = 25565, username, gameChat = true, connectTimeoutMs = 5000, idleTimeoutMs = 90000 } = {}) {
   if (!/^[A-Za-z0-9_]{1,16}$/.test(username ?? '') || !targetHost || !Number.isInteger(targetPort) || targetPort < 1 || targetPort > 65535) throw new Error('Fixed target and username required');
   const connections = new Set(); let active = null;
-  const stats = { accepted: 0, rejected: 0, filtered: 0, invalid_movement: 0, rate_limited: 0 };
+  const stats = { accepted: 0, rejected: 0, filtered: 0, invalid_movement: 0, invalid_chat: 0, rate_limited: 0 };
   const server = net.createServer(client => {
     client.setNoDelay(true);
     // Even pre-login sockets are bounded; an idle connection cannot allocate
@@ -158,7 +167,15 @@ export async function startIdentityProxy({ host = '127.0.0.1', port = 0, targetH
         upstream.on('data', chunk => { try { outgoing.push(chunk); } catch { reject(); } });
       }
       if (!gameChat && state === 'play' && ['chat_message', 'chat_command', 'tab_complete'].includes(name)) { stats.filtered++; return; }
-      if (state === 'play' && ['chat_message', 'chat_command', 'chat_command_signed'].includes(name)) {
+      if (state === 'play' && CHAT_PACKET_NAMES.has(name)) {
+        const invalid = inspectChat(body, id.end, name);
+        if (invalid) {
+          stats.invalid_chat++;
+          if (stats.invalid_chat <= 20) console.error('INVALID_CHAT', name, invalid.reason, invalid.length);
+          return;
+        }
+      }
+      if (state === 'play' && CHAT_PACKET_NAMES.has(name)) {
         const now = Date.now();
         while (chatTimes.length && now - chatTimes[0] > 1000) chatTimes.shift();
         chatTimes.push(now);
