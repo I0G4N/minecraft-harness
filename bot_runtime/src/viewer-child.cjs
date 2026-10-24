@@ -38,6 +38,12 @@ const world = {
 };
 
 const app = express();
+const fs = require('node:fs');
+const path = require('node:path');
+let customIndex = null;
+try { customIndex = fs.readFileSync(path.join(__dirname, 'viewer-index.html'), 'utf8'); } catch {}
+if (customIndex) app.get(['/', '/index.html'], (request, response) => response.type('html').send(customIndex));
+app.get('/health', (request, response) => response.json({ ok: true, uptime_s: Math.round(process.uptime()) }));
 app.use((request, response, next) => {
   response.setHeader('Cross-Origin-Opener-Policy', 'same-origin');
   response.setHeader('Cross-Origin-Embedder-Policy', 'require-corp');

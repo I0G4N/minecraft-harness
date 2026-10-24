@@ -1,0 +1,50 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>Prismarine Viewer</title>
+    <style>
+      html { overflow: hidden; }
+      html, body { height: 100%; margin: 0; padding: 0; }
+      canvas { height: 100%; width: 100%; font-size: 0; margin: 0; padding: 0; }
+      #reconnect-overlay {
+        display: none; position: fixed; inset: 0; z-index: 9999;
+        background: rgba(12, 14, 18, .88); color: #e6e6e6;
+        font: 15px/1.5 system-ui, sans-serif; place-items: center;
+      }
+      #reconnect-overlay .box { text-align: center; max-width: 420px; padding: 24px; }
+      #reconnect-overlay h1 { font-size: 19px; font-weight: 500; margin: 0 0 8px; }
+      #reconnect-overlay p { margin: 4px 0; color: #aab; }
+      #reconnect-overlay .dot { display: inline-block; width: 8px; height: 8px; margin-right: 8px; border-radius: 50%; background: #d33; }
+    </style>
+  </head>
+  <body>
+    <div id="reconnect-overlay"><div class="box">
+      <h1><span class="dot"></span>Viewer is reconnecting</h1>
+      <p>The Minecraft worker is restarting. This page will reload automatically.</p>
+      <p id="reconnect-url"></p>
+    </div></div>
+    <script type="text/javascript" src="index.js"></script>
+    <script>
+      (() => {
+        const overlay = document.getElementById('reconnect-overlay');
+        const url = document.getElementById('reconnect-url');
+        if (url) url.textContent = location.href;
+        let down = false;
+        async function check() {
+          try {
+            const response = await fetch('health', { cache: 'no-store' });
+            if (!response.ok) throw new Error('health ' + response.status);
+            if (down) { location.reload(); return; }
+            overlay.style.display = 'none';
+          } catch (error) {
+            down = true;
+            overlay.style.display = 'grid';
+          }
+          setTimeout(check, 2000);
+        }
+        setTimeout(check, 1000);
+      })();
+    </script>
+  </body>
+</html>

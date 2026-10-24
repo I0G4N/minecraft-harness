@@ -1,7 +1,7 @@
 import vm from 'node:vm';
 import { createRequire } from 'node:module';
 import { EventEmitter } from 'node:events';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { instrumentLoopDeadlines } from './loop-guard.mjs';
 import { boundedValue } from './limits.js';
@@ -37,6 +37,28 @@ const send = (message) => {
 };
 let bot;
 let agentBot;
+const recentApi = [];
+const recentLogs = [];
+function recordApi(name, args) {
+  try { recentApi.push({ name, args: args.slice(0, 4).map(summarizeArg), at: Date.now() }); if (recentApi.length > 40) recentApi.shift(); } catch {}
+}
+function summarizeArg(value) {
+  if (value === null || value === undefined) return value;
+  if (typeof value === 'number') return Number.isFinite(value) ? value : 'nonfinite';
+  if (typeof value === 'boolean') return value;
+  if (typeof value === 'string') return value.slice(0, 80);
+  if (Array.isArray(value)) return value.slice(0, 4).map(summarizeArg);
+  if (typeof value === 'object') {
+    const out = { type: value.constructor?.name || 'object' };
+    for (const key of ['x', 'y', 'z', 'name', 'id']) if (key in value) out[key] = summarizeArg(value[key]);
+    return out;
+  }
+  return String(value).slice(0, 40);
+}
+function recordLog(level, message) {
+  recentLogs.push({ level, message: String(message).slice(0, 200), at: Date.now() });
+  if (recentLogs.length > 20) recentLogs.shift();
+}
 let currentScope;
 const jobs = new Map();
 const controlOwners = new Map();
@@ -74,6 +96,7 @@ function scopedLogger() {
     while (Buffer.byteLength(message) > limit) message = message.slice(0, -1);
     if (Buffer.byteLength(text) > limit || values.length > 32) scope.logsTruncated++;
     scope.logBytes += Buffer.byteLength(message); scope.logCount++;
+    if (scope === currentScope) recordLog(level, message);
     send({ type: 'log', execution_id: scope.id, job_id: scope.jobId, level, message });
   }]));
 }
@@ -146,6 +169,7 @@ function instrumentMethod(target, name) {
   target[name] = function (...args) {
     const scope = scopes.getStore();
     if (scope?.closed) throw new Error('Execution has ended');
+    if (scope && (target === bot || (bot && target === bot.pathfinder))) recordApi(name, args);
     if (target === bot && name === 'setControlState') {
       if (args[1]) controlOwners.set(args[0], scope); else controlOwners.delete(args[0]);
     } else if (target === bot && name === 'clearControlStates') controlOwners.clear();
@@ -199,6 +223,26 @@ function entitySnapshot(entity) {
   return clone;
 }
 
+function snapshotEntities(entities) {
+  if (!entities || typeof entities !== 'object') return entities;
+  const out = {};
+  for (const [key, entity] of Object.entries(entities)) out[key] = entitySnapshot(entity);
+  return out;
+}
+
+function snapshotPlayers(players) {
+  if (!players || typeof players !== 'object') return players;
+  const out = {};
+  for (const [key, player] of Object.entries(players)) {
+    out[key] = { ...player, entity: entitySnapshot(player && player.entity) };
+  }
+  return out;
+}
+
+function finitePoint(point) {
+  return point && Number.isFinite(point.x) && Number.isFinite(point.y) && Number.isFinite(point.z);
+}
+
 function makeAgentFacingBot(real) {
   // `bot._client` exposes the raw protocol object.  Model-generated programs
   // have used it to monkey-patch sock.write/splitter.push and to change the
@@ -206,22 +250,41 @@ function makeAgentFacingBot(real) {
   // server (DecoderException/kicks).  Keep the real bot for the worker and hand
   // the program a proxied view without raw protocol internals.
   let pathfinderProxy;
-  const hidden = new Set(['_client', 'client', '_events', '_socket']);
+  const hidden = new Set(['_client', 'client', 'creative', '_events', '_socket', 'physics']);
+  const readonly = new Set(['physicsEnabled']);
   const bound = (target, value) => typeof value === 'function' ? value.bind(target) : value;
   const proxy = new Proxy(real, {
     get(target, prop) {
       if (hidden.has(prop)) return undefined;
       if (prop === 'entity') return entitySnapshot(target.entity);
+      if (prop === 'entities') return snapshotEntities(target.entities);
+      if (prop === 'players') return snapshotPlayers(target.players);
+      if (prop === 'look') return (yaw, pitch, force) => {
+        if (!Number.isFinite(yaw) || !Number.isFinite(pitch)) throw new TypeError('look requires finite yaw/pitch');
+        return target.look(yaw, pitch, force);
+      };
+      if (prop === 'lookAt') return (point, force) => {
+        if (!finitePoint(point)) throw new TypeError('lookAt requires a finite point');
+        return target.lookAt(point, force);
+      };
       if (prop === 'pathfinder' && target.pathfinder) {
         if (!pathfinderProxy) pathfinderProxy = new Proxy(target.pathfinder, {
-          get(pt, p) { if (p === 'bot') return proxy; return bound(pt, Reflect.get(pt, p, pt)); },
+          get(pt, p) {
+            if (p === 'bot') return proxy;
+            if (p === 'setGoal' || p === 'goto') return (...args) => {
+              const goal = args[0];
+              if (goal && ('x' in goal || 'y' in goal || 'z' in goal) && !finitePoint(goal)) throw new TypeError('pathfinder goal requires finite coordinates');
+              return pt[p](...args);
+            };
+            return bound(pt, Reflect.get(pt, p, pt));
+          },
           set(pt, p, value) { if (p === 'bot') return false; pt[p] = value; return true; },
         });
         return pathfinderProxy;
       }
       return bound(target, Reflect.get(target, prop, target));
     },
-    set(target, prop, value) { if (hidden.has(prop) || prop === 'entity') return false; target[prop] = value; return true; },
+    set(target, prop, value) { if (hidden.has(prop) || readonly.has(prop) || prop === 'entity') return false; target[prop] = value; return true; },
     has(target, prop) { return hidden.has(prop) ? false : Reflect.has(target, prop); },
   });
   return proxy;
@@ -242,7 +305,42 @@ function startBotStateGuard() {
     const values = [position.x, position.y, position.z, entity.yaw, entity.pitch];
     if (values.every(Number.isFinite)) { hadFinite = true; return; }
     if (!hadFinite) return;
-    process.stderr.write('NONFINITE_BOT_STATE restarting worker\n');
+    let detail;
+    try {
+      const entity = bot.entity;
+      const goal = bot.pathfinder?.goal;
+      const worldRef = bot.world;
+      const columns = worldRef?.async?.columns ?? worldRef?.columns;
+      const own = bot.entity;
+      detail = {
+        event: 'NONFINITE_BOT_STATE',
+        agent: config.username,
+        execution: currentScope?.id ?? null,
+        source_sha256: currentScope?.sourceHash ?? null,
+        source_head: currentScope?.sourceHead ?? null,
+        position: { x: summarizeArg(position.x), y: summarizeArg(position.y), z: summarizeArg(position.z) },
+        yaw_pitch: [summarizeArg(entity.yaw), summarizeArg(entity.pitch)],
+        velocity: { x: summarizeArg(entity.velocity?.x), y: summarizeArg(entity.velocity?.y), z: summarizeArg(entity.velocity?.z) },
+        on_ground: entity.onGround,
+        world_present: Boolean(worldRef),
+        world_columns: columns && typeof columns === 'object' ? Object.keys(columns).length : null,
+        world_sync_present: Boolean(worldRef?.async),
+        entities_count: bot.entities ? Object.keys(bot.entities).length : null,
+        own_entity_same: Boolean(bot.entities && own && bot.entities[own.id] === own),
+        dimension: bot.game?.dimension ?? null,
+        pathfinder_goal: goal ? { type: goal.constructor?.name || 'object', x: summarizeArg(goal.x), y: summarizeArg(goal.y), z: summarizeArg(goal.z) } : null,
+        physics_present: Boolean(bot.physics),
+        physics_gravity: summarizeArg(bot.physics?.gravity),
+        physics_enabled: bot.physicsEnabled,
+        client_state: bot._client?.state ?? null,
+        client_ended: bot._client?.ended ?? null,
+        recent_api: recentApi.slice(-15),
+        recent_logs: recentLogs.slice(-8),
+        uptime_s: Math.round(process.uptime()),
+        rss_bytes: process.memoryUsage().rss,
+      };
+    } catch (error) { detail = { event: 'NONFINITE_BOT_STATE', capture_error: String(error?.message ?? error).slice(0, 200), execution: currentScope?.id ?? null }; }
+    process.stderr.write('NONFINITE_BOT_STATE ' + JSON.stringify(detail).slice(0, 1800) + '\n');
     process.exit(1);
   }, 500);
   timer.unref?.();
@@ -335,6 +433,10 @@ async function execute(message) {
   if (currentScope) throw new Error('Worker already executing');
   const scope = makeScope(message.execution_id);
   currentScope = scope;
+  try {
+    scope.sourceHash = createHash('sha256').update(String(message.source ?? '')).digest('hex').slice(0, 16);
+    scope.sourceHead = String(message.source ?? '').replace(/\s+/g, ' ').slice(0, 300);
+  } catch {}
   scope.before = snapshot();
   scope.deadline = performance.now() + (Number(message.timeout_ms) || 60000);
   scope.checkDeadline = scope.deadline - Math.min(150, (Number(message.timeout_ms) || 60000) / 10);
