@@ -409,3 +409,19 @@
 - Fixes found during campaign: hide raw protocol internals from agent programs,
   entity read-only snapshots, nonfinite-state worker guard, identity-proxy
   drain/chat rate limits. Final report: `mc-runs/p8-4round-stability-report.md`.
+
+
+## 2026-10-24 Final v2 stability campaign (fixed and rerun)
+
+- Final valid runs: `p8-f1-02`, `p8-f2-02`, `p8-f3-01`, `p8-f4-01`.
+- 4/4 completed the full 60-minute wall; all `budget_exhausted`, report failures empty,
+  cleanup/finalization/shutdown-retry zero.
+- All 4 rounds: 0 bot kicks, 0 DecoderException, 0 invalid_player_movement, 0 SIGABRT.
+- Fixes in this campaign: protocol-internal hiding, entity/player snapshots, look/goal
+  validation, 30-second nonfinite recovery window, viewer health/reconnect page,
+  chat rate limit, chat string-length validation, and output-bound overrun no longer
+  terminating a wall-limited run.
+- Residual: 241 client-physics runtime restarts across four rounds (clean worker
+  restarts; no server kick); viewer endpoint can briefly be unreachable while a worker
+  is recreated, but the open page auto-reloads.
+- Final report: `mc-runs/p8-4round-stability-report-v2.md`.
