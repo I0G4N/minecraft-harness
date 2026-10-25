@@ -170,7 +170,9 @@ async function processAlive(pid) {
   try {
     const stat = await readFile(`/proc/${pid}/stat`, 'utf8');
     return !stat.slice(stat.lastIndexOf(')') + 2).startsWith('Z');
-  } catch (error) { if (error.code === 'ENOENT') return false; throw error; }
+  // A descendant can exit between the /proc stat open and read; ESRCH is the
+  // same not-alive signal as ENOENT (test-race fix, not a product condition).
+  } catch (error) { if (error.code === 'ENOENT' || error.code === 'ESRCH') return false; throw error; }
 }
 
 test('independent guardian kills synchronous worker when HTTP runtime is SIGKILLed', { skip: process.platform !== 'linux', timeout: 7000 }, async t => {

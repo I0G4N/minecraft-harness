@@ -79,6 +79,8 @@ class Session {
     this.softResetResolve = null;
     this.softResetTimer = null;
     this.softResetReason = null;
+    this.softResetAnnounced = false;
+    this.softResetPendingExecution = null;
   }
 
   renewLease(duration = this.config.leaseTimeoutMs) {
@@ -264,8 +266,9 @@ class Session {
         }
         child.ready = true;
         clearTimeout(startupTimer);
-        // A hard (re)start is a fresh worker process, so a generation-less ready
-        // means the client numbering restarted at the first client.
+        // A hard (re)start is a fresh worker process, so its client generation
+        // numbering restarts at 1. Adopt the worker-advertised generation when
+        // present; otherwise keep the protocol-v2/v3 default.
         this.workerGeneration = Number.isSafeInteger(message.generation) ? message.generation : 1;
         this.event('runtime_ready', { snapshot: message.snapshot, globals_lost: this.runtimeEpoch > 1 });
         readyResolve(child);
@@ -300,6 +303,14 @@ class Session {
         if (entry) { clearTimeout(entry.timer); this.aborting.delete(message.execution_id); }
       } else if (message.type === 'completed' && this.current?.record.execution_id === message.execution_id) {
         const status = this.current.cancelRequested ? 'cancelled' : message.timed_out ? 'timed_out' : message.error ? 'failed' : 'succeeded';
+        // A completion that announces an in-process client reset must open the
+        // dispatch gate BEFORE finish() resolves the drain promise. Otherwise
+        // drain's microtask can dispatch the next program in the gap before the
+        // worker's `soft_reset` IPC message is processed, and that program would
+        // run while the session records it interrupted.
+        if (message.reset_reason === 'soft_reset' && !this.softResetting) {
+          this._openSoftResetGate({ pending: true, executionId: message.execution_id });
+        }
         this.finish(this.current, status, message, message.needs_reset).catch(() => {});
       } else if (message.type === 'soft_reset') {
         this._handleSoftResetMessage(message);
@@ -514,29 +525,21 @@ class Session {
   _settleSoftReset() {
     if (this.softResetTimer) { clearTimeout(this.softResetTimer); this.softResetTimer = null; }
     this.softResetting = false;
+    this.softResetAnnounced = false;
+    this.softResetPendingExecution = null;
+    this.softResetReason = null;
     const resolve = this.softResetResolve;
     this.softResetResolve = null;
     this.softResetDone = null;
     try { resolve?.(); } catch {}
   }
 
-  _handleSoftResetMessage(message) {
-    if (this.softResetting) return; // single flight: one outstanding gate
-    const reason = typeof message.reason === 'string' && message.reason ? message.reason.slice(0, 200) : 'unknown';
-    const generation = Number.isSafeInteger(message.generation) ? message.generation : null;
-    // A duplicated/stale announcement from an already-resolved client
-    // generation must not open a second gate (which would later time out and
-    // hard-restart a healthy worker).
-    if (this.softResetCount > 0 && generation !== null && generation <= this.workerGeneration) return;
-    const executionId = typeof message.execution_id === 'string' ? message.execution_id : null;
-    let detail = message.detail ?? null;
-    if (detail !== null) {
-      try { if (Buffer.byteLength(JSON.stringify(detail)) > 8192) detail = { truncated: true }; }
-      catch { detail = { truncated: true }; }
-    }
-    // Open the gate synchronously: from here on drain() must not dispatch.
+  _openSoftResetGate({ pending = false, executionId = null } = {}) {
+    if (this.softResetting) return;
     this.softResetting = true;
-    this.softResetReason = reason;
+    this.softResetAnnounced = false;
+    this.softResetPendingExecution = pending ? executionId : null;
+    this.softResetReason = pending ? 'soft_reset_pending' : null;
     this.softResetDone = new Promise(resolve => { this.softResetResolve = resolve; });
     if (this.softResetTimer) clearTimeout(this.softResetTimer);
     this.softResetTimer = setTimeout(() => {
@@ -547,8 +550,12 @@ class Session {
       this.event('runtime_soft_reset_timeout', { reason: this.softResetReason, timeout_ms: this.config.softResetTimeoutMs, generation: this.workerGeneration, globals_lost: false });
       this.killWorker('soft_reset_timeout').catch(() => {});
     }, this.config.softResetTimeoutMs);
-    // The soft reset is authoritative session state, not a globals-lost restart:
-    // runtimeEpoch and child.ready are deliberately untouched.
+  }
+
+  _emitSoftReset({ reason, executionId, generation, detail }) {
+    if (this.softResetAnnounced) return;
+    this.softResetAnnounced = true;
+    this.softResetReason = reason;
     const payload = { reason, execution_id: executionId, generation, detail, globals_lost: false };
     const emit = () => this.event('runtime_soft_reset', payload, executionId);
     if (this.current && !TERMINAL.has(this.current.record.status)) {
@@ -561,9 +568,35 @@ class Session {
         finished = this.finish(this.current, 'interrupted', { error: { name: 'SoftResetError', message: `Bot client reset: ${reason}` }, reset_reason: 'soft_reset' }, false);
       } catch { emit(); return; }
       finished.then(emit, emit);
-    } else {
-      emit();
+      return;
     }
+    emit();
+  }
+
+  _handleSoftResetMessage(message) {
+    const reason = typeof message.reason === 'string' && message.reason ? message.reason.slice(0, 200) : 'unknown';
+    const generation = Number.isSafeInteger(message.generation) ? message.generation : null;
+    const executionId = typeof message.execution_id === 'string' ? message.execution_id : null;
+    let detail = message.detail ?? null;
+    if (detail !== null) {
+      try { if (Buffer.byteLength(JSON.stringify(detail)) > 8192) detail = { truncated: true }; }
+      catch { detail = { truncated: true }; }
+    }
+    if (this.softResetting) {
+      // Gate was pre-opened synchronously by the reset completion message (so
+      // drain could not dispatch into the reset window). Fill in the reset
+      // metadata and record the single runtime_soft_reset event.
+      this._emitSoftReset({ reason, executionId, generation, detail });
+      return;
+    }
+    // A duplicated/stale announcement from an already-resolved client
+    // generation must not open a second gate (which would later time out and
+    // hard-restart a healthy worker).
+    if (this.softResetCount > 0 && generation !== null && generation <= this.workerGeneration) return;
+    // The soft reset is authoritative session state, not a globals-lost restart:
+    // runtimeEpoch and child.ready are deliberately untouched.
+    this._openSoftResetGate();
+    this._emitSoftReset({ reason, executionId, generation, detail });
   }
 
   _handleSoftReadyMessage(message) {
@@ -707,7 +740,7 @@ export async function start(options = {}) {
     maxBackgroundJobs: options.maxBackgroundJobs ?? Number(process.env.MAX_BACKGROUND_JOBS ?? 8),
     maxBackgroundTtlMs: options.maxBackgroundTtlMs ?? Number(process.env.MAX_BACKGROUND_TTL_MS ?? 129600000),
     maxTimeoutMs: options.maxTimeoutMs ?? Number(process.env.MAX_TIMEOUT_MS ?? 180000),
-    softResetTimeoutMs: options.softResetTimeoutMs ?? Number(process.env.SOFT_RESET_TIMEOUT_MS ?? 45000),
+    softResetTimeoutMs: options.softResetTimeoutMs ?? Number(process.env.SOFT_RESET_TIMEOUT_MS ?? 60000),
     physicsStallMs: options.physicsStallMs ?? Number(process.env.PHYSICS_STALL_MS ?? 15000),
     exitOnLeaseExpiry: options.exitOnLeaseExpiry ?? ['1', 'true'].includes(process.env.EXIT_ON_LEASE_EXPIRY ?? 'false'),
     leaseTimeoutMs: options.leaseTimeoutMs ?? Number(process.env.SUPERVISOR_LEASE_MS ?? 30000),

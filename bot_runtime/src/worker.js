@@ -46,7 +46,6 @@ let agentBot = makeAgentFacingBot(() => bot);
 let botGeneration = 0;
 let botReady = false;
 let resetState = null; // { promise, reason } while a soft reset is in flight
-let resetting = false; // true while the recovery sequence runs outside program scopes
 let pendingExecutions = []; // execute messages that arrived during reset/startup
 const softResetTimes = [];
 let softResetCount = 0;
@@ -63,6 +62,10 @@ const SOFT_RESET_RETRY_BACKOFF_MS = 2000;
 const SOFT_RESET_ATTEMPTS = 3;
 const SOFT_RESET_LOGIN_GRACE_MS = 500;
 const SPAWN_TIMEOUT_MS = 25000;
+// Replacement clients must fit inside the session's soft-reset gate budget
+// (default server timeout 60 s): quit wait 3 s + grace 0.5 s + 3 attempts +
+// 2 s backoff => 3 * 10 s spawn cap keeps the worst case below the gate.
+const SOFT_RESET_SPAWN_TIMEOUT_MS = 10000;
 const recentApi = [];
 const recentLogs = [];
 function recordApi(name, args) {
@@ -197,9 +200,7 @@ function instrumentMethod(target, name) {
   names.add(name); instrumented.set(target, names);
   target[name] = function (...args) {
     const scope = scopes.getStore();
-    // During a soft reset the worker must be able to drive the real client
-    // (quit/wait/instrument) even though the triggering program scope is closed.
-    if (scope?.closed && !resetting) throw new Error('Execution has ended');
+    if (scope?.closed) throw new Error('Execution has ended');
     if (scope && (target === bot || (bot && target === bot.pathfinder))) recordApi(name, args);
     if (target === bot && name === 'setControlState') {
       if (args[1]) controlOwners.set(args[0], scope); else controlOwners.delete(args[0]);
@@ -221,7 +222,7 @@ function instrumentEmitter(target) {
     const original = target[method];
     target[method] = function (event, listener) {
       const scope = scopes.getStore();
-      if (scope?.closed && !resetting) throw new Error('Execution has ended');
+      if (scope?.closed) throw new Error('Execution has ended');
       if (!scope) return original.call(this, event, listener);
       const wrapped = (...args) => scopes.run(scope, () => {
         if (!scope.closed) return trackPromise(scope, listener.apply(this, args));
@@ -467,7 +468,7 @@ function loadMineflayer() {
   return mineflayerModules;
 }
 
-function waitForSpawn(client) {
+function waitForSpawn(client, timeoutMs = SPAWN_TIMEOUT_MS) {
   return new Promise((resolve, reject) => {
     let settled = false;
     const cleanup = () => {
@@ -490,8 +491,8 @@ function waitForSpawn(client) {
     const onKicked = reason => finish(reject, new Error('Kicked: ' + String(reason)));
     const onEnd = reason => finish(reject, new Error('Connection ended before spawn: ' + String(reason)));
     const timer = setTimeout(
-      () => finish(reject, new Error('Bot spawn timed out after ' + SPAWN_TIMEOUT_MS + ' ms')),
-      SPAWN_TIMEOUT_MS);
+      () => finish(reject, new Error('Bot spawn timed out after ' + timeoutMs + ' ms')),
+      timeoutMs);
     client.once('spawn', onSpawn);
     client.once('error', onError);
     client.once('kicked', onKicked);
@@ -499,16 +500,26 @@ function waitForSpawn(client) {
   });
 }
 
-async function createBotClient() {
+async function createBotClient({ timeoutMs = SPAWN_TIMEOUT_MS } = {}) {
   if (config.mode === 'fake') return makeFakeBot();
   const { mineflayer, pathfinder } = loadMineflayer();
-  const client = mineflayer.createBot({
-    host: config.host, port: config.port, username: config.username,
-    version: config.version, auth: 'offline', hideErrors: true,
-  });
-  client.loadPlugin(pathfinder);
-  await waitForSpawn(client);
-  return client;
+  let client = null;
+  try {
+    client = mineflayer.createBot({
+      host: config.host, port: config.port, username: config.username,
+      version: config.version, auth: 'offline', hideErrors: true,
+    });
+    client.loadPlugin(pathfinder);
+    await waitForSpawn(client, timeoutMs);
+    return client;
+  } catch (error) {
+    // The identity proxy admits one live connection per username. A client that
+    // failed to spawn still holds that login, so destroy it here (startBot's
+    // catch never sees it because createBotClient never returned it).
+    try { client?.quit?.(); } catch {}
+    try { client?._client?.socket?.destroy?.(); } catch {}
+    throw error;
+  }
 }
 
 function installBot(client) {
@@ -604,7 +615,7 @@ async function startBot({ initial = false, reason = null } = {}) {
   const startedAt = Date.now();
   let client = null;
   try {
-    client = await createBotClient();
+    client = await createBotClient({ timeoutMs: initial ? SPAWN_TIMEOUT_MS : SOFT_RESET_SPAWN_TIMEOUT_MS });
     installBot(client);
     botReady = true;
   if (initial) {
@@ -615,6 +626,7 @@ async function startBot({ initial = false, reason = null } = {}) {
       type: 'ready',
       snapshot: snapshot(),
       mode: config.mode,
+      generation: botGeneration,
       module_policy: modulePolicy(config.lifecycle),
       sandbox: {
         native_filter: process.env.HARNESS_NATIVE_SANDBOX === 'seccomp-v1',
@@ -670,7 +682,6 @@ function softReset(reason, detail = null) {
   }
   softResetTimes.length = 0;
   softResetTimes.push(...decision.times);
-  resetting = true;
   // The reset may be triggered from a program/AsyncLocalStorage context whose
   // scope is already closed. Run the recovery outside that store: internal
   // Mineflayer timers created from a closed scope would otherwise get an
@@ -684,7 +695,6 @@ function softReset(reason, detail = null) {
   });
   resetState = { promise, reason };
   const settle = () => {
-    resetting = false;
     if (resetState?.promise === promise) resetState = null;
     // `performSoftReset`/`startBot` send soft_ready and try to drain while
     // resetState is still held, so that drain is a no-op. Drain again now that

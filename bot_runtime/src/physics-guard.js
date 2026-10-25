@@ -201,13 +201,23 @@ export function installPhysicsGuard(bot, options = {}) {
   const recordGoodTick = () => {
     lastPhysicsTickAt = safeDateNow(nowFn);
     stalled = false;
-    badTickTimes = [];
-    if (consecutiveBad > 0) {
-      consecutiveBad = 0;
-      repeatedFired = false;
-      lastBadFields = [];
+    const state = currentState();
+    if (stateIsFinite(state)) {
+      badTickTimes = [];
+      if (consecutiveBad > 0) {
+        consecutiveBad = 0;
+        repeatedFired = false;
+        lastBadFields = [];
+      }
+      rememberGoodState();
+      return;
     }
-    rememberGoodState();
+    // A physicsTick fired but the applied client state is still nonfinite (e.g.
+    // first-tick corruption with no last-good state to restore). Do not clear
+    // the bad-episode counters here, otherwise the 3-consecutive/10-in-60 s
+    // escalation can never fire and recovery falls back to the 15 s stall
+    // watchdog. Count it as another bad tick so escalation stays possible.
+    recordBadTick(nonfiniteFields(state ?? {}));
   };
 
   const recordBadTick = (badFields) => {

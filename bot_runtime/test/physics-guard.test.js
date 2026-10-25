@@ -163,6 +163,30 @@ test('consecutive bad ticks fire onRepeated once and a good physicsTick resets t
   assert.ok(repeated[1].consecutive >= CONSECUTIVE_BAD_LIMIT);
 });
 
+test('physicsTick with no last-good finite state still escalates instead of silently resetting counters', () => {
+  // First-tick corruption: there is no finite state to restore. The physicsTick
+  // emitted after apply() must not clear the bad-episode counters, otherwise the
+  // 3-consecutive/10-in-window escalation can never fire and recovery is left to
+  // the stall watchdog.
+  const bot = makeBot({ position: [Number.NaN, 64, 1] });
+  let repeated = null;
+  const guard = installPhysicsGuard(bot, {
+    intervalMs: 10000,
+    stallMs: 60000,
+    onRepeated: stats => { repeated = stats; },
+  });
+  try {
+    assert.equal(guard.installed, true);
+    for (let index = 0; index < CONSECUTIVE_BAD_LIMIT; index += 1) bot.emit('physicsTick');
+    assert.ok(repeated, 'repeated escalation must fire even without a last-good state');
+    assert.ok(repeated.badFields.includes('pos.x'));
+    assert.ok(repeated.consecutive >= CONSECUTIVE_BAD_LIMIT);
+    assert.ok(Number.isNaN(bot.entity.position.x), 'no finite state exists to restore; value is untouched');
+  } finally {
+    guard.uninstall();
+  }
+});
+
 test('stall watchdog fires once per stall episode after a missing physicsTick', async t => {
   const bot = makeBot();
   const stalled = [];

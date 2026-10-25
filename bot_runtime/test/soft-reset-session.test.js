@@ -61,7 +61,7 @@ function fakeWorkerFactory() {
       if (!worker.stopped) {
         worker.emit('message', {
           type: 'ready', snapshot: { mode: 'fake', username: workerOptions.agentId },
-          module_policy: null, sandbox: null,
+          generation: 1, module_policy: null, sandbox: null,
         });
       }
     });
@@ -158,6 +158,7 @@ test('soft reset gates dispatch and preserves the runtime epoch, globals and rea
   const worker = f.factory.instances[0];
   const executeCount = () => worker.sent.filter(message => message.type === 'execute').length;
   assert.equal(executeCount(), 1);
+  assert.equal((await f.describe()).worker_generation, 1, 'initial ready generation is adopted');
   worker.emit('message', {
     type: 'soft_reset', reason: 'nonfinite_bot_state', execution_id: null,
     generation: 2, detail: { bad_fields: ['pos.x'], recent_api: [] },
@@ -465,4 +466,52 @@ test('soft reset and physics stall configuration is validated and reaches the wo
 
   const custom = await fixture(t, { physicsStallMs: 30000 });
   assert.equal(custom.factory.instances[0].options.workerConfig.physicsStallMs, 30000);
+});
+
+test('a soft-reset completion opens the dispatch gate before drain can dispatch the next program', async t => {
+  // Regression for the completed -> drain microtask race: the worker sends
+  // `completed` (reset_reason soft_reset) and then `soft_reset`. The server must
+  // open the gate from the completion message; otherwise drain dispatches the
+  // next queued program in the gap, the worker queues and later executes it, and
+  // the session records that program as interrupted even though it ran.
+  const f = await fixture(t, { softResetTimeoutMs: 5000 });
+  f.factory.options.autoComplete = false;
+  const running = await f.submit('return "long"', { timeout_ms: 10000 });
+  await f.wait(running.execution_id, record => record.status === 'running');
+  const queued = await f.submit('return "queued"');
+  const worker = f.factory.instances[0];
+  const executeCount = () => worker.sent.filter(message => message.type === 'execute').length;
+  assert.equal(executeCount(), 1);
+
+  worker.emit('message', {
+    type: 'completed', execution_id: running.execution_id, result: null,
+    error: { name: 'SoftResetError', message: 'Bot client reset: uncaught:Error', stack: '' },
+    timed_out: false, needs_reset: false, reset_reason: 'soft_reset', cleanup: null,
+  });
+  const finished = await f.wait(running.execution_id);
+  assert.equal(finished.status, 'failed');
+  await delay(60);
+  assert.equal(executeCount(), 1, 'the queued program must not be dispatched in the completion->soft_reset gap');
+  assert.equal((await f.describe()).soft_resetting, true);
+
+  worker.emit('message', {
+    type: 'soft_reset', reason: 'uncaught:Error', execution_id: running.execution_id,
+    generation: 2, detail: { source: 'UNCAUGHT_EXCEPTION' },
+  });
+  const recorded = await f.events();
+  const softEvents = recorded.filter(event => event.kind === 'runtime_soft_reset');
+  assert.equal(softEvents.length, 1, 'runtime_soft_reset must be recorded exactly once');
+  assert.equal(softEvents[0].payload.reason, 'uncaught:Error');
+
+  f.factory.options.autoComplete = true;
+  worker.emit('message', {
+    type: 'soft_ready', reason: 'uncaught:Error', generation: 2,
+    snapshot: { mode: 'fake', username: 'alice', globals_preserved: true },
+    duration_ms: 50, soft_resets: 1,
+  });
+  const done = await f.wait(queued.execution_id);
+  assert.equal(done.status, 'succeeded');
+  assert.equal(executeCount(), 2);
+  assert.equal(done.runtime_epoch, 1);
+  assert.equal(f.factory.instances.length, 1);
 });
