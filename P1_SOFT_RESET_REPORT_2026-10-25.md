@@ -331,7 +331,23 @@ Mitigations implemented (client-side, no prompt/tool/strategy change):
   the target to be a live entity tracked in `bot.entities`, not self, not
   dead-attacking, and within 6.5 blocks. Rejecting the stale/self target
   prevents the invalid-entity kick class.
-- The 20-minute `p8-p1-dig-05` run validates both guards (results below).
+- Validation:
+  - `p8-p1-dig-05` (20.1 min, 8 agents, both guards): **0 `moved too quickly`
+    warnings across 7 deaths**, 0 kicks, 0 hard restarts, 1 successful
+    `bot_disconnected` soft reset, 39/530 programs failed (7.4%, 2 fallbacks for
+    already-invalid originals). Without the guard, `p8-p1-dig-04` had 512
+    warnings across 26 deaths (19.7/death) and P0 runs 25.3-37.0/death.
+  - `p8-p1-dig-06` (6.1 min, 8 agents, both guards): 0 deaths, 0 warnings,
+    0 kicks, 0 hard restarts; run was too short to catch a death, so it only
+    confirms the guards do not break normal execution.
+  - Deterministic protocol-level test (real Mineflayer + fixture server,
+    `protocol-integration.test.js`): while alive, 5 server `position`
+    corrections produce >=5 immediate client `position_look` echoes (the known
+    loop driver); after a server-side death, 5 corrections produce **0**
+    movement packets from the client while `teleport_confirm` still works; the
+    session revives and runs normally; `bot.attack` on self/stale/null targets is
+    rejected locally with **0 `use_entity` packets** sent. Full bot runtime
+    suite **106/106**.
 
 ### 9.2 Program error rate - loop-deadline instrumentation corruption (fixed)
 
@@ -364,11 +380,16 @@ dz <= 10; dz++)`).
 
 ### 9.3 Remaining caveats
 
-- Dead-movement suppression is a client-side behaviour change. It is safe by
-  design (dead players have no movement) but a packet-level trace (incoming
-  corrections vs outgoing position packets) is still the cleanest proof; the
-  20-minute `p8-p1-dig-05` run is the first empirical check (no kicks, no
-  movement regressions observed).
+- Dead-movement suppression is a client-side behaviour change, now proven
+  deterministically for the dead window (corrections produce zero movement
+  packets; reviving works) and empirically in one 20-minute run (0 warnings,
+  0 kicks, 1 clean soft reset). It does not remove a correction loop that would
+  keep running **after** the respawn turns `isAlive` true; no such residual was
+  observed in `p8-p1-dig-05`, but a packet-level trace in a run with many deaths
+  is still the final confirmation. Run-to-run death counts are highly variable
+  (7-57 per run), which is why the deterministic fixture test is the primary
+  proof and the agent-corpus classification is the primary proof for the
+  loop-guard fix.
 - Attack validation only covers `bot.attack`, not raw protocol/plugin attacks.
 - Run-to-run agent behaviour variance is large (7% vs 21-36% program failure
   rates), so the transform fix is established primarily by the deterministic
