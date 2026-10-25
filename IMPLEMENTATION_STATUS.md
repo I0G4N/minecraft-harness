@@ -530,3 +530,35 @@ Validation (same 8-agent paper-aligned config, fresh seed-42 worlds):
   `p8-f3-01/events.sqlite3` failed SQLite integrity on re-analysis (its
   run-time analysis JSON is intact).
 - Full report: `P1_SOFT_RESET_REPORT_2026-10-25.md`.
+
+## 2026-10-25 follow-up: moved-too-quickly warnings + program error rate
+
+Two P1 validation residuals were investigated and fixed/characterised:
+
+- **`moved too quickly!` bursts (pre-existing, not P1).** They are Mineflayer's
+  death/respawn position-correction echo loop: Paper sends a `position`
+  correction, the Mineflayer physics handler applies it and immediately echoes
+  a client `position_look` (`mineflayer/lib/plugins/physics.js:367-418`); the
+  echo is not gated by death, so local-network round trips can log hundreds of
+  warnings per second. P0 runs show the same phenomenon (35-50 burst seconds,
+  101-146/s max, 25.3-37.0 warnings/death); P1 guard/soft-reset events do not
+  correlate with high bursts. Client-side mitigations implemented:
+  suppress outgoing position packets while `bot.isAlive === false`
+  (`bot_runtime/src/client-movement-guard.js`) and validate `bot.attack`
+  targets (tracked/live/non-self/in-range) to prevent
+  `invalid_entity_attacked` kicks.
+- **Program error rate (loop-deadline instrumentation bug, fixed).**
+  `bot_runtime/src/loop-guard.mjs` mutated the AST before walking it, produced
+  NaN offsets, and the NaN-corrupted sort inserted `__mcWindowCheck()` inside
+  identifiers/for-init expressions: old transform broke 93 of 2 693 valid
+  programs in the 60-minute confirm run (and 104-215 per earlier run), new
+  transform breaks 0. The transform is rewritten as offset-only with
+  deterministic insertion and a parse-validated fail-safe fallback
+  (`LOOP_GUARD_FALLBACK`). The paper CLI now prints a bounded error
+  location/source caret so agents can fix their own invalid edits.
+- Validation: `p8-p1-dig-04` (loop-guard fix, 20 min): 518 programs, 37 failed
+  (7.1%), 0 instrumentation SyntaxErrors, 2 fallbacks (already-invalid
+  originals), 0 hard restarts, 0 kicks. `p8-p1-dig-05` (both client-side guards,
+  20 min) results are in `P1_SOFT_RESET_REPORT_2026-10-25.md` §9.
+- Analyses: `mc-logs/.p1-analysis/moved-too-quickly-forensics.md`,
+  `mc-logs/.p1-analysis/loop-guard-fix-analysis.md`.
