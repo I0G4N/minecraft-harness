@@ -153,7 +153,7 @@ Images were overlay builds on the cached P0 worker/control/launcher images
 | p8-p1-diag-01 (pre-hotfix) | ~4 min (aborted) | 1 | 1 failed -> hard restart | 1 | 0 / 0 / 0 | 0 | ~250 | 0 |
 | p8-p1-diag-02 (ALS hotfix) | 20.2 min | **0** | 8 (all ready; 98-194 ms) | 0 | 0 / 0 / 0 | 0 | 1 573 | 24 |
 | p8-p1-diag-03 (final) | 20.2 min | **0** | 2 (both at shutdown; 148 ms) | 0 | 0 / 0 / 0 | 0 | 936 | 27 |
-| p8-p1-confirm-01 (final, 60 min) | 60 min | _pending_ | _pending_ | _pending_ | _pending_ | _pending_ | _pending_ | _pending_ |
+| p8-p1-confirm-01 (final, 60 min) | 60.2 min | **0** | 3 (all ready; 83-107 ms) | 0 | 1 kick / 0 decoder / 0 SIGABRT | 0 | 2 710 | 57 |
 
 Soft-reset reasons across the diagnostics: `uncaught:TypeError` 2,
 `physics_stalled` 4, `bot_disconnected` 4 (2 mid-run, 2 at shutdown). Every
@@ -166,15 +166,38 @@ final image.
 warnings were 1 793 / 20 min, higher than the baseline `p8-diag-07`
 (484 / 20 min, 829 in `diag-05`); see residual risks.
 
+`p8-p1-confirm-01` server log: 0 decoder exceptions, 0 invalid-move packets,
+0 SIGABRT, 11 join/leave pairs (8 initial + 3 soft resets), 3 236
+`moved too quickly` warnings (≈3 236/h; baseline 60-minute rounds 1 328/h,
+20-minute diagnostics 1 452-2 487/h). There was **one server kick**:
+`player3` disconnected at 09:07:51 with
+`multiplayer.disconnect.invalid_entity_attacked`; the worker's
+`bot_disconnected` soft reset recovered the client in 83 ms with globals
+preserved. The baseline 60-minute rounds had zero kicks, so this is a new
+signal that needs follow-up (see residual risks), not a re-introduction of the
+hard-restart problem.
+
+Worker-side physics recovery in the 60-minute run: 54
+`PHYSICS_NONFINITE_PREVENTED` events across the 8 bots (`restored:true`),
+0 `PHYSICS_NONFINITE_REPEATED` escalations, 0 `PHYSICS_STALLED` events, and
+27 `NONFINITE_BOT_STATE` state-guard observations (all restored, none became a
+restart). That is the direct mechanism by which the former 43-58/hour hard
+restarts disappear.
+
 ## 5. Before / after
 
 Hard worker restarts during a run (initial startups and shutdown excluded):
 
-| configuration | 20-minute sample | per hour |
-| --- | ---: | ---: |
-| baseline P0 image (`p8-diag-05/07`) | 16 / 17 | 47.8 / 50.5 |
-| four final rounds (P0) | - | 42.9-57.9 |
-| **P1 final image, 20-minute diagnostics** | **0** | **0** |
+| configuration | 20-minute sample | 60-minute sample | per hour |
+| --- | ---: | ---: | ---: |
+| baseline P0 image (`p8-diag-05/07`) | 16 / 17 | - | 47.8 / 50.5 |
+| four final rounds (P0, 60 min each) | - | 43, 54, 58, 54 | 42.9-57.9 |
+| **P1 final image** | **0** (`diag-02/03`) | **0** (`confirm-01`) | **0** |
+
+Soft resets are the replacement cost: 8 in `diag-02`, 2 in `diag-03` (both at
+shutdown), 3 in the 60-minute `confirm-01`; every one succeeded in 83-194 ms
+with `globals_preserved:true` and no `soft_reset_failed`/`timeout` on the final
+image.
 
 Soft resets replace the hard restarts: cheap (~0.1-0.2 s), same worker
 process, VM globals preserved, no container rebuild. The in-flight program is
@@ -191,23 +214,34 @@ still failed with a clear `SoftResetError`; everything else recovers.
    rate. Monitor `runtime_soft_reset` reasons.
 3. Physics-stall detection is 15 s by design (false-positive safety). A frozen
    client stays unusable for at most that window, then soft-resets.
-4. `moved too quickly` server warnings increased in the 20-minute final
-   diagnostic (1 793 vs 484 baseline). This may be the cost of the local
-   last-good-state restore (client/server position corrections) and/or of the
-   two soft resets / agent behaviour; it did not produce kicks or invalid-move
-   packets, but should be watched in the 60-minute confirmation run.
-5. The pre-existing loop-deadline instrumentation (`instrumentLoopDeadlines`)
+4. `moved too quickly` warnings are elevated in the P1 runs: 1 793 / 20 min in
+   `diag-03` and 3 236 / 60 min in `confirm-01` (1 328/h in the P0 60-minute
+   rounds). They produced no invalid-move packets, no SIGABRT and only the one
+   `invalid_entity_attacked` kick above, but the cause is not yet isolated.
+   Candidates: the physics/state guard's last-good position restores generating
+   server corrections, the two soft resets' rejoin teleports, or simply more
+   movement by surviving bots. This needs a follow-up analysis (per-player,
+   per-tick) before a paper run, but it is a correction-warning/teleport
+   quality issue, not a worker-stability regression.
+5. One new kick class appeared in the 60-minute run:
+   `multiplayer.disconnect.invalid_entity_attacked` (player3, 09:07:51). The
+   soft reset handled it correctly (83 ms, globals preserved, no hard restart),
+   but the P0 60-minute rounds had no kicks. It is most likely a stale entity
+   attack race (client attacking an entity the server already removed) and
+   should be investigated in the same follow-up; it does not reintroduce hard
+   restarts.
+6. The pre-existing loop-deadline instrumentation (`instrumentLoopDeadlines`)
    corrupts some agent programs (SyntaxError `__mcWindowCheck` insertions),
    causing a high program error rate (29% failures in `diag-03`, 15-25% in the
    P0 rounds). This is unrelated to P1 and should be fixed separately.
-6. Validation images were overlay builds on cached bases because the Docker Hub
+7. Validation images were overlay builds on cached bases because the Docker Hub
    `node:` base pull times out from this host; the source is committed and the
    production Dockerfiles (bot -> worker/control/launcher) need one clean
    network build before a paper run.
-7. This is still a 20-minute/1-hour evidence base, not the paper's 36h soak.
+8. This is still a 20-minute/1-hour evidence base, not the paper's 36h soak.
    The claim is "hard worker restarts and globals loss are removed in these
    runs", not "the framework is proven for 36h".
-8. Archived run `p8-f3-01` `events.sqlite3` failed SQLite integrity checking on
+9. Archived run `p8-f3-01` `events.sqlite3` failed SQLite integrity checking on
    2026-10-25 (its run-time `reports/stability-analysis.json` is intact and was
    used above). Cause not investigated; unrelated to P1 runtime code, but worth
    checking the archive storage.

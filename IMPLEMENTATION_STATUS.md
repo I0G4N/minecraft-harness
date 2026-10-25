@@ -511,12 +511,22 @@ Validation (same 8-agent paper-aligned config, fresh seed-42 worlds):
 - `p8-p1-diag-03` (final hardening image, 20.2 min): hard worker restarts **0**,
   2 shutdown-time soft resets (148 ms), 0 failed/timeout, 0 kicks/decoder/
   SIGABRT, `failures=[]`.
+- `p8-p1-confirm-01` (final hardening image, 60.2 min): hard worker restarts
+  **0** (baseline 42.9-57.9/hour), 3 soft resets (83-107 ms, all ready),
+  0 failed/timeout/worker_fatal/SIGABRT/decoder, `failures=[]`, 2 710 model
+  calls, 57 deaths. 54 `PHYSICS_NONFINITE_PREVENTED` recoveries and 27
+  state-guard nonfinite observations all restored in place; 0 escalations to
+  soft reset from physics. One server kick occurred
+  (`multiplayer.disconnect.invalid_entity_attacked`) and was recovered by a
+  83 ms soft reset with globals preserved.
 - Remaining limits: one in-flight program is still failed with
   `SoftResetError` per reset (globals survive); 6/600 s reset cap then hard
   restart; physics-stall detection latency 15 s; `moved too quickly` warnings
-  were higher than baseline in the 20-minute final diagnostic and are being
-  watched; the pre-existing loop-deadline instrumentation SyntaxError
-  corruption is unrelated and still inflates program error rates; validation
+  are elevated (3 236/h in the 60-minute run vs 1 328/h baseline) and need a
+  follow-up; the one `invalid_entity_attacked` kick and the pre-existing
+  loop-deadline SyntaxError corruption also need separate follow-up; validation
   images are overlay builds from cached bases (Docker Hub `node:` pull still
-  unavailable), so one clean production image build is pending.
+  unavailable), so one clean production image build is pending; archived
+  `p8-f3-01/events.sqlite3` failed SQLite integrity on re-analysis (its
+  run-time analysis JSON is intact).
 - Full report: `P1_SOFT_RESET_REPORT_2026-10-25.md`.
