@@ -33,3 +33,7 @@ Caddyfile
 pi_runtime/node_modules/
 .venv
 .mc-s/
+
+# Local reference checkout / extracted tarball used during the dsh-mc-agent comparison.
+reference/
+.tmp-mf/
