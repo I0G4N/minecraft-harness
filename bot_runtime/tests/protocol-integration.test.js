@@ -379,3 +379,108 @@ test('worker soft reset drains an execution queued during the reset gate', { tim
   assert.equal(child.exitCode, null, 'worker must not exit on a soft reset');
   assert.equal(stderr.join('').includes('SOFT_RESET_FAILED'), false);
 });
+
+// ---------------------------------------------------------------------------
+// Client movement/attack guards: deterministic protocol-level validation.
+//
+// - Alive position corrections: Mineflayer's physics position handler echoes a
+//   client position_look per correction (this is the pre-existing echo loop that
+//   produces Paper "moved too quickly!" bursts around death/respawn).
+// - While dead, the worker's death-movement guard must drop those echoes
+//   (teleport_confirm stays allowed; other packets are untouched).
+// - bot.attack on a stale/self entity must be rejected before any use_entity
+//   packet is sent (prevents multiplayer.disconnect.invalid_entity_attacked).
+// ---------------------------------------------------------------------------
+test('protocol fixture: dead clients do not echo position corrections and invalid attacks are rejected locally', { timeout: 20000 }, async t => {
+  const fixture = await protocolFixture();
+  const token = 'protocol-fixture-movement-guard-token';
+  const runtime = await start({ mode: 'minecraft', port: 0, token,
+    mcHost: '127.0.0.1', mcPort: fixture.port, mcVersion: '1.20.4', startupTimeoutMs: 6000 });
+  t.after(async () => { await runtime.close(); await fixture.close(); });
+  const url = `http://127.0.0.1:${runtime.address.port}`;
+  async function request(method, path, body) {
+    const response = await fetch(`${url}${path}`, { method,
+      headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' },
+      body: body === undefined ? undefined : JSON.stringify(body) });
+    const result = await response.json();
+    assert.ok(response.ok, `HTTP ${response.status}: ${JSON.stringify(result)}`);
+    return result;
+  }
+  async function submit(source, timeoutMs = 5000) {
+    return request('POST', '/v1/sessions/guardBot/programs', {
+      request_id: crypto.randomUUID(), source, timeout_ms: timeoutMs,
+      world_epoch: 1, run_id: 'development' });
+  }
+  async function wait(executionId, timeoutMs = 8000) {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      const record = await request('GET', `/v1/sessions/guardBot/programs/${executionId}`);
+      if (!['accepted', 'running'].includes(record.status)) return record;
+      await delay(15);
+    }
+    throw new Error('guard-fixture execution did not reach terminal status');
+  }
+
+  const session = await request('POST', '/v1/sessions', { agent_id: 'guardBot' });
+  assert.equal(session.connected, true);
+  const client = Object.values(fixture.server.clients).find(peer => peer.username === 'guardBot');
+  assert.ok(client, 'protocol fixture client should be connected');
+  const counts = { position: 0, position_look: 0, flying: 0, attack: 0 };
+  for (const packet of ['position', 'position_look', 'flying']) {
+    client.on(packet, () => { counts[packet] += 1; });
+  }
+  for (const packet of ['use_entity', 'interact', 'attack']) {
+    client.on(packet, () => { counts.attack += 1; });
+  }
+  const writeCorrections = (count, baseTeleportId) => {
+    for (let index = 0; index < count; index += 1) {
+      client.write('position', {
+        x: 8.5 + index * 0.01, y: 64, z: 8.5, yaw: 0, pitch: 0,
+        flags: 0, teleportId: baseTeleportId + index,
+      });
+    }
+  };
+
+  // Control: while alive, each correction produces an immediate position_look
+  // echo from Mineflayer's physics handler.
+  writeCorrections(5, 1000);
+  await delay(200);
+  assert.ok(counts.position_look >= 5,
+    `alive corrections should echo position_look, saw ${JSON.stringify(counts)}`);
+
+  // Kill the bot (server-side health update; the fixture does not answer the
+  // client's auto-respawn command, so the bot stays dead).
+  client.write('update_health', { health: 0, food: 20, foodSaturation: 5 });
+  await delay(250);
+
+  const beforeDead = { ...counts };
+  writeCorrections(5, 2000);
+  await delay(300);
+  const deadMovement = counts.position + counts.position_look + counts.flying - beforeDead.position - beforeDead.position_look - beforeDead.flying;
+  assert.equal(deadMovement, 0,
+    `dead client must not send movement packets, saw ${JSON.stringify(counts)} (before ${JSON.stringify(beforeDead)})`);
+
+  // Revive and confirm the session still works normally.
+  client.write('update_health', { health: 20, food: 20, foodSaturation: 5 });
+  client.write('position', { x: 8.5, y: 64, z: 8.5, yaw: 0, pitch: 0, flags: 0, teleportId: 3000 });
+  await delay(200);
+  const revived = await wait((await submit('return { alive: bot.isAlive, health: bot.health };')).execution_id);
+  assert.equal(revived.status, 'succeeded', JSON.stringify(revived.error));
+  assert.equal(revived.result.health, 20);
+
+  // Attack guard: bot.entity is a snapshot (never the tracked entity object),
+  // and self-attacks must be rejected locally without a use_entity packet.
+  const attackRecord = await wait((await submit(`
+    const before = bot.entity;
+    const outcomes = [];
+    for (const target of [bot.entity, bot.entities[bot.entity?.id], null]) {
+      try { bot.attack(target); outcomes.push('sent'); }
+      catch (error) { outcomes.push(error.name + ':' + error.message); }
+    }
+    return outcomes;
+  `)).execution_id);
+  assert.equal(attackRecord.status, 'succeeded', JSON.stringify(attackRecord.error));
+  assert.ok(attackRecord.result.every(outcome => /^(TypeError|Error):/.test(outcome)),
+    `all invalid attacks must be rejected locally: ${JSON.stringify(attackRecord.result)}`);
+  assert.equal(counts.attack, 0, 'no use_entity packet may be sent for rejected targets');
+});
