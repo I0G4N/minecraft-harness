@@ -452,3 +452,71 @@ Verification: `mc-runs/p8-diag-07` (20 min, patched worker image).
   the patched files because Docker Hub metadata access timed out during the full
   `bot.Dockerfile` build; the production Dockerfile wiring itself is committed
   but not fully network-built.
+
+## 2026-10-25 P1: in-process soft bot reset + physics NaN recovery
+
+Implements the phase-2 fix for the residual P0 problem: worker restarts were
+still 43-58/hour and every hard restart destroyed the VM context (agent
+globals/helpers) and the in-flight program. Design contract:
+`bot_runtime/P1_SOFT_RESET_DESIGN.md`.
+
+What changed:
+
+- `bot_runtime/src/physics-guard.js` (new): wraps
+  `bot.physics.simulatePlayer` and replaces nonfinite `pos`/`vel` before
+  `.apply(bot)`, repairs entity yaw/pitch, records bad fields/recent API,
+  escalates when a bad state cannot be restored (immediate when no last-good
+  state exists, otherwise 3 consecutive / 10 in 60 s), and runs a
+  `physicsTick` stall watchdog (`physicsStallMs`, default 15 s) for the
+  Mineflayer unloaded-chunk freeze.
+- `bot_runtime/src/worker.js`: bot setup refactored into
+  `createBotClient()`/`startBot()`; one stable agent-facing proxy via getter;
+  single-flight in-process `softReset` recreates the Mineflayer client while
+  keeping the VM context/`globals`, closes leftover scopes/timers/listeners,
+  quiesces native actions, retries login (bounded by the session gate) and
+  queues executions that race the reset boundary. Nonfinite state, unexpected
+  bot end, uncaught exceptions/rejections and unfinished native actions now
+  soft-reset instead of `process.exit(1)`; IPC loss and a 6/600 s loop cap
+  remain hard exits. Viewer hooks re-attach per generation.
+- `bot_runtime/src/server.js`: session soft-reset gate
+  (`runtime_soft_reset` / `_ready` / `_failed` / `_timeout`, `globals_lost:false`),
+  completion-first gate opening to close the dispatch microtask race,
+  `drain()` waits on the gate, `runtimeEpoch`/`child.ready` unchanged, config
+  `softResetTimeoutMs` (default 60 000) and `physicsStallMs`.
+- `bot_runtime/src/worker-host.js`: allowlist copy/validation for
+  `physicsStallMs`.
+- Python: recorder keeps soft resets as their own `player_event` kinds (never
+  `runtime_reset`/`globals_lost`); `analyze_stability.py` reports
+  `hard_restarts` and soft-reset counters/reasons separately;
+  `summarize_rounds.py` and `figures.py` keep soft resets out of paper-style
+  restart series.
+- Tests: physics-guard unit tests, session soft-reset gate tests (including
+  the completion-first race and timeout/failure hard-restart paths), real
+  Mineflayer E2E with production `chatDelivery=program_output` proving globals
+  survive a soft reset with exactly one `runtime_ready` and no
+  `runtime_reset`, queued-execution-during-reset regression. Full bot runtime
+  suite 89/89; an independent adversarial verifier re-audited the six defects
+  found on the first iteration (all fixed, suite 89/89 x3 on the final image).
+
+Validation (same 8-agent paper-aligned config, fresh seed-42 worlds):
+
+- `p8-p1-diag-01` (pre-hotfix): first real soft reset failed with
+  `socketClosed` because the replacement client was created inside the
+  triggering program's closed AsyncLocalStorage scope and leaked the identity
+  proxy's single active connection -> one hard restart. Aborted after ~4 min;
+  kept as evidence and fixed (`7e365b1`).
+- `p8-p1-diag-02` (hotfix image, 20.2 min): hard worker restarts **0** (baseline
+  16-17/20 min; 43-58/hour); 8 soft resets, all succeeded in 98-194 ms, 0
+  failed/timeout, 0 kicks/decoder/SIGABRT, `failures=[]`.
+- `p8-p1-diag-03` (final hardening image, 20.2 min): hard worker restarts **0**,
+  2 shutdown-time soft resets (148 ms), 0 failed/timeout, 0 kicks/decoder/
+  SIGABRT, `failures=[]`.
+- Remaining limits: one in-flight program is still failed with
+  `SoftResetError` per reset (globals survive); 6/600 s reset cap then hard
+  restart; physics-stall detection latency 15 s; `moved too quickly` warnings
+  were higher than baseline in the 20-minute final diagnostic and are being
+  watched; the pre-existing loop-deadline instrumentation SyntaxError
+  corruption is unrelated and still inflates program error rates; validation
+  images are overlay builds from cached bases (Docker Hub `node:` pull still
+  unavailable), so one clean production image build is pending.
+- Full report: `P1_SOFT_RESET_REPORT_2026-10-25.md`.
