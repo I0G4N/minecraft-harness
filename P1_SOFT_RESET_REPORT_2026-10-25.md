@@ -279,3 +279,100 @@ python3 scripts/analyze_stability.py mc-runs/<run> --server-log <server-data>/lo
   `mc-runs/p8-p1-diag-02`, `mc-runs/p8-p1-diag-03`, `mc-runs/p8-p1-confirm-01`.
 - Analysis: each run's `reports/stability-analysis.json`; worker stderr for the
   confirmation run under `mc-logs/p8-p1-confirm-01-workers/`.
+
+## 9. Follow-up investigation (2026-10-25): moved-too-quickly warnings and program error rate
+
+The P1 validation left two open items: Paper's `moved too quickly!` warnings were
+elevated in `p8-p1-confirm-01` (3 236 vs 1 087-1 653 in the P0 60-minute runs),
+and the program error rate was high (15-36%). Both were investigated with
+recorded evidence; neither was caused by the soft-reset machinery.
+
+### 9.1 `moved too quickly!` - death/respawn correction echo loop (pre-existing)
+
+Verdict: the warnings are a **Mineflayer/Paper client-side
+position-correction echo loop around death/respawn**, present in every P0 run;
+they are not caused by P1.
+
+Evidence:
+
+- Warnings arrive in 1-second bursts of one identical delta vector (49 bursts
+  in the P1 confirm run; 99.85% of the 3 236 warnings are inside multi-warning
+  bursts; max 233 in one second - far above Mineflayer's 20 Hz physics tick).
+- 91.4% of warnings fall within 30 s after a death of the same player (P0
+  baselines 83.7-94.0%); every burst is death/respawn-adjacent.
+- The mechanism is the Mineflayer physics position handler: when Paper sends a
+  clientbound `position` correction, the handler applies it, sends
+  `teleport_confirm`, then **always immediately echoes a client
+  `position_look`** (`bot_runtime/node_modules/mineflayer/lib/plugins/physics.js:367-418`).
+  That echo is not gated by death; Paper validates it, can reject and correct
+  again, and the loop runs at local-network speed until positions converge.
+- P0 baselines show the same phenomenon: 1 087-1 653 warnings, 35-50 warning
+  seconds, 101-146 warnings/s max, 25.3-37.0 warnings/death. P1's 49 burst
+  seconds are inside that range; P1 diagnostic runs vary widely (360, 512,
+  1 793 warnings over 20 min), so the elevated P1 total is run variance, not a
+  P1 signature.
+- P1 physics-guard / soft-reset events do not align with the bursts: only 1 of
+  the 15 high-burst deaths has a same-agent guard event before the burst, and
+  guard events stop ~35 min before the run ends.
+- The separate `multiplayer.disconnect.invalid_entity_attacked` kick was a
+  program error: player3's program attacked a stale/self player entity; the
+  target filter compared object identity only, and Mineflayer's `bot.attack`
+  forwards `target.id` without validation.
+
+Mitigations implemented (client-side, no prompt/tool/strategy change):
+
+- **Dead movement suppression** (`bot_runtime/src/client-movement-guard.js`):
+  while `bot.isAlive === false`, drop outgoing `position`/`position_look`/
+  `flying` packets. A dead player has no legitimate movement; `teleport_confirm`
+  and all other packets are untouched, and physics resumes from the respawn
+  position packet. This removes the client side of the echo loop during the
+  death/respawn window.
+- **Attack target validation**: before `bot.attack` sends `use_entity`, require
+  the target to be a live entity tracked in `bot.entities`, not self, not
+  dead-attacking, and within 6.5 blocks. Rejecting the stale/self target
+  prevents the invalid-entity kick class.
+- The 20-minute `p8-p1-dig-05` run validates both guards (results below).
+
+### 9.2 Program error rate - loop-deadline instrumentation corruption (fixed)
+
+The dominant synthetic-error class was not the model's JS: the loop-deadline
+source transform was corrupting valid programs. `instrumentLoopDeadlines`
+mutated the AST before walking it (synthetic loop bodies without `start`/`end`
+produced NaN offsets), and the NaN entries made the descending edit sort
+inconsistent, so valid `__mcWindowCheck()` insertions landed inside identifiers
+and for-init expressions (real failure: `for (let dz = -10;__mcWindowCheck();
+dz <= 10; dz++)`).
+
+- Deterministic classification of recorded execution sources: old transform
+  broke **93 of 2 693 valid** programs in the 60-minute confirm run (7.5% of
+  failures), **104** in `p8-p1-diag-03` (35.7% of failures), and 117-215
+  (21-56% of failures) in P0 60-minute rounds. New transform breaks **0**.
+- The transform was rewritten to be offset-only (no AST mutation), insert the
+  check at the start of each loop body, validate all offsets, group same-offset
+  edits deterministically, and re-parse its own output. On any unexpected
+  problem it returns the original program (runs without loop instrumentation)
+  and logs `LOOP_GUARD_FALLBACK` instead of rejecting a valid program.
+- The paper CLI text output now appends a bounded error location (execution
+  file:line + source line/caret, or the first execution stack frame), so the
+  agent can fix its own invalid edits instead of repeating them.
+- Validation: `p8-p1-dig-04` (20 min, loop-guard fix only): 518 programs, 37
+  failed (7.1%), **0** instrumentation-caused SyntaxErrors, 2
+  `LOOP_GUARD_FALLBACK` (both already-invalid originals), 0 hard restarts,
+  0 kicks, 0 SIGABRT. The remaining failures are agent-generated invalid JS
+  (broken hand edits) or ordinary runtime errors; in the 60-minute confirm run
+  824 of 1 244 failures were already invalid before instrumentation.
+
+### 9.3 Remaining caveats
+
+- Dead-movement suppression is a client-side behaviour change. It is safe by
+  design (dead players have no movement) but a packet-level trace (incoming
+  corrections vs outgoing position packets) is still the cleanest proof; the
+  20-minute `p8-p1-dig-05` run is the first empirical check (no kicks, no
+  movement regressions observed).
+- Attack validation only covers `bot.attack`, not raw protocol/plugin attacks.
+- Run-to-run agent behaviour variance is large (7% vs 21-36% program failure
+  rates), so the transform fix is established primarily by the deterministic
+  corpus classification, not by a single run's error rate.
+- The P0 baseline `events.sqlite3` files for `p8-f1-02`, `p8-f2-02` and
+  `p8-f3-01` fail SQLite integrity checks now; the baseline numbers above use
+  their run-time analysis JSON + `server_log_segment` artifacts/`events.jsonl`.
