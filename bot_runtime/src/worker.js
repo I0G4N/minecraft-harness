@@ -613,7 +613,8 @@ function installBot(client) {
   try {
     deathMovementGuard = installDeathMovementSuppression(client, {
       onSuppressed: ({ total, name }) => {
-        if (movementSuppressedLogs >= 10 || total % 200 !== 0) return;
+        if (movementSuppressedLogs >= 12) return;
+        if (total !== 1 && total % 25 !== 0) return;
         movementSuppressedLogs += 1;
         stderrEvidence('DEAD_MOVEMENT_SUPPRESSED', { count: total, packet: name, execution_id: currentScope?.id ?? null });
       },
