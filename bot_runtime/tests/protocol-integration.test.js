@@ -152,7 +152,12 @@ test('protocol fixture: real Mineflayer 1.20.4 spawns, observes, chats across bo
 test('protocol fixture: in-process soft reset preserves globals, session and runtime epoch', { timeout: 30000 }, async t => {
   const fixture = await protocolFixture();
   const token = 'protocol-fixture-soft-reset-token';
-  const runtime = await start({ mode: 'minecraft', port: 0, token,
+  // chatDelivery 'program_output' is the production paper config. It is
+  // important here: installBot registers the chat listener AFTER
+  // instrumentEmitter, so a soft reset triggered from a closed program
+  // AsyncLocalStorage scope used to throw "Execution has ended" on that
+  // registration (replacement client leaked, retries failed with socketClosed).
+  const runtime = await start({ mode: 'minecraft', port: 0, token, chatDelivery: 'program_output',
     mcHost: '127.0.0.1', mcPort: fixture.port, mcVersion: '1.20.4', startupTimeoutMs: 6000 });
   t.after(async () => { await runtime.close(); await fixture.close(); });
   const url = `http://127.0.0.1:${runtime.address.port}`;

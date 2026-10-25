@@ -16,6 +16,7 @@ ROOT=$(cd "$(dirname "$0")/.." && pwd)
 cd "$ROOT"
 
 DOCKER=${DOCKER:-docker}
+export DOCKER_BUILDKIT=${DOCKER_BUILDKIT:-0}  # buildx activity dir under ~/.docker is read-only in this sandbox
 BASE_BOT=${BASE_BOT:-minecraft-harness-bot:p0-test}
 WORKER_IMAGE=${WORKER_IMAGE:-minecraft-harness-worker:viewer}
 CONTROL_IMAGE=${CONTROL_IMAGE:-minecraft-harness-control:research}

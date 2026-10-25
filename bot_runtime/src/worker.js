@@ -46,6 +46,7 @@ let agentBot = makeAgentFacingBot(() => bot);
 let botGeneration = 0;
 let botReady = false;
 let resetState = null; // { promise, reason } while a soft reset is in flight
+let resetting = false; // true while the recovery sequence runs outside program scopes
 let pendingExecutions = []; // execute messages that arrived during reset/startup
 const softResetTimes = [];
 let softResetCount = 0;
@@ -58,8 +59,9 @@ let fatalExitScheduled = false;
 const PENDING_EXECUTION_LIMIT = 2;
 const SOFT_RESET_RATE_LIMIT = 6;
 const SOFT_RESET_RATE_WINDOW_MS = 600000;
-const SOFT_RESET_RETRY_BACKOFF_MS = 1500;
+const SOFT_RESET_RETRY_BACKOFF_MS = 2000;
 const SOFT_RESET_ATTEMPTS = 3;
+const SOFT_RESET_LOGIN_GRACE_MS = 500;
 const SPAWN_TIMEOUT_MS = 25000;
 const recentApi = [];
 const recentLogs = [];
@@ -195,7 +197,9 @@ function instrumentMethod(target, name) {
   names.add(name); instrumented.set(target, names);
   target[name] = function (...args) {
     const scope = scopes.getStore();
-    if (scope?.closed) throw new Error('Execution has ended');
+    // During a soft reset the worker must be able to drive the real client
+    // (quit/wait/instrument) even though the triggering program scope is closed.
+    if (scope?.closed && !resetting) throw new Error('Execution has ended');
     if (scope && (target === bot || (bot && target === bot.pathfinder))) recordApi(name, args);
     if (target === bot && name === 'setControlState') {
       if (args[1]) controlOwners.set(args[0], scope); else controlOwners.delete(args[0]);
@@ -217,7 +221,7 @@ function instrumentEmitter(target) {
     const original = target[method];
     target[method] = function (event, listener) {
       const scope = scopes.getStore();
-      if (scope?.closed) throw new Error('Execution has ended');
+      if (scope?.closed && !resetting) throw new Error('Execution has ended');
       if (!scope) return original.call(this, event, listener);
       const wrapped = (...args) => scopes.run(scope, () => {
         if (!scope.closed) return trackPromise(scope, listener.apply(this, args));
@@ -598,9 +602,11 @@ function installBot(client) {
 
 async function startBot({ initial = false, reason = null } = {}) {
   const startedAt = Date.now();
-  const client = await createBotClient();
-  installBot(client);
-  botReady = true;
+  let client = null;
+  try {
+    client = await createBotClient();
+    installBot(client);
+    botReady = true;
   if (initial) {
     try { setupViewer(); } catch (error) {
       stderrEvidence('VIEWER_SETUP_FAILED', { error: String(error?.stack ?? error).slice(0, 800) });
@@ -637,6 +643,15 @@ async function startBot({ initial = false, reason = null } = {}) {
   });
   drainPendingExecutions();
   return client;
+  } catch (error) {
+    // A replacement client that failed after createBot() must be destroyed:
+    // the identity proxy admits one live connection per username, so a leaked
+    // login would make every subsequent retry fail with socketClosed.
+    try { client?.quit?.(); } catch {}
+    try { client?._client?.socket?.destroy?.(); } catch {}
+    botReady = false;
+    throw error;
+  }
 }
 
 function softReset(reason, detail = null) {
@@ -655,7 +670,13 @@ function softReset(reason, detail = null) {
   }
   softResetTimes.length = 0;
   softResetTimes.push(...decision.times);
-  const promise = performSoftReset(reason, detail).catch(error => {
+  resetting = true;
+  // The reset may be triggered from a program/AsyncLocalStorage context whose
+  // scope is already closed. Run the recovery outside that store: internal
+  // Mineflayer timers created from a closed scope would otherwise get an
+  // "Execution has ended" fence on every instrumented bot call, and a partially
+  // created replacement client would leak its login and block the retries.
+  const promise = scopes.run(undefined, () => performSoftReset(reason, detail)).catch(error => {
     stderrEvidence('SOFT_RESET_UNEXPECTED_ERROR', { reason, error: String(error?.stack ?? error).slice(0, 2000) });
     try { send({ type: 'soft_reset_failed', reason, error: String(error?.stack ?? error).slice(0, 4096) }); } catch {}
     fatalExit('Soft reset failed: ' + String(error?.message ?? error), { soft_reset_failed: true, reason });
@@ -663,6 +684,7 @@ function softReset(reason, detail = null) {
   });
   resetState = { promise, reason };
   const settle = () => {
+    resetting = false;
     if (resetState?.promise === promise) resetState = null;
     // `performSoftReset`/`startBot` send soft_ready and try to drain while
     // resetState is still held, so that drain is a no-op. Drain again now that
@@ -754,6 +776,10 @@ async function performSoftReset(reason, detail) {
   bot = null;
   botReady = false;
   intentionalBotQuit = false;
+  // Give the identity proxy's single-active-connection slot time to observe the
+  // old socket close before the login is retried; otherwise the replacement
+  // login is rejected as a duplicate and looks like an immediate socket close.
+  await sleep(SOFT_RESET_LOGIN_GRACE_MS);
   // 9. Create the replacement client with bounded retries/backoff.
   let lastError = null;
   for (let attempt = 1; attempt <= SOFT_RESET_ATTEMPTS; attempt += 1) {
