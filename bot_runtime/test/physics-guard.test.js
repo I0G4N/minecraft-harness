@@ -163,11 +163,12 @@ test('consecutive bad ticks fire onRepeated once and a good physicsTick resets t
   assert.ok(repeated[1].consecutive >= CONSECUTIVE_BAD_LIMIT);
 });
 
-test('physicsTick with no last-good finite state still escalates instead of silently resetting counters', () => {
-  // First-tick corruption: there is no finite state to restore. The physicsTick
-  // emitted after apply() must not clear the bad-episode counters, otherwise the
-  // 3-consecutive/10-in-window escalation can never fire and recovery is left to
-  // the stall watchdog.
+test('nonfinite simulate output with no last-good state escalates immediately', () => {
+  // First-tick corruption with no finite state to restore: the bad PlayerState
+  // is about to be applied, so the guard must escalate immediately. For a
+  // position NaN the real Mineflayer tickPhysics early-returns on the
+  // blockAt(NaN) gate and never calls simulatePlayer again, so waiting for the
+  // 3-consecutive threshold or the 15 s stall watchdog is too late.
   const bot = makeBot({ position: [Number.NaN, 64, 1] });
   let repeated = null;
   const guard = installPhysicsGuard(bot, {
@@ -177,11 +178,30 @@ test('physicsTick with no last-good finite state still escalates instead of sile
   });
   try {
     assert.equal(guard.installed, true);
+    bot.__nextState = () => badState(bot);
+    const output = bot.physics.simulatePlayer({}, {});
+    assert.ok(repeated, 'onRepeated must fire on the first unrecoverable bad tick');
+    assert.equal(repeated.noLastGood, true);
+    assert.ok(repeated.badFields.includes('pos.x'));
+    assert.ok(repeated.consecutive >= CONSECUTIVE_BAD_LIMIT);
+    assert.ok(Number.isNaN(output.pos.x), 'no finite state exists to restore; output is untouched');
+  } finally {
+    guard.uninstall();
+  }
+});
+
+test('a nonfinite physicsTick does not silently clear the bad-episode counters', () => {
+  const bot = makeBot({ position: [Number.NaN, 64, 1] });
+  let repeated = null;
+  const guard = installPhysicsGuard(bot, {
+    intervalMs: 10000,
+    stallMs: 60000,
+    onRepeated: stats => { repeated = stats; },
+  });
+  try {
     for (let index = 0; index < CONSECUTIVE_BAD_LIMIT; index += 1) bot.emit('physicsTick');
     assert.ok(repeated, 'repeated escalation must fire even without a last-good state');
     assert.ok(repeated.badFields.includes('pos.x'));
-    assert.ok(repeated.consecutive >= CONSECUTIVE_BAD_LIMIT);
-    assert.ok(Number.isNaN(bot.entity.position.x), 'no finite state exists to restore; value is untouched');
   } finally {
     guard.uninstall();
   }

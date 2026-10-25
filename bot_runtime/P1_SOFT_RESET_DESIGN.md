@@ -278,8 +278,12 @@ defects. The implementation now additionally guarantees:
 - **Generation in the initial `ready` message.** The server adopts it, so the
   stale-generation guards have a defined baseline after a hard restart.
 - **Physics guard escalation without a last-good state.** A physicsTick whose
-  applied client state is still nonfinite counts as a bad tick (the counters
-  are only cleared by a finite tick), so first-tick corruption escalates
-  instead of waiting for the 15 s stall watchdog.
+  applied client state is still nonfinite counts as a bad tick (counters are
+  only cleared by a finite tick), and when no finite state exists to restore
+  the guard escalates on the *first* unrecoverable bad tick (position NaN
+  otherwise freezes Mineflayer tickPhysics through its `blockAt(NaN)` gate, so
+  the 15 s stall watchdog was the only recovery). The 10-in-60 s branch is
+  kept as defense in depth but is normally unreachable because a finite tick
+  clears the window.
 - `soft_reset` and `soft_ready` generation semantics are unchanged: soft_reset
   advertises the expected new generation, soft_ready the actual installed one.

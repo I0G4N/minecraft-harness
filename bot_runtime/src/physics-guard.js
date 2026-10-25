@@ -289,6 +289,23 @@ export function installPhysicsGuard(bot, options = {}) {
         state: good,
       };
       recordBadTick(fields);
+      if (!good && !repeatedFired) {
+        // No finite state exists to restore, so this bad PlayerState will be
+        // applied. Escalate immediately: for position NaN Mineflayer's
+        // tickPhysics early-returns on the blockAt(NaN) gate and no further
+        // physicsTick/simulate calls arrive, so the 3-consecutive threshold
+        // would otherwise never fire and only the 15 s stall watchdog recovers.
+        repeatedFired = true;
+        safeCall(onRepeated, {
+          reason: 'nonfinite_bot_state',
+          badFields: fields.slice(),
+          consecutive: Math.max(consecutiveBad, CONSECUTIVE_BAD_LIMIT),
+          inWindow: badTickTimes.length,
+          prevented: preventedCount,
+          recentApi: safeRecentApi(),
+          noLastGood: true,
+        });
+      }
       safeCall(onPrevented, payload);
       return output;
     } catch {
