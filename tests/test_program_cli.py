@@ -52,3 +52,76 @@ class ProgramCliTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(result["wait_expired"])
         self.assertEqual(result["execution_id"], "known")
         self.assertLess(time.monotonic() - started, 0.6)
+
+
+class RenderProgramTextTests(unittest.TestCase):
+    """The paper text output keeps a bounded source location for errors.
+
+    Agents edit generated programs by hand; printing only ``Error: <message>``
+    for a SyntaxError loses the line/caret and makes them repeat the same bad
+    edit. Keep the added context compact.
+    """
+
+    def test_success_output_prints_logs_then_returned(self):
+        from minecraft_harness.program_cli import render_program_text
+        text = render_program_text({"status": "succeeded", "logs": [{"message": "hello"}], "result": "ok"})
+        self.assertEqual(text, "hello\nReturned: ok")
+
+    def test_syntax_error_renders_line_code_and_caret(self):
+        from minecraft_harness.program_cli import render_program_text
+        result = {
+            "status": "failed",
+            "error": {
+                "name": "SyntaxError",
+                "message": "Unexpected token ';'",
+                "stack": (
+                    "execution-abc.js:11\n"
+                    "for (let dz = -10;__mcWindowCheck(); dz <= 10; dz++) {\n"
+                    "                                                         ^\n"
+                    "\nSyntaxError: Unexpected token ';'"
+                ),
+            },
+        }
+        lines = render_program_text(result).splitlines()
+        self.assertEqual(lines[0], "Error: Unexpected token ';'")
+        self.assertEqual(lines[1], "  at execution-abc.js:11")
+        self.assertIn("__mcWindowCheck", lines[2])
+        self.assertEqual(lines[3].strip(), "^")
+
+    def test_runtime_error_renders_first_execution_frame(self):
+        from minecraft_harness.program_cli import render_program_text
+        result = {
+            "status": "failed",
+            "error": {
+                "name": "TypeError",
+                "message": "x is not a function",
+                "stack": "TypeError: x is not a function\n    at execution-def.js:3:7\n    at foo",
+            },
+        }
+        self.assertEqual(
+            render_program_text(result).splitlines(),
+            ["Error: x is not a function", "  at execution-def.js:3:7", "Status: failed"],
+        )
+
+    def test_error_without_stack_stays_compact(self):
+        from minecraft_harness.program_cli import render_program_text
+        result = {"status": "failed", "error": {"name": "Error", "message": "boom"}}
+        self.assertEqual(render_program_text(result), "Error: boom\nStatus: failed")
+
+    def test_non_dict_error_and_status_line(self):
+        from minecraft_harness.program_cli import render_program_text
+        result = {"status": "timed_out", "error": "timeout", "result": None}
+        self.assertEqual(render_program_text(result), "Error: timeout\nStatus: timed_out")
+
+    def test_location_is_bounded(self):
+        from minecraft_harness.program_cli import render_program_text
+        long_code = "x" * 1000
+        result = {
+            "status": "failed",
+            "error": {
+                "name": "SyntaxError", "message": "bad",
+                "stack": f"execution-abc.js:1\n{long_code}\n{' ' * 10}^\n",
+            },
+        }
+        lines = render_program_text(result).splitlines()
+        self.assertTrue(all(len(line) <= 250 for line in lines))

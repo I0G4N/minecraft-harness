@@ -1224,7 +1224,11 @@ async function execute(message) {
   let error;
   let timedOut = false;
   try {
-    const guardedSource = instrumentLoopDeadlines(message.source);
+    const guardedSource = instrumentLoopDeadlines(message.source, {
+      // The injector fails safe (returns the original source) rather than
+      // rejecting a valid program. Surface the fallback for observability.
+      onFallback: reason => stderrEvidence('LOOP_GUARD_FALLBACK', { reason, execution_id: scope.id }),
+    });
     const fn = vm.runInContext(`(async function(bot, require, console, globalThis, isCancelled, jobs) {\n${guardedSource}\n})`, context,
       { filename: `execution-${scope.id}.js` });
     // Enforce the synchronous portion of the program inside V8's interruptible

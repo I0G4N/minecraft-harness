@@ -88,6 +88,46 @@ async def invoke(args):
         return response.json()
 
 
+_EXECUTION_LOCATION = re.compile(r"^(execution-[A-Za-z0-9-]+\.js):(\d+)$")
+_EXECUTION_FRAME = re.compile(r"(execution-[A-Za-z0-9-]+\.js):(\d+):(\d+)")
+
+
+def _render_error_location(stack):
+    """Return a bounded source location/code-frame for a program error.
+
+    The worker's SyntaxError stack starts with the execution file, the offending
+    source line and a caret, e.g.::
+
+        execution-<id>.js:11
+        for (let dz = -10;__mcWindowCheck(); dz <= 10; dz++) { ...
+                                                         ^
+
+        SyntaxError: Unexpected token ';'
+
+    Rendering the message alone loses the line number, which makes the agent
+    repeat the same bad edit. Keep this compact (at most 4 short lines).
+    """
+    if not isinstance(stack, str) or not stack:
+        return []
+    source_lines = stack.splitlines()
+    match = _EXECUTION_LOCATION.match(source_lines[0]) if source_lines else None
+    if match:
+        location = [f"  at {match.group(1)}:{match.group(2)}"]
+        # The next two lines are the offending source and its caret when the
+        # error is a VM compile error.
+        if len(source_lines) >= 3:
+            code = source_lines[1].rstrip()
+            caret = source_lines[2].rstrip()
+            if code and caret and set(caret.strip()) == {"^"}:
+                location.append("    " + code[:240])
+                location.append("    " + caret[:240])
+        return location
+    frame = _EXECUTION_FRAME.search(stack)
+    if frame:
+        return [f"  at {frame.group(1)}:{frame.group(2)}:{frame.group(3)}"]
+    return []
+
+
 def render_program_text(result):
     """Paper CLI output: the program's logs followed by its returned value."""
     lines = []
@@ -105,6 +145,7 @@ def render_program_text(result):
     error = result.get("error")
     if isinstance(error, dict):
         lines.append("Error: " + str(error.get("message", error)))
+        lines.extend(_render_error_location(error.get("stack")))
     elif error:
         lines.append("Error: " + str(error))
     status = result.get("status")
