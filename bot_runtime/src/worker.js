@@ -11,6 +11,7 @@ import { fileURLToPath } from 'node:url';
 import { isPathfinderRejection } from './pathfinder-rejection.js';
 import { quiesceNativeActions } from './native-action-guard.js';
 import { installPhysicsGuard, clientState as physicsClientState, stateIsFinite as physicsStateIsFinite, nonfiniteFields as physicsNonfiniteFields, rateLimitDecision } from './physics-guard.js';
+import { installAttackGuard, installDeathMovementSuppression } from './client-movement-guard.js';
 
 const nativeRequire = createRequire(import.meta.url);
 const config = JSON.parse(process.env.BOT_WORKER_CONFIG);
@@ -50,6 +51,9 @@ let pendingExecutions = []; // execute messages that arrived during reset/startu
 const softResetTimes = [];
 let softResetCount = 0;
 let physicsGuard = null;
+let attackGuardDispose = null;
+let deathMovementGuard = null;
+let movementSuppressedLogs = 0;
 let intentionalBotQuit = false;
 let preventedLogs = 0;
 let viewer = null;
@@ -526,6 +530,8 @@ function installBot(client) {
   botGeneration += 1;
   bot = client;
   if (physicsGuard) { try { physicsGuard.uninstall(); } catch {} physicsGuard = null; }
+  if (attackGuardDispose) { try { attackGuardDispose(); } catch {} attackGuardDispose = null; }
+  if (deathMovementGuard) { try { deathMovementGuard.uninstall(); } catch {} deathMovementGuard = null; }
   try {
     const stallConfig = Number(config.physicsStallMs);
     physicsGuard = installPhysicsGuard(client, {
@@ -601,6 +607,25 @@ function installBot(client) {
     softReset('bot_disconnected', { reason: 'kicked', detail: String(reason ?? '').slice(0, 500) });
   });
   try { instrumentEmitter(client); } catch {}
+  // Pre-existing Mineflayer/Paper failure modes: suppress outgoing movement
+  // packets while dead (Paper correction-echo loops) and validate attack
+  // targets (invalid_entity_attacked kicks). Both are client-side only.
+  try {
+    deathMovementGuard = installDeathMovementSuppression(client, {
+      onSuppressed: ({ total, name }) => {
+        if (movementSuppressedLogs >= 10 || total % 200 !== 0) return;
+        movementSuppressedLogs += 1;
+        stderrEvidence('DEAD_MOVEMENT_SUPPRESSED', { count: total, packet: name, execution_id: currentScope?.id ?? null });
+      },
+    });
+  } catch (error) {
+    stderrEvidence('DEAD_MOVEMENT_GUARD_FAILED', { error: String(error?.message ?? error).slice(0, 300) });
+  }
+  try {
+    attackGuardDispose = installAttackGuard(client);
+  } catch (error) {
+    stderrEvidence('ATTACK_GUARD_FAILED', { error: String(error?.message ?? error).slice(0, 300) });
+  }
   if (viewer) { try { viewer.attach(client); } catch (error) { stderrEvidence('VIEWER_ATTACH_FAILED', { error: String(error?.message ?? error).slice(0, 300) }); } }
   if (config.chatDelivery === 'program_output') {
     client.on('chat', (username, message) => {
