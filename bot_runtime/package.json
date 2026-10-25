@@ -8,9 +8,11 @@
     "node": ">=22"
   },
   "scripts": {
-    "postinstall": "node scripts/canvas-shim.mjs",
+    "postinstall": "node scripts/canvas-shim.mjs && node scripts/patch-pathfinder.mjs",
+    "patch:pathfinder": "node scripts/patch-pathfinder.mjs",
     "start": "node src/server.js",
     "test": "node --test test/*.test.js tests/*.test.js",
+    "test:pathfinder": "node --test test/pathfinder-patches.test.js",
     "test:protocol": "node --test tests/protocol-integration.test.js",
     "test:soak": "node scripts/soak.js"
   },

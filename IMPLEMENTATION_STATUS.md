@@ -425,3 +425,30 @@
   restarts; no server kick); viewer endpoint can briefly be unreachable while a worker
   is recreated, but the open page auto-reloads.
 - Final report: `mc-runs/p8-4round-stability-report-v2.md`.
+
+## 2026-10-25 P0: pathfinder patches + rejection boundary + nonfinite quiesce
+
+Implemented the three P0 items from `DSH_MC_AGENT_COMPARISON.md`:
+
+- `bot_runtime/scripts/patch-pathfinder.mjs`: idempotent patch for
+  `mineflayer-pathfinder@2.4.5` (collision-aware `canStraightLine`, no diagonal
+  corner cutting); wired into bot image build and package postinstall.
+- `bot_runtime/src/pathfinder-rejection.js` + worker handler: ignore only
+  `PathStopped` / `NoPath` / `GoalChanged` / pathfinder-stack `Timeout`
+  unhandled rejections; other errors remain fatal.
+- `bot_runtime/src/native-action-guard.js` + worker state guard: on first
+  nonfinite state, stop pathfinder, digging and held controls during the 30s
+  recovery window instead of only waiting.
+
+Verification: `mc-runs/p8-diag-07` (20 min, patched worker image).
+
+- 0 kicks, 0 decoder exceptions, 0 SIGABRT, failures [].
+- 25 runtime restarts / 20 min vs baseline `p8-diag-05` 24 / 20 min.
+- `moved_too_quickly` 484 vs baseline 829; `NONFINITE` quiesce observed 20 times.
+- Conclusion: P0 is present and safe, but does **not** reduce worker restarts;
+  it mainly reduces noisy movement warnings. The action coordinator / soft bot
+  reconnect (phase 2) is still required to address the residual nonfinite state.
+- Caveat: the diagnostic image was assembled from the cached worker image with
+  the patched files because Docker Hub metadata access timed out during the full
+  `bot.Dockerfile` build; the production Dockerfile wiring itself is committed
+  but not fully network-built.

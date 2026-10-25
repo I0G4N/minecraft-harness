@@ -8,6 +8,8 @@ import { boundedValue } from './limits.js';
 import { modulePolicy } from './capabilities.js';
 import { Worker } from 'node:worker_threads';
 import { fileURLToPath } from 'node:url';
+import { isPathfinderRejection } from './pathfinder-rejection.js';
+import { quiesceNativeActions } from './native-action-guard.js';
 
 const nativeRequire = createRequire(import.meta.url);
 const config = JSON.parse(process.env.BOT_WORKER_CONFIG);
@@ -300,19 +302,38 @@ function startBotStateGuard() {
   let hadFinite = false;
   let nonfiniteSince = null;
   let observedNonfinite = 0;
+  let quiesced = false;
+  let quiesceResult = null;
   const timer = setInterval(() => {
     const entity = bot && bot.entity;
     const position = entity && entity.position;
     if (!position) return;
     const values = [position.x, position.y, position.z, entity.yaw, entity.pitch];
-    if (values.every(Number.isFinite)) { hadFinite = true; nonfiniteSince = null; return; }
+    if (values.every(Number.isFinite)) {
+      hadFinite = true;
+      nonfiniteSince = null;
+      quiesced = false;
+      quiesceResult = null;
+      return;
+    }
     if (!hadFinite) return;
     // Give the client a bounded window to recover from a transient teleport /
     // chunk update instead of restarting the worker on the first bad tick.
+    // Stop native writes immediately: merely waiting lets a running pathfinder
+    // or dig keep writing the corrupted position/control state, and an async
+    // program cannot be cancelled directly.
     if (nonfiniteSince === null) {
       nonfiniteSince = Date.now();
       observedNonfinite++;
-      process.stderr.write('NONFINITE_BOT_STATE_OBSERVED ' + JSON.stringify({ agent: config.username, execution: currentScope?.id ?? null, at: new Date(nonfiniteSince).toISOString(), count: observedNonfinite }) + '\n');
+      quiesceResult = quiesceNativeActions(bot);
+      quiesced = true;
+      process.stderr.write('NONFINITE_BOT_STATE_OBSERVED ' + JSON.stringify({
+        agent: config.username,
+        execution: currentScope?.id ?? null,
+        at: new Date(nonfiniteSince).toISOString(),
+        count: observedNonfinite,
+        quiesce: quiesceResult,
+      }) + '\n');
     }
     if (Date.now() - nonfiniteSince < 30000) return;
     let detail;
@@ -346,6 +367,8 @@ function startBotStateGuard() {
         client_ended: bot._client?.ended ?? null,
         recent_api: recentApi.slice(-15),
         recent_logs: recentLogs.slice(-8),
+        quiesced,
+        quiesce: quiesceResult,
         uptime_s: Math.round(process.uptime()),
         rss_bytes: process.memoryUsage().rss,
       };
@@ -559,7 +582,24 @@ process.on('message', (message) => {
 });
 process.on('disconnect', () => process.exit(0));
 process.on('uncaughtException', error => { send({ type: 'fatal', error: String(error.stack ?? error).slice(0, 32768) }); process.exit(1); });
-process.on('unhandledRejection', error => { send({ type: 'fatal', error: String(error?.stack ?? error).slice(0, 32768) }); process.exit(1); });
+let ignoredPathfinderRejections = 0;
+process.on('unhandledRejection', error => {
+  // Pathfinder's normal route outcomes can reject derived/background promises
+  // after their caller has moved on. That is not a worker-fatal condition.
+  if (isPathfinderRejection(error)) {
+    ignoredPathfinderRejections++;
+    if (ignoredPathfinderRejections <= 20) {
+      process.stderr.write('PATHFINDER_REJECTION_IGNORED ' + JSON.stringify({
+        name: String(error?.name ?? error?.constructor?.name ?? ''),
+        message: String(error?.message ?? error).slice(0, 240),
+        count: ignoredPathfinderRejections,
+      }) + '\n');
+    }
+    return;
+  }
+  send({ type: 'fatal', error: String(error?.stack ?? error).slice(0, 32768) });
+  process.exit(1);
+});
 
 if (config.mode === 'fake') {
   bot = makeFakeBot();
