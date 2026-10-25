@@ -562,3 +562,20 @@ Two P1 validation residuals were investigated and fixed/characterised:
   20 min) results are in `P1_SOFT_RESET_REPORT_2026-10-25.md` §9.
 - Analyses: `mc-logs/.p1-analysis/moved-too-quickly-forensics.md`,
   `mc-logs/.p1-analysis/loop-guard-fix-analysis.md`.
+
+### Follow-up validation results (2026-10-25 evening)
+
+- Loop-guard fix (`p8-p1-dig-04`, 20 min): 518 programs, 37 failed (7.1%),
+  0 instrumentation-caused SyntaxErrors, 2 fallbacks (already-invalid originals),
+  0 hard restarts, 0 kicks, 0 SIGABRT. Corpus classification: old transform
+  broke 93-215 valid programs per run, new transform breaks 0.
+- Client guards (`p8-p1-dig-05`, 20.1 min, 8 agents): **0 `moved too quickly`
+  warnings across 7 deaths** (without guard: 512 warnings/26 deaths in dig-04;
+  P0: 25.3-37.0 warnings/death), 0 kicks, 0 hard restarts, 1 clean
+  `bot_disconnected` soft reset, 39/530 failures (7.4%).
+- `p8-p1-dig-06` (6.1 min): 0 deaths/warnings/kicks/restarts, sanity only.
+- Deterministic protocol fixture test proves the mechanisms: alive position
+  corrections echo a client movement packet; dead corrections produce 0
+  movement packets while teleport_confirm still works; invalid/self attacks are
+  rejected locally with 0 use_entity packets (no `invalid_entity_attacked`).
+- Bot runtime suite now **106/106**; full image suite expected same.
