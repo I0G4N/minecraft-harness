@@ -250,3 +250,36 @@ before `soft_reset`; `soft_ready` is sent only after the new client spawned.
 - No attempt to make the agent "never interrupted": one in-flight program can
   still fail with `SoftResetError`; the point is that the session, globals and
   the bot client recover in ~1-3 s instead of losing everything.
+
+## P1.1 hardening (2026-10-25, after the first real diagnostic and independent verification)
+
+The first 20-minute 8-agent diagnostic (`p8-p1-diag-01`) exposed a reset path the
+unit/E2E fixtures did not cover, and the independent verifier found five more
+defects. The implementation now additionally guarantees:
+
+- **Soft reset never inherits a closed program ALS store.** `performSoftReset`
+  is invoked through `scopes.run(undefined, ...)`; all replacement-client
+  creation, listener registration and teardown therefore run with no ambient
+  scope. Closed program scopes stay fenced for leftover callbacks (no global
+  fence-bypass flag).
+- **A replacement client that fails after creation is destroyed**
+  (`createBotClient` catch: quit + socket destroy). The identity proxy admits
+  one active connection per username, so a leaked login would otherwise make
+  every retry fail with `socketClosed`.
+- **Bounded retry budget inside the session gate.** Initial startup keeps the
+  25 s spawn timeout; replacement clients use 10 s, 3 attempts, 2 s backoff,
+  0.5 s login grace and a ≤3 s quit wait (worst case ≈ 37.5 s). The session
+  `softResetTimeoutMs` default is 60 000 ms (env override, valid 5 000–120 000).
+- **Completion-first gate.** The worker still sends `completed`
+  (`reset_reason: soft_reset`) before `soft_reset`. The server opens the
+  dispatch gate synchronously from that completion so drain cannot dispatch the
+  next program in the IPC gap; exactly one `runtime_soft_reset` event is
+  recorded.
+- **Generation in the initial `ready` message.** The server adopts it, so the
+  stale-generation guards have a defined baseline after a hard restart.
+- **Physics guard escalation without a last-good state.** A physicsTick whose
+  applied client state is still nonfinite counts as a bad tick (the counters
+  are only cleared by a finite tick), so first-tick corruption escalates
+  instead of waiting for the 15 s stall watchdog.
+- `soft_reset` and `soft_ready` generation semantics are unchanged: soft_reset
+  advertises the expected new generation, soft_ready the actual installed one.
