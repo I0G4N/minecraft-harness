@@ -10,13 +10,9 @@ from collections import Counter
 from pathlib import Path
 
 
-def main() -> int:
-    p = argparse.ArgumentParser()
-    p.add_argument("run_dir", type=Path)
-    p.add_argument("--server-log", type=Path)
-    p.add_argument("--output", type=Path)
-    a = p.parse_args()
-    run = a.run_dir.resolve()
+def analyze_run(run_dir, server_log=None):
+    """Analyze one run directory and return the stability report as a dict."""
+    run = Path(run_dir).resolve()
     db = run / "events.sqlite3"
     if not db.is_file():
         raise SystemExit(f"no ledger: {db}")
@@ -25,12 +21,14 @@ def main() -> int:
     kinds = Counter()
     signals = Counter()
     reset_reasons = Counter()
+    soft_reset_reasons = Counter()
+    runtime_ready_agents = set()
     stderr_tails = []
     actor_events = Counter()
     execution_status = Counter()
     latencies = []
     session_samples = []
-    for row in con.execute("SELECT kind, payload_json FROM events"):
+    for row in con.execute("SELECT kind, actor_id, payload_json FROM events"):
         kinds[row["kind"]] += 1
         try:
             raw = json.loads(row["payload_json"])
@@ -40,6 +38,11 @@ def main() -> int:
         actor = raw.get("actor_id") or body.get("agent_id") or body.get("actor_id")
         if actor:
             actor_events[str(actor)] += 1
+        if row["kind"] == "runtime_ready":
+            # Hard restarts are counted per agent: every ready after the first
+            # one for that agent replaced a previously ready client.
+            if row["actor_id"]:
+                runtime_ready_agents.add(str(row["actor_id"]))
         if row["kind"] == "execution_finished":
             status = body.get("status")
             if status:
@@ -59,6 +62,11 @@ def main() -> int:
         elif row["kind"] == "runtime_reset":
             reason = body.get("reason")
             reset_reasons[str(reason)] += 1
+        elif row["kind"] == "runtime_soft_reset":
+            # P1 soft reset: same worker/VM globals, only the Mineflayer client
+            # was recreated.  Keep it out of the hard-reset reasons/counters.
+            reason = body.get("reason")
+            soft_reset_reasons[str(reason)] += 1
     def state(key):
         row = con.execute("SELECT value_json FROM state WHERE key=?", (key,)).fetchone()
         return json.loads(row[0]) if row else None
@@ -79,8 +87,9 @@ def main() -> int:
         except ValueError:
             pass
     server = {"available": False}
-    if a.server_log and a.server_log.is_file():
-        text = a.server_log.read_text(errors="replace")
+    server_log = Path(server_log) if server_log is not None else None
+    if server_log and server_log.is_file():
+        text = server_log.read_text(errors="replace")
         import re
         behind = [int(m) for m in re.findall(r"Running (\d+)ms behind", text)]
         server = {"available": True,
@@ -93,6 +102,13 @@ def main() -> int:
                   "joined_game": text.count("joined the game"),
                   "left_game": text.count("left the game"),
                   "bytes": len(text)}
+    hard_restarts = max(0, kinds["runtime_ready"] - len(runtime_ready_agents))
+    soft_reset_counts = {
+        "runtime_soft_reset": kinds["runtime_soft_reset"],
+        "runtime_soft_reset_ready": kinds["runtime_soft_reset_ready"],
+        "runtime_soft_reset_failed": kinds["runtime_soft_reset_failed"],
+        "runtime_soft_reset_timeout": kinds["runtime_soft_reset_timeout"],
+    }
     result = {
         "run_dir": str(run),
         "status": state("status"),
@@ -101,6 +117,11 @@ def main() -> int:
         "events_by_kind": dict(sorted(kinds.items())),
         "runtime_exit_signals": dict(sorted(signals.items())),
         "runtime_reset_reasons": dict(sorted(reset_reasons.items())),
+        "hard_restarts": hard_restarts,
+        "runtime_ready_agents": sorted(runtime_ready_agents),
+        "soft_reset_count": kinds["runtime_soft_reset"],
+        "soft_reset_reasons": dict(sorted(soft_reset_reasons.items())),
+        "soft_reset_counts": soft_reset_counts,
         "runtime_exit_stderr_tails": stderr_tails[:20],
         "budget": budget.get("budget"),
         "model_latency_ms": {
@@ -138,6 +159,13 @@ def main() -> int:
             "model_request": kinds["model_request"],
             "model_response": kinds["model_response"],
             "runtime_ready": kinds["runtime_ready"],
+            "runtime_ready_agents": len(runtime_ready_agents),
+            "hard_restarts": hard_restarts,
+            "runtime_soft_reset": kinds["runtime_soft_reset"],
+            "runtime_soft_reset_ready": kinds["runtime_soft_reset_ready"],
+            "runtime_soft_reset_failed": kinds["runtime_soft_reset_failed"],
+            "runtime_soft_reset_timeout": kinds["runtime_soft_reset_timeout"],
+            "soft_reset_reasons": dict(sorted(soft_reset_reasons.items())),
             "execution_succeeded": kinds["execution_succeeded"],
             "execution_failed": kinds["execution_failed"],
             "cleanup_failed": kinds["cleanup_failed"],
@@ -150,6 +178,18 @@ def main() -> int:
             "model_failed": kinds["model_failed"],
         },
     }
+    con.close()
+    return result
+
+
+def main() -> int:
+    p = argparse.ArgumentParser()
+    p.add_argument("run_dir", type=Path)
+    p.add_argument("--server-log", type=Path)
+    p.add_argument("--output", type=Path)
+    a = p.parse_args()
+    result = analyze_run(a.run_dir, a.server_log)
+    run = Path(result["run_dir"])
     out = a.output or (run / "reports" / "stability-analysis.json")
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(json.dumps(result, ensure_ascii=False, indent=2) + "\n")

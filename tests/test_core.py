@@ -1,5 +1,7 @@
 import asyncio
 import hashlib
+import importlib.util
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -152,6 +154,92 @@ class CoreTests(unittest.IsolatedAsyncioTestCase):
                                                    "world_epoch": 1}, actor_id="alice", world_epoch=1)
         recovered = reopened.player_events("alice", after=last_cursor)
         self.assertEqual([item["cursor"] for item in recovered], [newest["event_seq"]])
+
+
+    def test_soft_reset_transport_events_stay_distinct_from_hard_runtime_reset(self):
+        recorder = self.recorder()
+        run_id = recorder.run_id
+        session = "session-soft-reset"
+        batch = [
+            {"cursor": 1, "session_id": session, "run_id": run_id,
+             "kind": "runtime_ready", "world_epoch": 0, "runtime_epoch": 0,
+             "payload": {"globals_lost": False, "generation": 0}},
+            {"cursor": 2, "session_id": session, "run_id": run_id,
+             "kind": "runtime_soft_reset", "world_epoch": 0, "runtime_epoch": 0,
+             "payload": {"reason": "nonfinite_bot_state", "execution_id": None,
+                         "generation": 1, "detail": {"bad_fields": ["pos.x"]},
+                         "globals_lost": False}},
+            {"cursor": 3, "session_id": session, "run_id": run_id,
+             "kind": "runtime_soft_reset_ready", "world_epoch": 0,
+             "runtime_epoch": 0,
+             "payload": {"generation": 1, "duration_ms": 1200, "soft_resets": 1,
+                         "snapshot": {"mode": "minecraft", "globals_preserved": True},
+                         "globals_lost": False}},
+            {"cursor": 4, "session_id": session, "run_id": run_id,
+             "kind": "runtime_soft_reset_failed", "world_epoch": 0,
+             "runtime_epoch": 0,
+             "payload": {"reason": "nonfinite_bot_state", "error": "login failed",
+                         "globals_lost": False}},
+            {"cursor": 5, "session_id": session, "run_id": run_id,
+             "kind": "runtime_soft_reset_timeout", "world_epoch": 0,
+             "runtime_epoch": 0,
+             "payload": {"reason": "soft_reset_timeout", "globals_lost": False}},
+            # A later hard-ready event for the same agent affects the hard-restart
+            # count only; soft resets are reported separately.
+            {"cursor": 6, "session_id": session, "run_id": run_id,
+             "kind": "runtime_ready", "world_epoch": 0, "runtime_epoch": 0,
+             "payload": {"globals_lost": False, "generation": 2}},
+        ]
+        recorder.ingest_transport("player1", session, batch)
+        recorder.ingest_transport("player2", session, [
+            {"cursor": 1, "session_id": session, "run_id": run_id,
+             "kind": "runtime_ready", "world_epoch": 0, "runtime_epoch": 0,
+             "payload": {"globals_lost": False, "generation": 0}},
+        ])
+        raw_kinds = [event["kind"] for event in recorder.read_events()]
+        self.assertEqual(raw_kinds.count("runtime_soft_reset"), 1)
+        self.assertEqual(raw_kinds.count("runtime_soft_reset_ready"), 1)
+        self.assertEqual(raw_kinds.count("runtime_soft_reset_failed"), 1)
+        self.assertEqual(raw_kinds.count("runtime_soft_reset_timeout"), 1)
+        self.assertNotIn("runtime_reset", raw_kinds)
+
+        player_kinds = [item["kind"] for item in recorder.player_events("player1")]
+        self.assertEqual(player_kinds.count("runtime_soft_reset"), 1)
+        self.assertEqual(player_kinds.count("runtime_soft_reset_ready"), 1)
+        self.assertNotIn("runtime_reset", player_kinds)
+        # Soft-reset player events preserve their own kind/payload rather than
+        # becoming a globals_lost hard reset row.
+        soft_rows = [item for item in recorder.player_events("player1")
+                     if item["kind"] == "runtime_soft_reset"]
+        self.assertFalse(soft_rows[0]["payload"]["globals_lost"])
+        recorder.close()
+
+        script = Path(__file__).resolve().parents[1] / "scripts" / "analyze_stability.py"
+        spec = importlib.util.spec_from_file_location("analyze_stability_soft_reset", script)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        analysis = module.analyze_run(self.root)
+        flags = analysis["flags"]
+        self.assertEqual(flags["runtime_soft_reset"], 1)
+        self.assertEqual(flags["runtime_soft_reset_ready"], 1)
+        self.assertEqual(flags["runtime_soft_reset_failed"], 1)
+        self.assertEqual(flags["runtime_soft_reset_timeout"], 1)
+        self.assertEqual(flags["runtime_ready"], 3)  # existing flag stays raw count
+        self.assertEqual(flags["runtime_ready_agents"], 2)
+        self.assertEqual(flags["hard_restarts"], 1)  # 3 ready - 2 initial startups
+        self.assertEqual(analysis["hard_restarts"], 1)
+        self.assertEqual(analysis["soft_reset_reasons"],
+                         {"nonfinite_bot_state": 1})
+        self.assertEqual(analysis["soft_reset_counts"]["runtime_soft_reset_ready"], 1)
+        self.assertEqual(analysis["runtime_reset_reasons"], {})  # soft never mixed in
+
+        from minecraft_harness.figures import build_figures
+        figures = build_figures(self.root)
+        runtime_kinds = [item["kind"] for item in figures["runtime_resets"]]
+        self.assertIn("runtime_soft_reset", runtime_kinds)
+        self.assertNotIn("runtime_soft_reset", [item["kind"] for item in figures["restarts"]])
+        self.assertEqual(figures["soft_reset_count"], 1)
+        self.assertEqual(figures["soft_resets"], 1)
 
     def test_artifacts_are_content_addressed_and_existing_corruption_is_rejected(self):
         recorder = self.recorder()

@@ -19,6 +19,28 @@ async function docker(args, timeoutMs = 15000) {
 }
 const equalToken = (a, b) => typeof a === 'string' && Buffer.byteLength(a) === Buffer.byteLength(b) && timingSafeEqual(Buffer.from(a), Buffer.from(b));
 
+// Fields the launcher is allowed to forward from the supervisor-supplied
+// worker_config. Everything else is dropped; the game identity/network target
+// always comes from this launcher's fixed configuration.
+export const SAFE_WORKER_FIELDS = Object.freeze(['mode', 'username', 'version', 'lifecycle', 'maxBackgroundJobs', 'remainingRunMs', 'runDeadlineAt', 'maxLogs', 'maxLogBytes', 'maxResultBytes', 'leftoverPolicy', 'chatDelivery', 'maxLeftoverScopes', 'paperSingleProgram']);
+export const PHYSICS_STALL_MS_MIN = 3000;
+export const PHYSICS_STALL_MS_MAX = 60000;
+export const PHYSICS_STALL_MS_DEFAULT = 15000;
+
+// Pure allowlist copy + validation (no docker/process access) so the worker
+// receives a bounded physics-stall watchdog interval and cannot smuggle
+// arbitrary launcher fields through worker_config.
+export function copySafeWorkerConfig(worker, fixed = {}) {
+  if (!worker || typeof worker !== 'object' || Array.isArray(worker)) throw new Error('Worker configuration must be an object');
+  const physicsStallMs = worker.physicsStallMs === undefined ? PHYSICS_STALL_MS_DEFAULT : worker.physicsStallMs;
+  if (!Number.isSafeInteger(physicsStallMs) || physicsStallMs < PHYSICS_STALL_MS_MIN || physicsStallMs > PHYSICS_STALL_MS_MAX) throw new Error(`physicsStallMs must be a safe integer between ${PHYSICS_STALL_MS_MIN} and ${PHYSICS_STALL_MS_MAX}`);
+  const safeWorker = Object.fromEntries(SAFE_WORKER_FIELDS.map(key => [key, worker[key]]));
+  safeWorker.physicsStallMs = physicsStallMs;
+  if (fixed.host !== undefined) safeWorker.host = fixed.host;
+  if (fixed.port !== undefined) safeWorker.port = fixed.port;
+  return safeWorker;
+}
+
 export async function startWorkerHost(options = {}) {
   const config = {
     agentId: options.agentId ?? process.env.WORKER_AGENT_ID,
@@ -115,8 +137,7 @@ export async function startWorkerHost(options = {}) {
         if (worker.mode === 'minecraft' && (config.network === 'none' || !config.mcHost || !config.identityProxy)) throw new Error('Minecraft worker requires fixed identity-proxy network and target');
         const watchdog = Math.min(config.maxWatchdogMs, Math.max(100, Number(message.watchdog_ms) || config.maxWatchdogMs));
         // Copy only declared fields. No incoming environment / container flags.
-        const safeWorker = Object.fromEntries(['mode', 'username', 'version', 'lifecycle', 'maxBackgroundJobs', 'remainingRunMs', 'runDeadlineAt', 'maxLogs', 'maxLogBytes', 'maxResultBytes', 'leftoverPolicy', 'chatDelivery', 'maxLeftoverScopes', 'paperSingleProgram'].map(key => [key, worker[key]]));
-        safeWorker.host = config.mcHost; safeWorker.port = config.mcPort;
+        const safeWorker = copySafeWorkerConfig(worker, { host: config.mcHost, port: config.mcPort });
         const name = `mc-worker-${config.id}-${randomUUID().slice(0, 8)}`;
         // gVisor (`runsc`) is an optional OCI sandbox runtime here. It adds a
         // user-space kernel/syscall boundary around the already read-only,

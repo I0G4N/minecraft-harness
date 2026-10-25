@@ -316,6 +316,12 @@ class Recorder:
                         self._insert('player_event',{**event,'kind':'chat'},actor_id=agent_id,world_epoch=event.get('world_epoch',0))
                     elif kind=='runtime_reset' or (kind=='runtime_ready' and isinstance(payload,dict) and payload.get('globals_lost')):
                         self._insert('player_event',{**event,'kind':'runtime_reset'},actor_id=agent_id,world_epoch=event.get('world_epoch',0))
+                    elif kind in ('runtime_soft_reset','runtime_soft_reset_ready'):
+                        # P1 soft reset: the Mineflayer client was recreated inside the
+                        # same worker and VM globals survived. Preserve the wire kind so
+                        # analysis can distinguish it from a hard runtime_reset and never
+                        # synthesize a globals_lost row.
+                        self._insert('player_event',{**event,'kind':kind},actor_id=agent_id,world_epoch=event.get('world_epoch',0))
                 committed=cursor
             self.db.execute('INSERT INTO transport_cursors VALUES (?,?,?) ON CONFLICT(agent_id,session_id) DO UPDATE SET cursor=excluded.cursor',(agent_id,session_id,committed))
             return committed

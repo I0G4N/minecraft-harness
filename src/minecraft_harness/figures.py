@@ -577,7 +577,7 @@ def build_figures(run_dir, *, max_series=MAX_SERIES):
         # run cannot visually masquerade as 16 paper-style server restarts.
         restarts = []
         runtime_resets = []
-        for row in connection.execute("SELECT event_seq, kind, actor_id, received_at, payload_json FROM events WHERE kind IN ('server_stopped','server_started','world_restored','runtime_recovery_started','runtime_reset') ORDER BY event_seq"):
+        for row in connection.execute("SELECT event_seq, kind, actor_id, received_at, payload_json FROM events WHERE kind IN ('server_stopped','server_started','world_restored','runtime_recovery_started','runtime_reset','runtime_soft_reset') ORDER BY event_seq"):
             payload = _json(row["payload_json"]) or {}
             when = _ts(row["received_at"])
             if when is None:
@@ -587,7 +587,11 @@ def build_figures(run_dir, *, max_series=MAX_SERIES):
             if row["kind"] in {'server_stopped', 'server_started', 'world_restored'}:
                 restarts.append(item)
             else:
+                # P1 soft resets keep their own wire kind here. They recreate the
+                # Mineflayer client in the same worker (globals preserved), so
+                # they must never be classified as paper-style server restarts.
                 runtime_resets.append(item)
+        soft_reset_count = sum(1 for item in runtime_resets if item["kind"] == "runtime_soft_reset")
         evaluation = state.get("evaluation") if isinstance(state.get("evaluation"), dict) else {}
         payload = {
             "schema_version": SCHEMA_VERSION,
@@ -603,6 +607,8 @@ def build_figures(run_dir, *, max_series=MAX_SERIES):
             "chats": chats, "deaths": deaths, "advancements": advancements,
             "stages": stages, "dimension_bands": dimension_bands,
             "restarts": restarts, "runtime_resets": runtime_resets,
+            "soft_reset_count": soft_reset_count,
+            "soft_resets": soft_reset_count,
             "behavior": _behavior_counts(chats), "death_causes": _deaths_payload(deaths),
             "dragon": dragon, "in_game_days": _in_game_days(connection, run_dir),
             "world": _world_payload(manifest, run_dir),

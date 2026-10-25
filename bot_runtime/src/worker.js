@@ -10,6 +10,7 @@ import { Worker } from 'node:worker_threads';
 import { fileURLToPath } from 'node:url';
 import { isPathfinderRejection } from './pathfinder-rejection.js';
 import { quiesceNativeActions } from './native-action-guard.js';
+import { installPhysicsGuard, clientState as physicsClientState, stateIsFinite as physicsStateIsFinite, nonfiniteFields as physicsNonfiniteFields, rateLimitDecision } from './physics-guard.js';
 
 const nativeRequire = createRequire(import.meta.url);
 const config = JSON.parse(process.env.BOT_WORKER_CONFIG);
@@ -37,8 +38,29 @@ const send = (message) => {
   pendingSends++;
   process.send(message, error => { pendingSends--; if (error) process.exit(73); });
 };
-let bot;
-let agentBot;
+let bot = null;
+// ONE stable agent-facing proxy for every execution; it resolves the *current*
+// Mineflayer client through a getter so a program that outlives a soft reset can
+// never keep acting on (or reviving) the discarded client.
+let agentBot = makeAgentFacingBot(() => bot);
+let botGeneration = 0;
+let botReady = false;
+let resetState = null; // { promise, reason } while a soft reset is in flight
+let pendingExecutions = []; // execute messages that arrived during reset/startup
+const softResetTimes = [];
+let softResetCount = 0;
+let physicsGuard = null;
+let intentionalBotQuit = false;
+let preventedLogs = 0;
+let viewer = null;
+let viewerSetupDone = false;
+let fatalExitScheduled = false;
+const PENDING_EXECUTION_LIMIT = 2;
+const SOFT_RESET_RATE_LIMIT = 6;
+const SOFT_RESET_RATE_WINDOW_MS = 600000;
+const SOFT_RESET_RETRY_BACKOFF_MS = 1500;
+const SOFT_RESET_ATTEMPTS = 3;
+const SPAWN_TIMEOUT_MS = 25000;
 const recentApi = [];
 const recentLogs = [];
 function recordApi(name, args) {
@@ -108,8 +130,11 @@ function finishJob(scope, status = 'succeeded', error = null) {
   clearInterval(scope.monitor);
   scope.status = status;
   send({ type: 'job_finished', job_id: scope.jobId, execution_id: scope.id, status, error, cleanup: summary, result: serialize(scope.result) });
-  // Native actions cannot be proved stopped without terminating this process.
-  if (summary.unfinished_actions) { send({ type: 'fatal', error: 'Background task ended with unfinished native actions' }); process.exit(74); }
+  // Native actions cannot be proved stopped without recreating the client.
+  // Escalate to the in-process soft reset instead of a hard worker exit.
+  if (summary.unfinished_actions && !resetState) {
+    softReset('unfinished_actions', { job_id: scope.jobId, unfinished_actions: summary.unfinished_actions });
+  }
 }
 function checkJob(scope) {
   if (scope.closed || !scope.functionDone) return;
@@ -245,136 +270,818 @@ function finitePoint(point) {
   return point && Number.isFinite(point.x) && Number.isFinite(point.y) && Number.isFinite(point.z);
 }
 
-function makeAgentFacingBot(real) {
+function makeAgentFacingBot(getReal) {
   // `bot._client` exposes the raw protocol object.  Model-generated programs
   // have used it to monkey-patch sock.write/splitter.push and to change the
   // compression threshold, which corrupts the Minecraft stream for the whole
   // server (DecoderException/kicks).  Keep the real bot for the worker and hand
   // the program a proxied view without raw protocol internals.
-  let pathfinderProxy;
+  //
+  // The target is resolved through `getReal()` on every access so the proxy is
+  // stable across in-process soft resets: an execution gets the same `bot`
+  // object while the underlying Mineflayer client is replaced underneath.
+  let pathfinderTarget = null;
+  let pathfinderProxy = null;
   const hidden = new Set(['_client', 'client', 'creative', '_events', '_socket', 'physics']);
   const readonly = new Set(['physicsEnabled']);
+  const current = () => {
+    try { return typeof getReal === 'function' ? getReal() : getReal; } catch { return null; }
+  };
   const bound = (target, value) => typeof value === 'function' ? value.bind(target) : value;
-  const proxy = new Proxy(real, {
-    get(target, prop) {
+  const proxy = new Proxy({}, {
+    get(_target, prop) {
+      const real = current();
+      if (!real) return undefined;
       if (hidden.has(prop)) return undefined;
-      if (prop === 'entity') return entitySnapshot(target.entity);
-      if (prop === 'entities') return snapshotEntities(target.entities);
-      if (prop === 'players') return snapshotPlayers(target.players);
+      if (prop === 'entity') return entitySnapshot(real.entity);
+      if (prop === 'entities') return snapshotEntities(real.entities);
+      if (prop === 'players') return snapshotPlayers(real.players);
       if (prop === 'look') return (yaw, pitch, force) => {
         if (!Number.isFinite(yaw) || !Number.isFinite(pitch)) throw new TypeError('look requires finite yaw/pitch');
-        return target.look(yaw, pitch, force);
+        return real.look(yaw, pitch, force);
       };
       if (prop === 'lookAt') return (point, force) => {
         if (!finitePoint(point)) throw new TypeError('lookAt requires a finite point');
-        return target.lookAt(point, force);
+        return real.lookAt(point, force);
       };
-      if (prop === 'pathfinder' && target.pathfinder) {
-        if (!pathfinderProxy) pathfinderProxy = new Proxy(target.pathfinder, {
-          get(pt, p) {
-            if (p === 'bot') return proxy;
-            if (p === 'setGoal' || p === 'goto') return (...args) => {
-              const goal = args[0];
-              if (goal && ('x' in goal || 'y' in goal || 'z' in goal) && !finitePoint(goal)) throw new TypeError('pathfinder goal requires finite coordinates');
-              return pt[p](...args);
-            };
-            return bound(pt, Reflect.get(pt, p, pt));
-          },
-          set(pt, p, value) { if (p === 'bot') return false; pt[p] = value; return true; },
-        });
+      if (prop === 'pathfinder' && real.pathfinder) {
+        if (pathfinderTarget !== real.pathfinder) {
+          pathfinderTarget = real.pathfinder;
+          pathfinderProxy = new Proxy(real.pathfinder, {
+            get(pt, p) {
+              if (p === 'bot') return proxy;
+              if (p === 'setGoal' || p === 'goto') return (...args) => {
+                const goal = args[0];
+                if (goal && ('x' in goal || 'y' in goal || 'z' in goal) && !finitePoint(goal)) throw new TypeError('pathfinder goal requires finite coordinates');
+                return pt[p](...args);
+              };
+              return bound(pt, Reflect.get(pt, p, pt));
+            },
+            set(pt, p, value) { if (p === 'bot') return false; pt[p] = value; return true; },
+          });
+        }
         return pathfinderProxy;
       }
-      return bound(target, Reflect.get(target, prop, target));
+      return bound(real, Reflect.get(real, prop, real));
     },
-    set(target, prop, value) { if (hidden.has(prop) || readonly.has(prop) || prop === 'entity') return false; target[prop] = value; return true; },
-    has(target, prop) { return hidden.has(prop) ? false : Reflect.has(target, prop); },
+    set(_target, prop, value) {
+      const real = current();
+      if (!real) return true;
+      if (hidden.has(prop) || readonly.has(prop) || prop === 'entity') return false;
+      real[prop] = value;
+      return true;
+    },
+    has(_target, prop) {
+      const real = current();
+      if (!real) return false;
+      return hidden.has(prop) ? false : Reflect.has(real, prop);
+    },
+    // Keep the agent-visible object shape identical to the previous
+    // Proxy(real, ...) implementation even though the target is now a stable
+    // placeholder (the real client is resolved per access through the getter).
+    ownKeys(_target) {
+      const real = current();
+      if (!real) return [];
+      try { return Reflect.ownKeys(real); } catch { return []; }
+    },
+    getOwnPropertyDescriptor(_target, prop) {
+      const real = current();
+      if (!real) return undefined;
+      try {
+        const descriptor = Reflect.getOwnPropertyDescriptor(real, prop);
+        if (!descriptor) return undefined;
+        return { ...descriptor, configurable: true };
+      } catch { return undefined; }
+    },
+    getPrototypeOf(_target) {
+      const real = current();
+      try { return real ? Object.getPrototypeOf(real) : Object.prototype; } catch { return Object.prototype; }
+    },
+    deleteProperty(_target, prop) {
+      const real = current();
+      if (!real) return true;
+      try { return Reflect.deleteProperty(real, prop); } catch { return false; }
+    },
+    defineProperty(_target, prop, descriptor) {
+      const real = current();
+      if (!real) return false;
+      try { return Reflect.defineProperty(real, prop, descriptor); } catch { return false; }
+    },
   });
   return proxy;
 }
 
-function startBotStateGuard() {
-  // Mineflayer physics can occasionally produce a permanent NaN/null position
-  // when chunk state is lost.  The resulting client packets either get dropped
-  // by the identity proxy or trip the server's invalid_player_movement check.
-  // Once the bot has had a finite state, recover the worker cleanly instead of
-  // letting it hammer the server with malformed movement.
-  if (config.mode !== 'minecraft') return;
-  let hadFinite = false;
-  let nonfiniteSince = null;
-  let observedNonfinite = 0;
-  let quiesced = false;
-  let quiesceResult = null;
-  const timer = setInterval(() => {
-    const entity = bot && bot.entity;
-    const position = entity && entity.position;
+function restoreEntityPhysicsState(entity, state) {
+  if (!entity || !state) return false;
+  try {
+    const position = entity.position;
+    if (position && typeof position.set === 'function') position.set(state.pos.x, state.pos.y, state.pos.z);
+    else if (position) { position.x = state.pos.x; position.y = state.pos.y; position.z = state.pos.z; }
+    const velocity = entity.velocity;
+    if (velocity && typeof velocity.set === 'function') velocity.set(0, 0, 0);
+    else if (velocity) { velocity.x = 0; velocity.y = 0; velocity.z = 0; }
+    entity.yaw = state.yaw;
+    entity.pitch = state.pitch;
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function safeSnapshot() {
+  try { return snapshot(); } catch { return null; }
+}
+
+function boundedDetail(detail) {
+  try { return detail === null || detail === undefined ? null : serialize(detail); } catch { return null; }
+}
+
+function stderrEvidence(kind, payload) {
+  // Bounded single-line JSON-ish forensics; never throws and never blocks.
+  try {
+    const text = kind + ' ' + JSON.stringify(payload ?? null);
+    process.stderr.write(String(text).slice(0, 1800) + '\n');
+  } catch { /* evidence is best effort */ }
+}
+
+function sleep(ms) {
+  return new Promise(resolve => { setTimeout(resolve, Math.max(0, Number(ms) || 0)); });
+}
+
+function fatalExit(message, extra = {}) {
+  fatalExitScheduled = true;
+  try { stderrEvidence('WORKER_FATAL', { error: String(message ?? 'worker fatal').slice(0, 2000), ...extra }); } catch {}
+  try { send({ type: 'fatal', error: String(message ?? 'worker fatal').slice(0, 32768), ...extra }); } catch {}
+  // Give process.send a tick to flush before the hard restart.
+  setTimeout(() => process.exit(1), 100);
+}
+
+function softSnapshot() {
+  try {
+    return serialize({
+      mode: config.mode,
+      username: bot?.username ?? config.username ?? null,
+      position: bot?.entity?.position ?? null,
+      health: bot?.health ?? null,
+      food: bot?.food ?? null,
+      globals_preserved: true,
+    });
+  } catch {
+    return { mode: config.mode, globals_preserved: true };
+  }
+}
+
+function waitForBotEnd(client, timeoutMs) {
+  return new Promise(resolve => {
+    let settled = false;
+    const done = () => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      try { client?.removeListener?.('end', done); } catch {}
+      try { client?._client?.socket?.removeListener?.('close', done); } catch {}
+      resolve();
+    };
+    const timer = setTimeout(done, Math.max(0, Number(timeoutMs) || 0));
+    timer.unref?.();
+    try { client?.once?.('end', done); } catch {}
+    try {
+      if (client?._client?.ended) { done(); return; }
+      client?._client?.socket?.once?.('close', done);
+    } catch { /* socket may be gone already */ }
+  });
+}
+
+let mineflayerModules = null;
+function loadMineflayer() {
+  if (!mineflayerModules) {
+    mineflayerModules = {
+      mineflayer: nativeRequire('mineflayer'),
+      pathfinder: nativeRequire('mineflayer-pathfinder').pathfinder,
+    };
+  }
+  return mineflayerModules;
+}
+
+function waitForSpawn(client) {
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const cleanup = () => {
+      clearTimeout(timer);
+      try {
+        client.removeListener('spawn', onSpawn);
+        client.removeListener('error', onError);
+        client.removeListener('kicked', onKicked);
+        client.removeListener('end', onEnd);
+      } catch {}
+    };
+    const finish = (callback, value) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      callback(value);
+    };
+    const onSpawn = () => finish(resolve);
+    const onError = error => finish(reject, error);
+    const onKicked = reason => finish(reject, new Error('Kicked: ' + String(reason)));
+    const onEnd = reason => finish(reject, new Error('Connection ended before spawn: ' + String(reason)));
+    const timer = setTimeout(
+      () => finish(reject, new Error('Bot spawn timed out after ' + SPAWN_TIMEOUT_MS + ' ms')),
+      SPAWN_TIMEOUT_MS);
+    client.once('spawn', onSpawn);
+    client.once('error', onError);
+    client.once('kicked', onKicked);
+    client.once('end', onEnd);
+  });
+}
+
+async function createBotClient() {
+  if (config.mode === 'fake') return makeFakeBot();
+  const { mineflayer, pathfinder } = loadMineflayer();
+  const client = mineflayer.createBot({
+    host: config.host, port: config.port, username: config.username,
+    version: config.version, auth: 'offline', hideErrors: true,
+  });
+  client.loadPlugin(pathfinder);
+  await waitForSpawn(client);
+  return client;
+}
+
+function installBot(client) {
+  botGeneration += 1;
+  bot = client;
+  if (physicsGuard) { try { physicsGuard.uninstall(); } catch {} physicsGuard = null; }
+  try {
+    const stallConfig = Number(config.physicsStallMs);
+    physicsGuard = installPhysicsGuard(client, {
+      stallMs: Number.isFinite(stallConfig) && stallConfig > 0 ? stallConfig : undefined,
+      isReady: () => botReady,
+      recentApi: () => recentApi,
+      onPrevented: payload => {
+        if (preventedLogs >= 5) return;
+        preventedLogs += 1;
+        stderrEvidence('PHYSICS_NONFINITE_PREVENTED', {
+          reason: 'nonfinite_bot_state',
+          execution_id: currentScope?.id ?? null,
+          bad_fields: payload.badFields,
+          restored: payload.restored,
+          recent_api: (payload.recentApi ?? []).slice(-5),
+        });
+      },
+      onRepeated: stats => {
+        stderrEvidence('PHYSICS_NONFINITE_REPEATED', {
+          reason: 'nonfinite_bot_state',
+          execution_id: currentScope?.id ?? null,
+          bad_fields: stats.badFields,
+          consecutive: stats.consecutive,
+          in_window: stats.inWindow,
+          recent_api: (stats.recentApi ?? []).slice(-5),
+        });
+        if (!resetState) softReset('nonfinite_bot_state', {
+          source: 'physics_guard',
+          bad_fields: stats.badFields,
+          recent_api: (stats.recentApi ?? []).slice(-10),
+        });
+      },
+      onStalled: payload => {
+        stderrEvidence('PHYSICS_STALLED', {
+          reason: 'physics_stalled',
+          execution_id: currentScope?.id ?? null,
+          ms_since_tick: payload.msSinceTick,
+          ms_since_spawn: payload.msSinceSpawn,
+          last_physics_tick_at: payload.lastPhysicsTickAt,
+        });
+        if (!resetState) softReset('physics_stalled', {
+          ms_since_tick: payload.msSinceTick,
+          ms_since_spawn: payload.msSinceSpawn,
+          last_physics_tick_at: payload.lastPhysicsTickAt,
+        });
+      },
+    });
+  } catch (error) {
+    stderrEvidence('PHYSICS_GUARD_FAILED', { error: String(error?.message ?? error).slice(0, 500) });
+  }
+  const emitterMethods = new Set(['on', 'once', 'addListener', 'prependListener', 'prependOnceListener', 'off', 'removeListener', 'removeAllListeners', 'emit']);
+  try {
+    for (const name of Object.keys(client)) if (!emitterMethods.has(name)) instrumentMethod(client, name);
+    if (client.pathfinder) {
+      instrumentMethod(client.pathfinder, 'goto');
+      instrumentMethod(client.pathfinder, 'setGoal');
+    }
+  } catch (error) {
+    stderrEvidence('BOT_INSTRUMENT_FAILED', { error: String(error?.message ?? error).slice(0, 500) });
+  }
+  for (const event of ['chat', 'whisper', 'death', 'respawn', 'kicked', 'end', 'error']) {
+    client.on(event, (...args) => {
+      const encoded = boundedValue(args, 32768);
+      send({ type: 'event', kind: event, payload: encoded.value, payload_truncated: encoded.truncated });
+    });
+  }
+  client.on('end', () => {
+    if (intentionalBotQuit || resetState) return;
+    softReset('bot_disconnected', { reason: 'bot_end' });
+  });
+  client.on('kicked', reason => {
+    if (intentionalBotQuit || resetState) return;
+    softReset('bot_disconnected', { reason: 'kicked', detail: String(reason ?? '').slice(0, 500) });
+  });
+  try { instrumentEmitter(client); } catch {}
+  if (viewer) { try { viewer.attach(client); } catch (error) { stderrEvidence('VIEWER_ATTACH_FAILED', { error: String(error?.message ?? error).slice(0, 300) }); } }
+  if (config.chatDelivery === 'program_output') {
+    client.on('chat', (username, message) => {
+      pendingChat.push({ username: String(username ?? '').slice(0, 64), message: String(message ?? '').slice(0, 4096), received_at: new Date().toISOString() });
+      while (pendingChat.length > 100) pendingChat.shift();
+    });
+  }
+  return client;
+}
+
+async function startBot({ initial = false, reason = null } = {}) {
+  const startedAt = Date.now();
+  const client = await createBotClient();
+  installBot(client);
+  botReady = true;
+  if (initial) {
+    try { setupViewer(); } catch (error) {
+      stderrEvidence('VIEWER_SETUP_FAILED', { error: String(error?.stack ?? error).slice(0, 800) });
+    }
+    send({
+      type: 'ready',
+      snapshot: snapshot(),
+      mode: config.mode,
+      module_policy: modulePolicy(config.lifecycle),
+      sandbox: {
+        native_filter: process.env.HARNESS_NATIVE_SANDBOX === 'seccomp-v1',
+        version: process.env.HARNESS_NATIVE_SANDBOX === 'seccomp-v1' ? 1 : null,
+      },
+    });
+    drainPendingExecutions();
+    return client;
+  }
+  softResetCount += 1;
+  const durationMs = Date.now() - startedAt;
+  stderrEvidence('SOFT_RESET_READY', {
+    reason,
+    generation: botGeneration,
+    duration_ms: durationMs,
+    soft_resets: softResetCount,
+    snapshot_position: bot?.entity?.position ?? null,
+  });
+  send({
+    type: 'soft_ready',
+    reason,
+    generation: botGeneration,
+    snapshot: softSnapshot(),
+    duration_ms: durationMs,
+    soft_resets: softResetCount,
+  });
+  drainPendingExecutions();
+  return client;
+}
+
+function softReset(reason, detail = null) {
+  if (resetState) return resetState.promise;
+  const decision = rateLimitDecision(softResetTimes, {
+    limit: SOFT_RESET_RATE_LIMIT,
+    windowMs: SOFT_RESET_RATE_WINDOW_MS,
+  });
+  if (!decision.allowed) {
+    fatalExit('Soft reset rate limit exceeded (' + SOFT_RESET_RATE_LIMIT + ' in '
+      + Math.round(SOFT_RESET_RATE_WINDOW_MS / 1000) + 's): ' + String(reason), { reason });
+    const rejected = Promise.resolve(null);
+    resetState = { promise: rejected, reason };
+    rejected.then(() => { if (resetState?.promise === rejected) resetState = null; });
+    return rejected;
+  }
+  softResetTimes.length = 0;
+  softResetTimes.push(...decision.times);
+  const promise = performSoftReset(reason, detail).catch(error => {
+    stderrEvidence('SOFT_RESET_UNEXPECTED_ERROR', { reason, error: String(error?.stack ?? error).slice(0, 2000) });
+    try { send({ type: 'soft_reset_failed', reason, error: String(error?.stack ?? error).slice(0, 4096) }); } catch {}
+    fatalExit('Soft reset failed: ' + String(error?.message ?? error), { soft_reset_failed: true, reason });
+    return null;
+  });
+  resetState = { promise, reason };
+  const settle = () => {
+    if (resetState?.promise === promise) resetState = null;
+    // `performSoftReset`/`startBot` send soft_ready and try to drain while
+    // resetState is still held, so that drain is a no-op. Drain again now that
+    // the single-flight gate is actually clear; otherwise the next execute
+    // (especially the server's post-soft_ready dispatch) would stay queued
+    // forever. Fatal paths exit and must not start new work.
+    if (!fatalExitScheduled) drainPendingExecutions();
+  };
+  promise.then(settle, settle);
+  return promise;
+}
+
+async function performSoftReset(reason, detail) {
+  const generation = botGeneration + 1;
+  const scope = currentScope;
+  const executionId = scope?.id ?? null;
+  botReady = false;
+  stderrEvidence('SOFT_RESET_START', {
+    reason,
+    generation,
+    execution_id: executionId,
+    detail: boundedDetail(detail),
+  });
+  // 4. Complete the in-flight foreground execution exactly once, before the
+  //    soft_reset message, so the server can release or fail it deterministically.
+  if (scope && !scope.completed) {
+    const error = {
+      name: 'SoftResetError',
+      message: 'Bot client reset: ' + reason,
+      stack: new Error('Bot client reset: ' + reason).stack,
+    };
+    completeScope(scope, null, error, false, { resetReason: 'soft_reset', forceNeedsReset: false });
+  }
+  // 5. Close every retained leftover scope (paper leftover_policy allow) and
+  //    background job so no program callback can touch the old generation after
+  //    the bump. Cleanup keeps the exact "Execution has ended" fencing: closed
+  //    scopes make instrumented methods throw.
+  for (const leftover of [...leftoverScopes]) {
+    try { cleanup(leftover); } catch {}
+    leftoverScopes.delete(leftover);
+  }
+  for (const job of jobs.values()) {
+    if (job.closed) continue;
+    try {
+      const summary = cleanup(job);
+      clearInterval(job.monitor);
+      job.closed = true;
+      job.status = 'failed';
+      send({
+        type: 'job_finished',
+        job_id: job.jobId,
+        execution_id: job.id,
+        status: 'failed',
+        error: { name: 'SoftResetError', message: 'Bot client reset: ' + reason, stack: '' },
+        cleanup: summary,
+        result: null,
+      });
+    } catch {}
+  }
+  controlOwners.clear();
+  goalOwner = null;
+  // 6. Quiesce native actions on the old client. Run outside the (now closed)
+  //    AsyncLocalStorage scope so the instrumented pathfinder/bot methods do not
+  //    reject with "Execution has ended" just because a program scope was active;
+  //    native shutdown must still reach the real client.
+  try {
+    const quiesce = scopes.run(undefined, () => quiesceNativeActions(bot));
+    stderrEvidence('SOFT_RESET_QUIESCE', { reason, quiesce });
+  } catch {}
+  // 7. Announce the reset (server gates its queue on this message).
+  send({
+    type: 'soft_reset',
+    reason,
+    generation,
+    execution_id: executionId,
+    detail: boundedDetail(detail),
+  });
+  // 8. Disconnect the old client; the identity proxy needs it active=false
+  //    before a new login can be admitted.
+  const oldBot = bot;
+  intentionalBotQuit = true;
+  if (oldBot) {
+    try { oldBot.quit?.(); } catch {}
+    await waitForBotEnd(oldBot, 3000);
+    try { oldBot._client?.socket?.destroy?.(); } catch {}
+  }
+  try { physicsGuard?.uninstall(); } catch {}
+  physicsGuard = null;
+  bot = null;
+  botReady = false;
+  intentionalBotQuit = false;
+  // 9. Create the replacement client with bounded retries/backoff.
+  let lastError = null;
+  for (let attempt = 1; attempt <= SOFT_RESET_ATTEMPTS; attempt += 1) {
+    try {
+      await startBot({ initial: false, reason });
+      return;
+    } catch (error) {
+      lastError = error;
+      stderrEvidence('SOFT_RESET_ATTEMPT_FAILED', {
+        reason,
+        attempt,
+        error: String(error?.message ?? error).slice(0, 400),
+      });
+      if (attempt < SOFT_RESET_ATTEMPTS) await sleep(SOFT_RESET_RETRY_BACKOFF_MS);
+    }
+  }
+  // 10. Failure is a hard restart: tell the server, then exit.
+  stderrEvidence('SOFT_RESET_FAILED', { reason, error: String(lastError?.stack ?? lastError).slice(0, 2000) });
+  try { send({ type: 'soft_reset_failed', reason, error: String(lastError?.stack ?? lastError).slice(0, 4096) }); } catch {}
+  fatalExit('Soft reset failed: ' + String(lastError?.message ?? lastError), {
+    soft_reset_failed: true,
+    reason,
+  });
+}
+
+function failQueuedExecution(message, reason, name = 'WorkerBusyError') {
+  if (!message || !message.execution_id) return;
+  try {
+    send({
+      type: 'completed',
+      execution_id: message.execution_id,
+      result: null,
+      error: { name, message: String(reason).slice(0, 500), stack: '' },
+      output_truncated: false,
+      before: null,
+      after: null,
+      timed_out: false,
+      needs_reset: false,
+      reset_reason: 'worker_reset',
+      cleanup: null,
+    });
+  } catch {}
+}
+
+function queueExecution(message) {
+  pendingExecutions.push(message);
+  while (pendingExecutions.length > PENDING_EXECUTION_LIMIT) {
+    failQueuedExecution(pendingExecutions.shift(), 'Worker busy during bot reset');
+  }
+}
+
+function drainPendingExecutions() {
+  if (resetState || !botReady || currentScope) return;
+  const next = pendingExecutions.shift();
+  if (!next) return;
+  execute(next).catch(error => fatalExit('Queued execution failed: ' + String(error?.stack ?? error)));
+}
+
+function handleAsyncFatal(error, source) {
+  const name = String(error?.name ?? error?.constructor?.name ?? 'Error');
+  stderrEvidence(source, {
+    name,
+    message: String(error?.message ?? error).slice(0, 500),
+    execution_id: currentScope?.id ?? null,
+  });
+  // A reset already owns recovery; swallowing avoids a reset->exception->reset
+  // recursion (the in-flight reset will either recover or hard-fail).
+  if (resetState) return;
+  softReset('uncaught:' + name, {
+    source,
+    message: String(error?.message ?? error).slice(0, 2000),
+    stack: String(error?.stack ?? '').slice(0, 4000),
+  });
+}
+
+function setupViewer() {
+  if (viewerSetupDone || config.mode !== 'minecraft') return;
+  const viewerPort = Number(process.env.VIEWER_PORT ?? '');
+  if (!(Number.isInteger(viewerPort) && viewerPort > 0 && viewerPort < 65536)) return;
+  viewerSetupDone = true;
+  const bind = process.env.VIEWER_BIND || '127.0.0.1';
+  const viewDistance = Math.max(1, Math.min(8, Number(process.env.VIEWER_VIEW_DISTANCE ?? '2') || 2));
+  const firstPerson = (process.env.VIEWER_FIRST_PERSON ?? 'true') !== 'false';
+  const viewerScript = fileURLToPath(new URL('./viewer-child.cjs', import.meta.url));
+  const viewerChunks = new Map();
+  let viewerThread = null;
+  let viewerStopping = false;
+  let viewerRestarts = 0;
+  let viewerLastHeartbeat = Date.now();
+  let viewerRestartTimer = null;
+  let viewerPositionAt = 0;
+  let viewerVersion = null;
+  let repaintTimer = null;
+  const viewerEntityAt = new Map();
+
+  function viewerSend(message) {
+    if (!viewerThread) return;
+    try { viewerThread.postMessage(message); } catch { /* restart owns recovery */ }
+  }
+  function viewerSnapshot() {
+    const chunks = [];
+    for (const [key, json] of viewerChunks) {
+      const [x, z] = key.split(',').map(Number);
+      chunks.push({ x, z, json });
+    }
+    viewerSend({ type: 'chunks', chunks });
+    viewerPosition(true);
+  }
+  function viewerChunk(pos) {
+    try {
+      const column = bot?.world?.getColumnAt(pos);
+      if (!column || typeof column.toJson !== 'function') return;
+      const x = Math.floor(pos.x / 16), z = Math.floor(pos.z / 16);
+      const json = column.toJson();
+      viewerChunks.set(`${x},${z}`, json);
+      if (viewerChunks.size > 1024) viewerChunks.delete(viewerChunks.keys().next().value);
+      viewerSend({ type: 'chunk', x, z, json });
+    } catch (error) { process.stderr.write(`viewer chunk capture failed: ${String(error?.message ?? error).slice(0, 300)}\n`); }
+  }
+  function viewerAllChunks() {
+    try {
+      const columns = bot?.world?.columns || {};
+      for (const [key, column] of Object.entries(columns)) {
+        if (!column || typeof column.toJson !== 'function') continue;
+        const [x, z] = String(key).split(',').map(Number);
+        if (!Number.isInteger(x) || !Number.isInteger(z)) continue;
+        viewerChunks.set(`${x},${z}`, column.toJson());
+      }
+    } catch (error) { process.stderr.write(`viewer snapshot failed: ${String(error?.message ?? error).slice(0, 300)}\n`); }
+  }
+  function viewerPosition(force = false) {
+    const now = Date.now();
+    if (!force && now - viewerPositionAt < 100) return;
+    const position = bot?.entity?.position;
     if (!position) return;
-    const values = [position.x, position.y, position.z, entity.yaw, entity.pitch];
-    if (values.every(Number.isFinite)) {
-      hadFinite = true;
-      nonfiniteSince = null;
-      quiesced = false;
-      quiesceResult = null;
+    viewerPositionAt = now;
+    viewerSend({ type: 'position', pos: { x: position.x, y: position.y, z: position.z }, yaw: bot.entity.yaw, pitch: bot.entity.pitch });
+  }
+  function viewerEntity(entity, force = false) {
+    if (!entity || entity === bot?.entity) return;
+    const now = Date.now();
+    if (!force && now - (viewerEntityAt.get(entity.id) || 0) < 150) return;
+    viewerEntityAt.set(entity.id, now);
+    if (viewerEntityAt.size > 256) viewerEntityAt.delete(viewerEntityAt.keys().next().value);
+    viewerSend({ type: 'entity', entity: { id: entity.id, name: entity.name, pos: { x: entity.position.x, y: entity.position.y, z: entity.position.z }, width: entity.width, height: entity.height, username: entity.username } });
+  }
+  function viewerBlockUpdate(oldBlock, newBlock) {
+    if (!newBlock || !newBlock.position) return;
+    const stateId = Number.isInteger(newBlock.stateId) ? newBlock.stateId : ((newBlock.type << 4) | (newBlock.metadata || 0));
+    viewerSend({ type: 'blockUpdate', block: { pos: { x: newBlock.position.x, y: newBlock.position.y, z: newBlock.position.z }, stateId } });
+  }
+  function viewerStart() {
+    if (viewerStopping) return;
+    if (viewerRestartTimer) { clearTimeout(viewerRestartTimer); viewerRestartTimer = null; }
+    viewerVersion = bot?.version ?? viewerVersion;
+    const config = { port: viewerPort, bind, viewDistance, firstPerson, version: viewerVersion };
+    let thread;
+    try {
+      thread = new Worker(viewerScript, {
+        workerData: config,
+        resourceLimits: { maxOldGenerationSizeMb: 384, maxYoungGenerationSizeMb: 64 },
+      });
+    } catch (error) {
+      process.stderr.write(`viewer thread spawn failed: ${String(error?.message ?? error).slice(0, 500)}\n`);
+      viewerScheduleRestart();
       return;
     }
-    if (!hadFinite) return;
-    // Give the client a bounded window to recover from a transient teleport /
-    // chunk update instead of restarting the worker on the first bad tick.
-    // Stop native writes immediately: merely waiting lets a running pathfinder
-    // or dig keep writing the corrupted position/control state, and an async
-    // program cannot be cancelled directly.
-    if (nonfiniteSince === null) {
-      nonfiniteSince = Date.now();
-      observedNonfinite++;
-      quiesceResult = quiesceNativeActions(bot);
-      quiesced = true;
-      process.stderr.write('NONFINITE_BOT_STATE_OBSERVED ' + JSON.stringify({
-        agent: config.username,
-        execution: currentScope?.id ?? null,
-        at: new Date(nonfiniteSince).toISOString(),
-        count: observedNonfinite,
-        quiesce: quiesceResult,
-      }) + '\n');
+    viewerThread = thread;
+    viewerLastHeartbeat = Date.now();
+    thread.on('message', (message) => {
+      if (!message || typeof message !== 'object') return;
+      if (message.type === 'viewer_heartbeat') { viewerLastHeartbeat = Date.now(); return; }
+      if (message.type === 'viewer_ready') {
+        viewerAllChunks();
+        viewerSnapshot();
+        send({ type: 'viewer_started', port: viewerPort, bind, first_person: firstPerson, isolated: true, restarts: viewerRestarts });
+        return;
+      }
+      if (message.type === 'viewer_fatal' || message.type === 'viewer_warning') {
+        process.stderr.write(`viewer ${message.type}: ${String(message.error).slice(0, 800)}\n`);
+      }
+    });
+    thread.on('error', (error) => {
+      process.stderr.write(`viewer thread error: ${String(error?.stack ?? error).slice(0, 1000)}\n`);
+    });
+    thread.on('exit', (code) => {
+      if (viewerThread === thread) viewerThread = null;
+      if (viewerStopping) return;
+      process.stderr.write(`viewer thread exited code=${code}; restarting\n`);
+      viewerScheduleRestart();
+    });
+  }
+  function viewerScheduleRestart() {
+    if (viewerStopping || viewerRestartTimer) return;
+    viewerRestarts++;
+    const delay = Math.min(5000, 500 + viewerRestarts * 250);
+    viewerRestartTimer = setTimeout(() => { viewerRestartTimer = null; viewerStart(); }, delay);
+  }
+  function viewerStop() {
+    viewerStopping = true;
+    if (viewerRestartTimer) { clearTimeout(viewerRestartTimer); viewerRestartTimer = null; }
+    if (repaintTimer) { clearTimeout(repaintTimer); repaintTimer = null; }
+    const thread = viewerThread; viewerThread = null;
+    if (thread) {
+      try { thread.postMessage({ type: 'shutdown' }); } catch {}
+      const killTimer = setTimeout(() => { thread.terminate().catch(() => {}); }, 500);
+      killTimer.unref?.();
+      thread.once('exit', () => clearTimeout(killTimer));
     }
-    if (Date.now() - nonfiniteSince < 30000) return;
-    let detail;
+  }
+  function scheduleRepaint(delayMs = 50) {
+    if (repaintTimer) return;
+    repaintTimer = setTimeout(() => {
+      repaintTimer = null;
+      try { viewerAllChunks(); viewerSnapshot(); } catch {}
+    }, delayMs);
+    repaintTimer.unref?.();
+  }
+  function attach(client) {
+    // A new bot generation replaces the connection under the same viewer
+    // thread: drop the stale chunk cache and re-register all hooks so the
+    // existing viewer repaints from the new client. The thread itself is only
+    // restarted on exit/heartbeat-timeout, not on a soft reset.
+    viewerChunks.clear();
+    viewerEntityAt.clear();
+    const previousVersion = viewerVersion;
+    viewerVersion = client?.version ?? viewerVersion;
+    // The pinned MC version never changes across generations, but a version
+    // change would need a fresh viewer thread (its workerData is immutable).
+    if (previousVersion && viewerVersion && previousVersion !== viewerVersion && viewerThread) {
+      try { viewerThread.terminate().catch(() => {}); } catch {}
+    }
+    client.on('chunkColumnLoad', viewerChunk);
+    client.on('move', () => viewerPosition());
+    client.on('entitySpawn', (entity) => viewerEntity(entity, true));
+    client.on('entityMoved', viewerEntity);
+    client.on('entityGone', (entity) => viewerSend({ type: 'entity', entity: { id: entity.id, delete: true } }));
+    client.on('blockUpdate', viewerBlockUpdate);
+    // The new client is already spawned when the worker installs it; request a
+    // fresh repaint shortly after chunks start decoding.
+    scheduleRepaint(50);
+    client.once('chunkColumnLoad', () => scheduleRepaint(25));
+  }
+  viewer = { attach, stop: viewerStop };
+  // The initial bot was installed before the viewer existed, so attach it here;
+  // later generations are attached from installBot(). A generation's listeners
+  // live on its own client object, so a soft reset never double-registers them.
+  try { attach(bot); } catch (error) {
+    stderrEvidence('VIEWER_ATTACH_FAILED', { error: String(error?.message ?? error).slice(0, 300) });
+  }
+  process.on('exit', viewerStop);
+  process.on('SIGTERM', () => { viewerStop(); process.exit(0); });
+  const viewerPositionTimer = setInterval(() => viewerPosition(), 250);
+  viewerPositionTimer.unref?.();
+  const viewerHealthTimer = setInterval(() => {
+    if (!viewerThread || viewerStopping) return;
+    if (Date.now() - viewerLastHeartbeat > 15000) {
+      process.stderr.write('viewer heartbeat timeout; restarting thread\n');
+      viewerThread.terminate().catch(() => {});
+    }
+  }, 5000);
+  viewerHealthTimer.unref?.();
+  viewerStart();
+}
+
+function startBotStateGuard() {
+  // One 500 ms guard interval for the whole process (never per generation).
+  // It reads the current global bot and resets per-generation recovery state
+  // whenever the client generation changes. It tries restoring the last finite
+  // state first and only escalates to an in-process soft reset when the state
+  // stays nonfinite for 3 checks (~1.5 s).
+  if (config.mode !== 'minecraft') return;
+  let hadFinite = false;
+  let lastGoodState = null;
+  let nonfiniteChecks = 0;
+  let guardGeneration = botGeneration;
+  let evidenceLogged = 0;
+  const timer = setInterval(() => {
     try {
-      const entity = bot.entity;
-      const goal = bot.pathfinder?.goal;
-      const worldRef = bot.world;
-      const columns = worldRef?.async?.columns ?? worldRef?.columns;
-      const own = bot.entity;
-      detail = {
-        event: 'NONFINITE_BOT_STATE',
-        agent: config.username,
-        execution: currentScope?.id ?? null,
-        source_sha256: currentScope?.sourceHash ?? null,
-        source_head: currentScope?.sourceHead ?? null,
-        position: { x: summarizeArg(position.x), y: summarizeArg(position.y), z: summarizeArg(position.z) },
-        yaw_pitch: [summarizeArg(entity.yaw), summarizeArg(entity.pitch)],
-        velocity: { x: summarizeArg(entity.velocity?.x), y: summarizeArg(entity.velocity?.y), z: summarizeArg(entity.velocity?.z) },
-        on_ground: entity.onGround,
-        world_present: Boolean(worldRef),
-        world_columns: columns && typeof columns === 'object' ? Object.keys(columns).length : null,
-        world_sync_present: Boolean(worldRef?.async),
-        entities_count: bot.entities ? Object.keys(bot.entities).length : null,
-        own_entity_same: Boolean(bot.entities && own && bot.entities[own.id] === own),
-        dimension: bot.game?.dimension ?? null,
-        pathfinder_goal: goal ? { type: goal.constructor?.name || 'object', x: summarizeArg(goal.x), y: summarizeArg(goal.y), z: summarizeArg(goal.z) } : null,
-        physics_present: Boolean(bot.physics),
-        physics_gravity: summarizeArg(bot.physics?.gravity),
-        physics_enabled: bot.physicsEnabled,
-        client_state: bot._client?.state ?? null,
-        client_ended: bot._client?.ended ?? null,
-        recent_api: recentApi.slice(-15),
-        recent_logs: recentLogs.slice(-8),
-        quiesced,
-        quiesce: quiesceResult,
-        uptime_s: Math.round(process.uptime()),
-        rss_bytes: process.memoryUsage().rss,
-      };
-    } catch (error) { detail = { event: 'NONFINITE_BOT_STATE', capture_error: String(error?.message ?? error).slice(0, 200), execution: currentScope?.id ?? null }; }
-    process.stderr.write('NONFINITE_BOT_STATE ' + JSON.stringify(detail).slice(0, 1800) + '\n');
-    process.exit(1);
+      if (guardGeneration !== botGeneration) {
+        guardGeneration = botGeneration;
+        hadFinite = false;
+        lastGoodState = null;
+        nonfiniteChecks = 0;
+      }
+      const entity = bot && bot.entity;
+      const position = entity && entity.position;
+      if (!position) return;
+      const state = physicsClientState(entity);
+      if (physicsStateIsFinite(state)) {
+        hadFinite = true;
+        lastGoodState = state;
+        nonfiniteChecks = 0;
+        return;
+      }
+      if (!hadFinite) return;
+      nonfiniteChecks += 1;
+      if (evidenceLogged < 5) {
+        evidenceLogged += 1;
+        stderrEvidence('NONFINITE_BOT_STATE', {
+          event: 'NONFINITE_BOT_STATE',
+          agent: config.username,
+          execution_id: currentScope?.id ?? null,
+          bad_fields: physicsNonfiniteFields(state),
+          position: { x: summarizeArg(position.x), y: summarizeArg(position.y), z: summarizeArg(position.z) },
+          yaw_pitch: [summarizeArg(entity.yaw), summarizeArg(entity.pitch)],
+          velocity: { x: summarizeArg(entity.velocity?.x), y: summarizeArg(entity.velocity?.y), z: summarizeArg(entity.velocity?.z) },
+          last_good: lastGoodState ? { pos: lastGoodState.pos, yaw: lastGoodState.yaw, pitch: lastGoodState.pitch } : null,
+          source_guard: 'state_guard',
+          check: nonfiniteChecks,
+          physics_present: Boolean(bot.physics),
+          physics_enabled: bot.physicsEnabled,
+          uptime_s: Math.round(process.uptime()),
+          rss_bytes: process.memoryUsage().rss,
+        });
+      }
+      if (lastGoodState) restoreEntityPhysicsState(entity, lastGoodState);
+      if (nonfiniteChecks >= 3) {
+        nonfiniteChecks = 0;
+        if (!resetState) {
+          softReset('nonfinite_bot_state', {
+            source: 'state_guard',
+            bad_fields: physicsNonfiniteFields(state),
+            recent_api: recentApi.slice(-10),
+          });
+        }
+      }
+    } catch { /* the final backstop must never throw */ }
   }, 500);
   timer.unref?.();
 }
@@ -463,14 +1170,17 @@ function retainLeftover(scope) {
 }
 
 async function execute(message) {
-  if (currentScope) throw new Error('Worker already executing');
+  // The server can race the next execute against soft_reset/soft_ready; queue
+  // it instead of throwing "Worker already executing" so no execution is lost
+  // to a reset boundary. Queue draining happens after ready/completion.
+  if (resetState || !botReady || currentScope) { queueExecution(message); return; }
   const scope = makeScope(message.execution_id);
   currentScope = scope;
   try {
     scope.sourceHash = createHash('sha256').update(String(message.source ?? '')).digest('hex').slice(0, 16);
     scope.sourceHead = String(message.source ?? '').replace(/\s+/g, ' ').slice(0, 300);
   } catch {}
-  scope.before = snapshot();
+  try { scope.before = safeSnapshot(); } catch { scope.before = null; }
   scope.deadline = performance.now() + (Number(message.timeout_ms) || 60000);
   scope.checkDeadline = scope.deadline - Math.min(150, (Number(message.timeout_ms) || 60000) / 10);
   const logger = scopedLogger();
@@ -513,13 +1223,15 @@ async function execute(message) {
   // keeps running, but this invocation must not emit a second completion.
   if (scope.aborted) {
     retainLeftover(scope);
+    drainPendingExecutions();
     return;
   }
   if (scope.aborted) return;
   completeScope(scope, result, error, timedOut);
+  drainPendingExecutions();
 }
 
-function completeScope(scope, result, error, timedOut) {
+function completeScope(scope, result, error, timedOut, options = {}) {
   if (scope.completed) return;
   scope.completed = true;
   if (currentScope === scope) currentScope = null;
@@ -545,9 +1257,11 @@ function completeScope(scope, result, error, timedOut) {
     needsReset = timedOut || unfinishedActions > 0 || (moving && !backgroundActive);
     if (!resetReason) resetReason = unfinishedActions > 0 ? 'unfinished_async_action' : moving && !backgroundActive ? 'unfinished_movement' : null;
   }
+  if (options.forceNeedsReset === false) needsReset = false;
+  if (options.resetReason) resetReason = options.resetReason;
   const serialized = boundedValue(result, config.maxResultBytes ?? 262144);
   send({ type: 'completed', execution_id: scope.id, result: serialized.value, error, output_truncated: serialized.truncated,
-    before: scope.before ?? null, after: snapshot(), timed_out: timedOut, needs_reset: needsReset, reset_reason: resetReason, cleanup: summary });
+    before: scope.before ?? null, after: safeSnapshot(), timed_out: timedOut, needs_reset: needsReset, reset_reason: resetReason, cleanup: summary });
 }
 
 function abortExecution(executionId) {
@@ -557,16 +1271,39 @@ function abortExecution(executionId) {
   currentScope = null;
   retainLeftover(scope);
   send({ type: 'abort_ack', execution_id: executionId });
+  drainPendingExecutions();
   return true;
 }
 
 process.on('message', (message) => {
-  if (message.type === 'execute') execute(message).catch(error => {
-    send({ type: 'fatal', error: String(error.stack ?? error).slice(0, 32768) }); process.exit(1);
-  });
-  else if (message.type === 'abort_execution') abortExecution(message.execution_id);
-  else if (message.type === 'cancel_execution' && currentScope?.id === message.execution_id) currentScope.cancelled = true;
-  else if (message.type === 'cancel_job') {
+  if (message.type === 'execute') {
+    // Queue during startup/reset: the server may dispatch the next execution
+    // immediately after seeing `completed` but before it processes soft_reset.
+    if (resetState || !botReady || currentScope) { queueExecution(message); return; }
+    execute(message).catch(error => fatalExit('Execution failed: ' + String(error?.stack ?? error)));
+    return;
+  }
+  if (message.type === 'abort_execution') {
+    const queuedIndex = pendingExecutions.findIndex(item => item.execution_id === message.execution_id);
+    if (queuedIndex >= 0) {
+      pendingExecutions.splice(queuedIndex, 1);
+      send({ type: 'abort_ack', execution_id: message.execution_id });
+      return;
+    }
+    abortExecution(message.execution_id);
+    return;
+  }
+  if (message.type === 'cancel_execution') {
+    const queuedIndex = pendingExecutions.findIndex(item => item.execution_id === message.execution_id);
+    if (queuedIndex >= 0) {
+      const [queued] = pendingExecutions.splice(queuedIndex, 1);
+      failQueuedExecution(queued, 'Program cancelled before it started', 'CancelledError');
+      return;
+    }
+    if (currentScope?.id === message.execution_id) currentScope.cancelled = true;
+    return;
+  }
+  if (message.type === 'cancel_job') {
     const scope = jobs.get(message.job_id);
     if (scope && !scope.closed) {
       scope.cancelled = true; scope.status = 'cancelling'; scope.cancelStatus = message.status;
@@ -577,11 +1314,16 @@ process.on('message', (message) => {
       scope.timers.clear(); scope.listeners.length = 0;
       checkJob(scope);
     }
+    return;
   }
-  else if (message.type === 'fake_chat_deliver' && config.mode === 'fake') bot.emit('chat', message.username, message.message);
+  if (message.type === 'fake_chat_deliver' && config.mode === 'fake') {
+    try { bot?.emit('chat', message.username, message.message); } catch {}
+  }
 });
+// IPC loss remains a hard exit: the worker must not outlive its session.
 process.on('disconnect', () => process.exit(0));
-process.on('uncaughtException', error => { send({ type: 'fatal', error: String(error.stack ?? error).slice(0, 32768) }); process.exit(1); });
+
+process.on('uncaughtException', error => handleAsyncFatal(error, 'UNCAUGHT_EXCEPTION'));
 let ignoredPathfinderRejections = 0;
 process.on('unhandledRejection', error => {
   // Pathfinder's normal route outcomes can reject derived/background promises
@@ -597,196 +1339,17 @@ process.on('unhandledRejection', error => {
     }
     return;
   }
-  send({ type: 'fatal', error: String(error?.stack ?? error).slice(0, 32768) });
-  process.exit(1);
+  handleAsyncFatal(error, 'UNHANDLED_REJECTION');
 });
 
-if (config.mode === 'fake') {
-  bot = makeFakeBot();
-} else {
-  const mineflayer = nativeRequire('mineflayer');
-  const { pathfinder } = nativeRequire('mineflayer-pathfinder');
-  bot = mineflayer.createBot({ host: config.host, port: config.port, username: config.username, version: config.version,
-    auth: 'offline', hideErrors: true });
-  bot.loadPlugin(pathfinder);
-  await new Promise((resolve, reject) => {
-    bot.once('spawn', resolve);
-    bot.once('error', reject);
-    bot.once('kicked', reason => reject(new Error(`Kicked: ${String(reason)}`)));
-    bot.once('end', reason => reject(new Error(`Connection ended before spawn: ${reason}`)));
-  });
-  // Optional live first-person viewer for human observation. The HTTP/socket
-  // renderer runs in an isolated worker thread inside the same read-only
-  // sandbox. A viewer exception is caught by this parent thread, which restarts
-  // the viewer; the agent bot, execution channel and experiment are untouched.
-  const viewerPort = Number(process.env.VIEWER_PORT ?? '');
-  if (Number.isInteger(viewerPort) && viewerPort > 0 && viewerPort < 65536) {
-    const bind = process.env.VIEWER_BIND || '127.0.0.1';
-    const viewDistance = Math.max(1, Math.min(8, Number(process.env.VIEWER_VIEW_DISTANCE ?? '2') || 2));
-    const firstPerson = (process.env.VIEWER_FIRST_PERSON ?? 'true') !== 'false';
-    const viewerScript = fileURLToPath(new URL('./viewer-child.cjs', import.meta.url));
-    const viewerChunks = new Map();
-    let viewerThread = null;
-    let viewerStopping = false;
-    let viewerRestarts = 0;
-    let viewerLastHeartbeat = Date.now();
-    let viewerRestartTimer = null;
-    let viewerPositionAt = 0;
-
-    function viewerSend(message) {
-      if (!viewerThread) return;
-      try { viewerThread.postMessage(message); } catch { /* restart owns recovery */ }
-    }
-    function viewerSnapshot() {
-      const chunks = [];
-      for (const [key, json] of viewerChunks) {
-        const [x, z] = key.split(',').map(Number);
-        chunks.push({ x, z, json });
-      }
-      viewerSend({ type: 'chunks', chunks });
-      viewerPosition(true);
-    }
-    function viewerChunk(pos) {
-      try {
-        const column = bot.world?.getColumnAt(pos);
-        if (!column || typeof column.toJson !== 'function') return;
-        const x = Math.floor(pos.x / 16), z = Math.floor(pos.z / 16);
-        const json = column.toJson();
-        viewerChunks.set(`${x},${z}`, json);
-        if (viewerChunks.size > 1024) viewerChunks.delete(viewerChunks.keys().next().value);
-        viewerSend({ type: 'chunk', x, z, json });
-      } catch (error) { process.stderr.write(`viewer chunk capture failed: ${String(error?.message ?? error).slice(0, 300)}\n`); }
-    }
-    function viewerAllChunks() {
-      try {
-        const columns = bot.world?.columns || {};
-        for (const [key, column] of Object.entries(columns)) {
-          if (!column || typeof column.toJson !== 'function') continue;
-          const [x, z] = String(key).split(',').map(Number);
-          if (!Number.isInteger(x) || !Number.isInteger(z)) continue;
-          viewerChunks.set(`${x},${z}`, column.toJson());
-        }
-      } catch (error) { process.stderr.write(`viewer snapshot failed: ${String(error?.message ?? error).slice(0, 300)}\n`); }
-    }
-    function viewerPosition(force = false) {
-      const now = Date.now();
-      if (!force && now - viewerPositionAt < 100) return;
-      const position = bot.entity?.position;
-      if (!position) return;
-      viewerPositionAt = now;
-      viewerSend({ type: 'position', pos: { x: position.x, y: position.y, z: position.z }, yaw: bot.entity.yaw, pitch: bot.entity.pitch });
-    }
-    const viewerEntityAt = new Map();
-    function viewerEntity(entity, force = false) {
-      if (!entity || entity === bot.entity) return;
-      const now = Date.now();
-      if (!force && now - (viewerEntityAt.get(entity.id) || 0) < 150) return;
-      viewerEntityAt.set(entity.id, now);
-      if (viewerEntityAt.size > 256) viewerEntityAt.delete(viewerEntityAt.keys().next().value);
-      viewerSend({ type: 'entity', entity: { id: entity.id, name: entity.name, pos: { x: entity.position.x, y: entity.position.y, z: entity.position.z }, width: entity.width, height: entity.height, username: entity.username } });
-    }
-    function viewerBlockUpdate(oldBlock, newBlock) {
-      if (!newBlock || !newBlock.position) return;
-      const stateId = Number.isInteger(newBlock.stateId) ? newBlock.stateId : ((newBlock.type << 4) | (newBlock.metadata || 0));
-      viewerSend({ type: 'blockUpdate', block: { pos: { x: newBlock.position.x, y: newBlock.position.y, z: newBlock.position.z }, stateId } });
-    }
-    function viewerStart() {
-      if (viewerStopping) return;
-      if (viewerRestartTimer) { clearTimeout(viewerRestartTimer); viewerRestartTimer = null; }
-      const config = { port: viewerPort, bind, viewDistance, firstPerson, version: bot.version };
-      let thread;
-      try {
-        thread = new Worker(viewerScript, {
-          workerData: config,
-          resourceLimits: { maxOldGenerationSizeMb: 384, maxYoungGenerationSizeMb: 64 },
-        });
-      } catch (error) {
-        process.stderr.write(`viewer thread spawn failed: ${String(error?.message ?? error).slice(0, 500)}\n`);
-        viewerScheduleRestart();
-        return;
-      }
-      viewerThread = thread;
-      viewerLastHeartbeat = Date.now();
-      thread.on('message', (message) => {
-        if (!message || typeof message !== 'object') return;
-        if (message.type === 'viewer_heartbeat') { viewerLastHeartbeat = Date.now(); return; }
-        if (message.type === 'viewer_ready') {
-          viewerAllChunks();
-          viewerSnapshot();
-          send({ type: 'viewer_started', port: viewerPort, bind, first_person: firstPerson, isolated: true, restarts: viewerRestarts });
-          return;
-        }
-        if (message.type === 'viewer_fatal' || message.type === 'viewer_warning') {
-          process.stderr.write(`viewer ${message.type}: ${String(message.error).slice(0, 800)}\n`);
-        }
-      });
-      thread.on('error', (error) => {
-        process.stderr.write(`viewer thread error: ${String(error?.stack ?? error).slice(0, 1000)}\n`);
-      });
-      thread.on('exit', (code) => {
-        if (viewerThread === thread) viewerThread = null;
-        if (viewerStopping) return;
-        process.stderr.write(`viewer thread exited code=${code}; restarting\n`);
-        viewerScheduleRestart();
-      });
-    }
-    function viewerScheduleRestart() {
-      if (viewerStopping || viewerRestartTimer) return;
-      viewerRestarts++;
-      const delay = Math.min(5000, 500 + viewerRestarts * 250);
-      viewerRestartTimer = setTimeout(() => { viewerRestartTimer = null; viewerStart(); }, delay);
-    }
-    function viewerStop() {
-      viewerStopping = true;
-      if (viewerRestartTimer) { clearTimeout(viewerRestartTimer); viewerRestartTimer = null; }
-      const thread = viewerThread; viewerThread = null;
-      if (thread) {
-        try { thread.postMessage({ type: 'shutdown' }); } catch {}
-        const killTimer = setTimeout(() => { thread.terminate().catch(() => {}); }, 500);
-        killTimer.unref?.();
-        thread.once('exit', () => clearTimeout(killTimer));
-      }
-    }
-    process.on('exit', viewerStop);
-    process.on('SIGTERM', () => { viewerStop(); process.exit(0); });
-    bot.on('chunkColumnLoad', viewerChunk);
-    bot.on('move', () => viewerPosition());
-    bot.on('entitySpawn', (entity) => viewerEntity(entity, true));
-    bot.on('entityMoved', viewerEntity);
-    bot.on('entityGone', (entity) => viewerSend({ type: 'entity', entity: { id: entity.id, delete: true } }));
-    bot.on('blockUpdate', viewerBlockUpdate);
-    const viewerPositionTimer = setInterval(() => viewerPosition(), 250);
-    viewerPositionTimer.unref?.();
-    const viewerHealthTimer = setInterval(() => {
-      if (!viewerThread || viewerStopping) return;
-      if (Date.now() - viewerLastHeartbeat > 15000) {
-        process.stderr.write('viewer heartbeat timeout; restarting thread\n');
-        viewerThread.terminate().catch(() => {});
-      }
-    }, 5000);
-    viewerHealthTimer.unref?.();
-    viewerStart();
-  }
-
-}
-const emitterMethods = new Set(['on', 'once', 'addListener', 'prependListener', 'prependOnceListener', 'off', 'removeListener', 'removeAllListeners', 'emit']);
-for (const name of Object.keys(bot)) if (!emitterMethods.has(name)) instrumentMethod(bot, name);
-instrumentMethod(bot.pathfinder, 'goto');
-instrumentMethod(bot.pathfinder, 'setGoal');
-for (const event of ['chat', 'whisper', 'death', 'respawn', 'kicked', 'end', 'error']) {
-  bot.on(event, (...args) => {
-    const encoded = boundedValue(args, 32768);
-    send({ type: 'event', kind: event, payload: encoded.value, payload_truncated: encoded.truncated });
-  });
-}
-bot.on('end', () => process.exit(1));
-instrumentEmitter(bot);
-agentBot = makeAgentFacingBot(bot);
+// One guard interval for the whole process; it follows the current bot across
+// in-process soft resets.
 startBotStateGuard();
-if (config.chatDelivery === 'program_output') {
-  bot.on('chat', (username, message) => {
-    pendingChat.push({ username: String(username ?? '').slice(0, 64), message: String(message ?? '').slice(0, 4096), received_at: new Date().toISOString() });
-    while (pendingChat.length > 100) pendingChat.shift();
-  });
+try {
+  await startBot({ initial: true });
+} catch (error) {
+  // Initial startup failure keeps the existing hard-fail behaviour: the server
+  // fails the session startup/startup timeout and restarts the worker.
+  try { send({ type: 'fatal', error: String(error?.stack ?? error).slice(0, 32768) }); } catch {}
+  process.exit(1);
 }
-send({ type: 'ready', snapshot: snapshot(), mode: config.mode, module_policy: modulePolicy(config.lifecycle), sandbox: { native_filter: process.env.HARNESS_NATIVE_SANDBOX === 'seccomp-v1', version: process.env.HARNESS_NATIVE_SANDBOX === 'seccomp-v1' ? 1 : null } });

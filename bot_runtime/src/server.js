@@ -70,6 +70,15 @@ class Session {
     this.fencing = null;
     this.draining = false;
     this.closed = false;
+    // Soft reset (same worker process, new Mineflayer client) coordination. A
+    // soft reset never changes runtimeEpoch and never clears child.ready.
+    this.softResetting = false;
+    this.softResetCount = 0;
+    this.workerGeneration = 0;
+    this.softResetDone = null;
+    this.softResetResolve = null;
+    this.softResetTimer = null;
+    this.softResetReason = null;
   }
 
   renewLease(duration = this.config.leaseTimeoutMs) {
@@ -185,19 +194,24 @@ class Session {
       buffers: { events: this.events.length, event_bytes: this.eventBytes, executions: this.executions.size,
         requests: this.requests.size, request_tombstones: this.tombstones.count, tombstone_bytes: this.tombstones.bits.byteLength },
       request_sequence_high_water: this.sequenceHighWater,
+      soft_resetting: this.softResetting, soft_resets: this.softResetCount,
+      worker_generation: this.workerGeneration,
       worker_pid: this.worker?.pid ?? null, worker_rss_bytes: workerRss(this.worker?.pid),
       execution_security: this.securityStatus() };
   }
 
   async ensureWorker() {
     if (this.closed) throw new Error('Session closed');
+    // A soft reset recreates the client in the SAME worker process; the worker is
+    // still ready, so never fork a replacement just because the gate is set.
+    if (this.softResetting && this.worker?.ready && !this.worker.expectedExit && !this.worker.killPromise) return this.worker;
     if (this.worker?.expectedExit && this.worker.killPromise) await this.worker.killPromise;
     if (this.worker?.ready && !this.worker.expectedExit) return this.worker;
     if (this.starting) return this.starting;
     if (!this.reservedRuntimeEpoch) this.runtimeEpoch += 1;
     this.reservedRuntimeEpoch = false;
     const workerConfig = { mode: this.config.mode, username: this.username, host: this.config.mcHost,
-      port: this.config.mcPort, version: this.config.mcVersion, lifecycle: this.lifecycle, paperSingleProgram: this.config.paperSingleProgram, maxBackgroundJobs: this.maxBackgroundJobs, remainingRunMs: Math.max(0, Math.floor(this.runDeadline - performance.now())), runDeadlineAt: Date.now() + Math.max(0, this.runDeadline - performance.now()), maxLogs: this.config.maxLogs, maxLogBytes: this.config.maxLogBytes, maxResultBytes: this.config.maxResultBytes, leftoverPolicy: this.config.leftoverPolicy, chatDelivery: this.config.chatDelivery, maxLeftoverScopes: Number(process.env.MAX_LEFTOVER_SCOPES ?? 256) };
+      port: this.config.mcPort, version: this.config.mcVersion, lifecycle: this.lifecycle, paperSingleProgram: this.config.paperSingleProgram, maxBackgroundJobs: this.maxBackgroundJobs, remainingRunMs: Math.max(0, Math.floor(this.runDeadline - performance.now())), runDeadlineAt: Date.now() + Math.max(0, this.runDeadline - performance.now()), maxLogs: this.config.maxLogs, maxLogBytes: this.config.maxLogBytes, maxResultBytes: this.config.maxResultBytes, leftoverPolicy: this.config.leftoverPolicy, chatDelivery: this.config.chatDelivery, maxLeftoverScopes: Number(process.env.MAX_LEFTOVER_SCOPES ?? 256), physicsStallMs: this.config.physicsStallMs };
     // Never pass gateway/model secrets to code execution children.
     const remote = this.config.workerEndpoints[this.agentId];
     let child;
@@ -250,6 +264,9 @@ class Session {
         }
         child.ready = true;
         clearTimeout(startupTimer);
+        // A hard (re)start is a fresh worker process, so a generation-less ready
+        // means the client numbering restarted at the first client.
+        this.workerGeneration = Number.isSafeInteger(message.generation) ? message.generation : 1;
         this.event('runtime_ready', { snapshot: message.snapshot, globals_lost: this.runtimeEpoch > 1 });
         readyResolve(child);
       } else if (message.type === 'job_started') {
@@ -284,6 +301,12 @@ class Session {
       } else if (message.type === 'completed' && this.current?.record.execution_id === message.execution_id) {
         const status = this.current.cancelRequested ? 'cancelled' : message.timed_out ? 'timed_out' : message.error ? 'failed' : 'succeeded';
         this.finish(this.current, status, message, message.needs_reset).catch(() => {});
+      } else if (message.type === 'soft_reset') {
+        this._handleSoftResetMessage(message);
+      } else if (message.type === 'soft_ready') {
+        this._handleSoftReadyMessage(message);
+      } else if (message.type === 'soft_reset_failed') {
+        this._handleSoftResetFailedMessage(message);
       } else if (message.type === 'fatal') {
         this.event('runtime_error', { error: message.error });
         if (this.current) this.finish(this.current, 'interrupted', { error: { message: message.error }, reset_reason: 'worker_fatal' }, true).catch(() => {});
@@ -298,6 +321,9 @@ class Session {
       this.killWorker('remote_worker_error').catch(() => {});
     });
     child.once('exit', (code, signal) => {
+      // An exited worker can never send soft_ready: settle the gate so queued
+      // dispatch (and session close) cannot hang on a dead soft reset.
+      this._settleSoftReset();
       for (const [executionId, entry] of this.aborting) {
         if (entry.active?.child === child) { clearTimeout(entry.timer); this.aborting.delete(executionId); }
       }
@@ -357,6 +383,7 @@ class Session {
   }
 
   async killWorker(reason) {
+    this._settleSoftReset();
     for (const [executionId, entry] of this.aborting) {
       clearTimeout(entry.timer); this.aborting.delete(executionId);
     }
@@ -426,11 +453,29 @@ class Session {
     this.draining = true;
     try {
       while (!this.closed && !this.paused && this.queue.length) {
+        if (this.softResetting) {
+          // Do not dispatch into a worker whose Mineflayer client is being
+          // recreated; the gate settles on soft_ready or on kill/exit.
+          const gate = this.softResetDone;
+          if (gate) await gate;
+          if (this.closed || this.paused) break;
+          continue;
+        }
         const item = this.queue.shift();
         if (item.record.status !== 'accepted') continue;
         try {
           const child = await this.ensureWorker();
           if (this.closed || item.record.status !== 'accepted') continue;
+          if (this.softResetting) {
+            // A soft reset can start while ensureWorker() was resolving; requeue
+            // and wait for the new client to be ready before dispatching. This is
+            // checked before the paused re-queue so a gate is never left pending.
+            this.queue.unshift(item);
+            const gate = this.softResetDone;
+            if (gate) await gate;
+            if (this.closed || this.paused) break;
+            continue;
+          }
           if (this.paused) { this.queue.unshift(item); break; }
           const record = item.record;
           if (!this.event('execution_running', {}, record.execution_id)) { this.queue.unshift(item); break; }
@@ -463,6 +508,88 @@ class Session {
         }
       }
     } finally { this.draining = false; }
+  }
+
+  // ---- soft reset (same worker process, new Mineflayer client) ---------
+  _settleSoftReset() {
+    if (this.softResetTimer) { clearTimeout(this.softResetTimer); this.softResetTimer = null; }
+    this.softResetting = false;
+    const resolve = this.softResetResolve;
+    this.softResetResolve = null;
+    this.softResetDone = null;
+    try { resolve?.(); } catch {}
+  }
+
+  _handleSoftResetMessage(message) {
+    if (this.softResetting) return; // single flight: one outstanding gate
+    const reason = typeof message.reason === 'string' && message.reason ? message.reason.slice(0, 200) : 'unknown';
+    const generation = Number.isSafeInteger(message.generation) ? message.generation : null;
+    // A duplicated/stale announcement from an already-resolved client
+    // generation must not open a second gate (which would later time out and
+    // hard-restart a healthy worker).
+    if (this.softResetCount > 0 && generation !== null && generation <= this.workerGeneration) return;
+    const executionId = typeof message.execution_id === 'string' ? message.execution_id : null;
+    let detail = message.detail ?? null;
+    if (detail !== null) {
+      try { if (Buffer.byteLength(JSON.stringify(detail)) > 8192) detail = { truncated: true }; }
+      catch { detail = { truncated: true }; }
+    }
+    // Open the gate synchronously: from here on drain() must not dispatch.
+    this.softResetting = true;
+    this.softResetReason = reason;
+    this.softResetDone = new Promise(resolve => { this.softResetResolve = resolve; });
+    if (this.softResetTimer) clearTimeout(this.softResetTimer);
+    this.softResetTimer = setTimeout(() => {
+      if (!this.softResetting) return;
+      this.softResetTimer = null;
+      // Emit before killing so the timeout is durable in the ledger before the
+      // hard-restart events (runtime_exit/runtime_reset) that killWorker emits.
+      this.event('runtime_soft_reset_timeout', { reason: this.softResetReason, timeout_ms: this.config.softResetTimeoutMs, generation: this.workerGeneration, globals_lost: false });
+      this.killWorker('soft_reset_timeout').catch(() => {});
+    }, this.config.softResetTimeoutMs);
+    // The soft reset is authoritative session state, not a globals-lost restart:
+    // runtimeEpoch and child.ready are deliberately untouched.
+    const payload = { reason, execution_id: executionId, generation, detail, globals_lost: false };
+    const emit = () => this.event('runtime_soft_reset', payload, executionId);
+    if (this.current && !TERMINAL.has(this.current.record.status)) {
+      // Defensive: the worker normally completes/fails the running program before
+      // sending soft_reset (ordering guarantee). If it did not, it cannot survive
+      // the client recreation, so finish it exactly once as an execution fault
+      // BEFORE recording runtime_soft_reset (reset=false: keep the worker alive).
+      let finished;
+      try {
+        finished = this.finish(this.current, 'interrupted', { error: { name: 'SoftResetError', message: `Bot client reset: ${reason}` }, reset_reason: 'soft_reset' }, false);
+      } catch { emit(); return; }
+      finished.then(emit, emit);
+    } else {
+      emit();
+    }
+  }
+
+  _handleSoftReadyMessage(message) {
+    const generation = Number.isSafeInteger(message.generation) ? message.generation : this.workerGeneration;
+    const durationMs = Number.isSafeInteger(message.duration_ms) ? message.duration_ms : null;
+    const hadGate = this.softResetting;
+    // Duplicate/late ready for a generation we already adopted: the gate was
+    // already resolved (never resolve twice) and the count must not inflate.
+    if (!hadGate && this.softResetCount > 0 && generation <= this.workerGeneration) return;
+    if (hadGate) this.softResetCount += 1;
+    else if (Number.isSafeInteger(message.soft_resets)) this.softResetCount = Math.max(this.softResetCount, message.soft_resets);
+    if (hadGate || generation > this.workerGeneration && Number.isSafeInteger(message.generation)) this.workerGeneration = generation;
+    // Resolve the gate first, then kick dispatch: an already-running drain
+    // re-checks the gate itself, and a fresh drain starts after it is cleared.
+    this._settleSoftReset();
+    this.event('runtime_soft_reset_ready', { generation, duration_ms: durationMs, soft_resets: this.softResetCount, snapshot: message.snapshot ?? null, globals_lost: false });
+    this.drain().catch(error => this.event('queue_error', { error: String(error.message) }));
+  }
+
+  _handleSoftResetFailedMessage(message) {
+    const reason = typeof message.reason === 'string' && message.reason ? message.reason.slice(0, 200) : (this.softResetReason ?? 'unknown');
+    const error = typeof message.error === 'string' ? message.error.slice(0, 2000) : String(message.error ?? 'unknown');
+    this._settleSoftReset();
+    this.event('runtime_soft_reset_failed', { reason, error, globals_lost: false });
+    // A failed soft reset is the last-resort hard restart path.
+    this.killWorker('soft_reset_failed').catch(() => {});
   }
 
   async finish(active, status, data, reset) {
@@ -580,6 +707,8 @@ export async function start(options = {}) {
     maxBackgroundJobs: options.maxBackgroundJobs ?? Number(process.env.MAX_BACKGROUND_JOBS ?? 8),
     maxBackgroundTtlMs: options.maxBackgroundTtlMs ?? Number(process.env.MAX_BACKGROUND_TTL_MS ?? 129600000),
     maxTimeoutMs: options.maxTimeoutMs ?? Number(process.env.MAX_TIMEOUT_MS ?? 180000),
+    softResetTimeoutMs: options.softResetTimeoutMs ?? Number(process.env.SOFT_RESET_TIMEOUT_MS ?? 45000),
+    physicsStallMs: options.physicsStallMs ?? Number(process.env.PHYSICS_STALL_MS ?? 15000),
     exitOnLeaseExpiry: options.exitOnLeaseExpiry ?? ['1', 'true'].includes(process.env.EXIT_ON_LEASE_EXPIRY ?? 'false'),
     leaseTimeoutMs: options.leaseTimeoutMs ?? Number(process.env.SUPERVISOR_LEASE_MS ?? 30000),
     parentWatchdogMs: options.parentWatchdogMs ?? Number(process.env.PARENT_WATCHDOG_MS ?? 10000),
@@ -613,6 +742,8 @@ export async function start(options = {}) {
     if (!Number.isSafeInteger(config[key]) || config[key] < 1) throw new Error(`${key} must be a positive safe integer`);
   }
   if (config.maxResponseBytes < config.maxResultBytes * 4 || config.maxEventBytes < 1024) throw new Error('Response/event byte limits are too small');
+  if (!Number.isSafeInteger(config.softResetTimeoutMs) || config.softResetTimeoutMs < 5000 || config.softResetTimeoutMs > 120000) throw new Error('softResetTimeoutMs must be an integer between 5000 and 120000');
+  if (!Number.isSafeInteger(config.physicsStallMs) || config.physicsStallMs < 3000 || config.physicsStallMs > 60000) throw new Error('physicsStallMs must be an integer between 3000 and 60000');
   const sessions = new Map();
   let closing = false;
   let closePromise;

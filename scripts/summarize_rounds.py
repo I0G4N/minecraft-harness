@@ -44,10 +44,19 @@ def main() -> int:
                      "cleanup": flags.get("cleanup_failed"), "finalization": flags.get("finalization_failed"),
                      "storage": (resources.get("last_storage") or {}).get("measured_run_bytes"),
                      "rss": resources.get("supervisor_rss_bytes_max"),
-                     "server": server})
+                     "server": server,
+                     # P1 soft/hard reset split.  Old analysis files lack these
+                     # keys; they stay None and render as n/a.
+                     "hard_restarts": flags.get("hard_restarts", data.get("hard_restarts")),
+                     "soft_resets": flags.get("runtime_soft_reset", data.get("soft_reset_count")),
+                     "soft_reset_ready": flags.get("runtime_soft_reset_ready"),
+                     "soft_reset_failed": flags.get("runtime_soft_reset_failed"),
+                     "soft_reset_timeout": flags.get("runtime_soft_reset_timeout"),
+                     "soft_reset_reasons": (data.get("soft_reset_reasons")
+                                            or flags.get("soft_reset_reasons") or {})})
     lines = ["# 8-agent paper-aligned 4-round stability report", ""]
-    lines.append("| round | status | wall s | calls | cost USD | kicks | SIGABRT | worker_fatal | exec failed | p95 latency ms | report failures | cleanup | storage MiB | supervisor RSS MiB |")
-    lines.append("| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- | ---: | ---: | ---: |")
+    lines.append("| round | status | wall s | calls | cost USD | kicks | SIGABRT | worker_fatal | exec failed | p95 latency ms | report failures | cleanup | storage MiB | supervisor RSS MiB | hard restarts | soft resets |")
+    lines.append("| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- | ---: | ---: | ---: | ---: | ---: |")
     for r in rows:
         storage = r["storage"] / 2**20 if isinstance(r["storage"], int) else None
         rss = r["rss"] / 2**20 if isinstance(r["rss"], int) else None
@@ -56,8 +65,18 @@ def main() -> int:
         execs = r["data"].get("execution_status_counts") or {}
         lines.append(f"| {r['round']} | {r['status']} | {fmt(r['wall'])} | {fmt(r['calls'])} | {fmt(r['cost'])} | "
                      f"{fmt(r['kicks'])} | {fmt(r['sigabrt'])} | {fmt(r['worker_fatal'])} | {fmt(execs.get('failed'))} | {fmt(latency)} | {r['failures']} | "
-                     f"{fmt(r['cleanup'])} | {fmt(storage)} | {fmt(rss)} |")
-    lines += ["", "## Per-round evidence", ""]
+                     f"{fmt(r['cleanup'])} | {fmt(storage)} | {fmt(rss)} | {fmt(r['hard_restarts'])} | {fmt(r['soft_resets'])} |")
+    totals = {}
+    for key in ("hard_restarts", "soft_resets", "soft_reset_ready", "soft_reset_failed",
+                "soft_reset_timeout"):
+        values = [r[key] for r in rows if isinstance(r.get(key), int)]
+        totals[key] = sum(values) if len(values) == len(rows) else None
+    lines += ["", (f"Totals: hard restarts {fmt(totals['hard_restarts'])}; soft resets "
+                   f"{fmt(totals['soft_resets'])} (ready {fmt(totals['soft_reset_ready'])}, "
+                   f"failed {fmt(totals['soft_reset_failed'])}, timeout "
+                   f"{fmt(totals['soft_reset_timeout'])}). P1 soft resets preserve VM globals "
+                   "and run inside the same worker; they are not hard restarts."),
+              "", "## Per-round evidence", ""]
     for r in rows:
         s = r["server"] or {}
         data = r["data"]
@@ -66,6 +85,7 @@ def main() -> int:
                   f"- kicks: {fmt(r['kicks'])}; SIGABRT: {fmt(r['sigabrt'])}; worker_fatal: {fmt(r['worker_fatal'])}; report failures: `{r['failures']}`",
                   f"- cleanup_failed: {fmt(r['cleanup'])}; finalization_failed: {fmt(r['finalization'])}; storage: {fmt(r['storage'])} bytes; supervisor RSS max: {fmt(r['rss'])} bytes",
                   f"- runtime exit signals: `{data.get('runtime_exit_signals')}`; reset reasons: `{data.get('runtime_reset_reasons')}`; execution: `{data.get('execution_status_counts')}`; model latency p95: `{(data.get('model_latency_ms') or {}).get('p95')}` ms",
+                  f"- hard restarts: {fmt(r['hard_restarts'])}; soft resets: {fmt(r['soft_resets'])} (ready {fmt(r['soft_reset_ready'])}, failed {fmt(r['soft_reset_failed'])}, timeout {fmt(r['soft_reset_timeout'])}); soft reset reasons: `{r['soft_reset_reasons']}`",
                   f"- server log: invalid_move={s.get('invalid_move')}, decoder_exception={s.get('decoder_exception')}, moved_too_quickly={s.get('moved_too_quickly')}",
                   ""]
         tails = data.get("runtime_exit_stderr_tails") or []
@@ -78,6 +98,11 @@ def main() -> int:
     a.output.write_text(md)
     if a.json_output:
         a.json_output.write_text(json.dumps([{"round": r["round"], "run": r["run"], "status": r["status"],
+                                              "hard_restarts": r["hard_restarts"],
+                                              "soft_resets": r["soft_resets"],
+                                              "soft_reset_ready": r["soft_reset_ready"],
+                                              "soft_reset_failed": r["soft_reset_failed"],
+                                              "soft_reset_timeout": r["soft_reset_timeout"],
                                               "data": r["data"]} for r in rows], ensure_ascii=False, indent=2) + "\n")
     print(md)
     return 0
